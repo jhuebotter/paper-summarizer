@@ -6,77 +6,53 @@
 
 Built by **Justus Hübotter** (February 2026).
 
-`paper-summarizer` is a CLI tool that converts research PDFs into structured markdown summaries using an OpenAI-compatible LLM backend.
+`paper-summarizer` is a CLI that turns research PDFs into structured markdown summaries using an OpenAI-compatible backend.
 
-It is optimized for SNN/control literature workflows and keeps outputs consistent and reproducible.
+It is optimized for SNN/control literature workflows, but the core pipeline is topic-agnostic and can be adapted by swapping prompt/reference material.
 
-Originally, this tool was built to help process a large volume of related research papers in one domain. The pipeline code itself (outside `skill_data/`) is topic-agnostic and can be configured for other research areas by changing prompt/reference material.
-
-## Features
-
-- Parse PDFs to markdown using `docling` or `pypdf` with local parse caching.
-- One combined LLM prompt per paper for metadata + summary sections.
-- Pydantic schema validation plus bounded JSON/schema repair retries.
-- Centralized output structure by paper type: `primary`, `survey`, `commentary`, `non_research`.
-- Batch processing with parallel workers and persistent processed-index skipping.
-- Full test suite and comprehensive runtime logging support.
-
-## Brief Workflow
-
-1. Discover PDFs from `--source` recursively (or use `--file` for a single paper).
-2. Parse PDF text (`<pdf_stem>.md` cache next to the source PDF).
-3. Build combined prompt with references from `skill_data/references`.
-4. Call the configured OpenAI-compatible backend.
-5. Validate/repair JSON response and render markdown.
-6. Write summary to `output_summaries/<paper_type>/<citation_key>_summary.md` and update `processed.txt`.
-
-## Requirements
-
-- Python `>=3.11`
-- Dependencies:
-  - `docling`
-  - `openai`
-  - `python-dotenv`
-  - `pydantic`
-  - `pypdf`
-  - `tqdm`
-
-Install from source:
+## Quick Start (60 seconds)
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-```
-
-CLI entry point:
-
-```bash
-summarize-papers --help
-```
-
-## Environment Configuration (`.env`)
-
-The CLI loads environment variables from `.env` (via `python-dotenv`) and from the shell.
-
-Supported variables:
-
-- `LLM_API_KEY`: API key for your backend.
-  - Required for OpenRouter.
-  - Ignored by LM Studio.
-- `LLM_MODEL`: default model when `--model` is not provided.
-
-Minimal `.env` example:
-
-```env
+cat > .env <<'EOF'
 LLM_API_KEY=your_openrouter_key_here
 LLM_MODEL=openai/gpt-oss-120b:free
+EOF
+summarize-papers --source input_papers
 ```
 
-Notes:
+## What it does
 
-- Default `--base-url` is `https://openrouter.ai/api/v1`.
-- Before processing (except in `--dry-run`), the CLI checks backend reachability at the host root (for example `https://openrouter.ai`).
+- Parses PDFs to markdown with local cache (`docling` or `pypdf`).
+- Builds one combined LLM prompt for metadata + sectioned summary.
+- Validates output with Pydantic and bounded repair retries.
+- Organizes outputs by paper type (`primary`, `survey`, `commentary`, `non_research`).
+- Supports batch processing with parallel workers and processed-file skipping.
+
+## Typical workflow
+
+1. Discover PDFs from `--source` (recursive) or `--file`.
+2. Parse PDF text and cache as `<pdf_stem>.md` next to the source file.
+3. Build prompt with references from `skill_data/references`.
+4. Call the configured OpenAI-compatible backend.
+5. Validate/repair JSON and render summary markdown.
+6. Write summary to `output_summaries/<paper_type>/<citation_key>_summary.md` and update `processed.txt`.
+
+## Data prep: collect PDFs from nested libraries
+
+Use `collect_pdfs.sh` when your PDFs live in deep subfolders (for example a Zotero or Mendeley library export):
+
+```bash
+./collect_pdfs.sh "/path/to/library_root" "./input_papers"
+```
+
+What it does:
+
+- Recursively finds all `*.pdf` files under the source directory.
+- Copies them into one destination folder.
+- Flattens names as `<parent_folder>__<original_filename>.pdf` to reduce collisions.
 
 ## Usage
 
@@ -92,26 +68,51 @@ Single-file mode:
 summarize-papers --file "test_pdfs/example.pdf"
 ```
 
-## CLI Options
+## Example output
 
-- `--source DIR`: scan directory recursively for PDFs.
-- `--file PDF`: process a single PDF.
-- `--force-summary`: re-run summary step even if file is in `processed.txt`.
-- `--reparse`: re-run extraction too (implies `--force-summary`).
-- `--extractor {auto,docling,pypdf}`: extraction strategy.
-- `--dry-run`: list files that would be processed (no LLM calls, no writes).
-- `--output-dir DIR`: output root (default `output_summaries`).
-- `--model MODEL`: model ID (default from `LLM_MODEL`, then `openai/gpt-oss-120b:free`).
-- `--base-url URL`: OpenAI-compatible API base URL (default `https://openrouter.ai/api/v1`).
-- `--max-chars N`: cap parsed text length sent to the LLM.
-- `--skill-data-dir DIR`: references directory (default `skill_data/references`).
-- `--verbose` / `--no-verbose`: enable/disable debug-style verbosity (default enabled).
-- `--log-file FILE`: custom log file path.
-- `--timeout S`: per-call timeout in seconds (default `120`).
-- `--workers N`: parallel batch workers (default `3`).
-- `--max-output-tokens N`: optional model output-token cap.
+`output_summaries/primary/smith2025_summary.md`:
 
-## Backend Examples
+```markdown
+# Smith et al. (2025)
+
+## Core idea
+Event-driven SNN controller with reward-modulated plasticity for online adaptation.
+
+## Methods snapshot
+- Task: closed-loop motor control in simulated arm reach task
+- Encoder: population spike encoding of state variables
+- Learning: local plasticity + global reward signal
+
+## Key findings
+- Lower energy use than ANN baseline with comparable tracking error
+- Better robustness under sensor noise
+```
+
+## Project structure
+
+```text
+.
+├── input_papers/                 # PDFs to process
+├── output_summaries/             # Generated summaries grouped by paper type
+├── processed.txt                 # Absolute paths already processed
+├── skill_data/references/        # Prompt references/domain guidance
+├── collect_pdfs.sh               # Helper to flatten nested PDF libraries
+└── summarizer/                   # Python package source
+```
+
+## Configuration
+
+Environment variables:
+
+- `LLM_API_KEY`: API key (required for OpenRouter, ignored by LM Studio).
+- `LLM_MODEL`: default model if `--model` is not passed.
+
+Notes:
+
+- Default `--base-url`: `https://openrouter.ai/api/v1`.
+- In non-`--dry-run` mode, backend reachability is checked before processing.
+
+Backend examples:
 
 LM Studio:
 
@@ -129,13 +130,31 @@ export LLM_API_KEY="<your_key>"
 summarize-papers --source input_papers --model "openai/gpt-oss-120b:free"
 ```
 
-## Skip and Re-run Behavior
+## Important CLI options
 
-- If a PDF absolute path exists in `processed.txt`, it is skipped.
-- `--force-summary` bypasses that skip logic.
-- Parser cache (`<pdf_stem>.md`) is reused unless `--reparse` is passed.
-- `--extractor auto` tries docling first, then `pypdf` fallback.
-- Existing output filename collisions are versioned (`_v2`, `_v3`, ...).
+- `--source DIR` / `--file PDF`: choose batch or single-file mode.
+- `--force-summary`: re-run summary even if listed in `processed.txt`.
+- `--reparse`: re-run extraction too (implies `--force-summary`).
+- `--extractor {auto,docling,pypdf}`: parser strategy.
+- `--output-dir DIR`: output root (default `output_summaries`).
+- `--workers N`: parallel batch workers (default `3`).
+- `--timeout S`: per-call timeout in seconds (default `120`).
+- `--dry-run`: preview files without LLM calls or writes.
+
+## Skip and rerun behavior
+
+- Files in `processed.txt` are skipped by default.
+- `--force-summary` bypasses skip logic.
+- Parser cache (`<pdf_stem>.md`) is reused unless `--reparse` is used.
+- `--extractor auto` tries `docling` first, then `pypdf` fallback.
+- Output name collisions are versioned (`_v2`, `_v3`, ...).
+
+## Troubleshooting
+
+- Auth errors: verify `LLM_API_KEY` and that your backend accepts the configured model.
+- Backend unreachable: check `--base-url`, local server status, and firewall/VPN.
+- Parsing quality issues: retry with `--extractor pypdf` or `--reparse`.
+- Slow/timeout runs: lower `--workers`, increase `--timeout`, or reduce `--max-chars`.
 
 ## Development
 
@@ -145,7 +164,13 @@ Run tests:
 pytest
 ```
 
-Integration tests are marked with `integration` and require real external resources.
+Integration tests are marked `integration` and require real external resources.
+
+## Roadmap
+
+- Add automated table generation with citations from extracted summary fields.
+- Support synthesis workflows for methodological overviews across large paper sets.
+- Extend the pipeline from single-paper summarization toward staged corpus distillation ("multistage RAG 2.0" without document-embedding/token-encoder indexing).
 
 ## License
 
