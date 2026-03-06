@@ -142,3 +142,90 @@ def test_build_combined_prompt_mentions_year_priority_rules():
     )
     assert "Year resolution priority" in prompt
     assert "source filename" in prompt
+
+
+# ---------------------------------------------------------------------------
+# load_references — structural tests
+# ---------------------------------------------------------------------------
+
+
+def test_load_references_joins_with_separator(tmp_path):
+    """Multiple .md files are joined with a '---' separator."""
+    (tmp_path / "a.md").write_text("content A", encoding="utf-8")
+    (tmp_path / "b.md").write_text("content B", encoding="utf-8")
+    result = load_references(tmp_path)
+    assert "---" in result
+    assert "content A" in result
+    assert "content B" in result
+
+
+def test_load_references_alphabetical_order(tmp_path):
+    """Files are loaded in alphabetical order (deterministic)."""
+    (tmp_path / "b.md").write_text("SECOND", encoding="utf-8")
+    (tmp_path / "a.md").write_text("FIRST", encoding="utf-8")
+    result = load_references(tmp_path)
+    assert result.index("FIRST") < result.index("SECOND")
+
+
+# ---------------------------------------------------------------------------
+# build_combined_prompt — required keys per variant
+# ---------------------------------------------------------------------------
+
+# Build the prompt once at module level; the function is pure.
+_PROMPT = build_combined_prompt("text", "refs", "paper.pdf")
+
+_PRIMARY_PART1_KEYS = [
+    "tldr", "problem_motivation", "core_contribution", "methods", "results",
+    "key_takeaways", "limitations", "open_problems_future_directions",
+    "critical_assessment", "notable_findings", "citable_snippets", "relevance",
+]
+_SYNTHESIS_PART1_KEYS = [
+    "tldr", "target_papers_field", "scope_coverage", "taxonomy_organization",
+    "core_argument", "synthesis_contribution", "key_claims_narrative",
+    "key_takeaways", "limitations", "open_problems_future_directions",
+    "critical_assessment", "notable_findings", "citable_snippets", "relevance",
+]
+_NON_RESEARCH_PART1_KEYS = ["paper_type", "note"]
+
+
+@pytest.mark.parametrize("key", _PRIMARY_PART1_KEYS)
+def test_build_combined_prompt_lists_primary_part1_key(key):
+    """Every required primary part1 key appears in the prompt."""
+    assert key in _PROMPT, f"Primary part1 key '{key}' missing from prompt"
+
+
+@pytest.mark.parametrize("key", _SYNTHESIS_PART1_KEYS)
+def test_build_combined_prompt_lists_synthesis_part1_key(key):
+    """Every required synthesis part1 key appears in the prompt."""
+    assert key in _PROMPT, f"Synthesis part1 key '{key}' missing from prompt"
+
+
+@pytest.mark.parametrize("key", _NON_RESEARCH_PART1_KEYS)
+def test_build_combined_prompt_lists_non_research_part1_key(key):
+    """Every required non_research part1 key appears in the prompt."""
+    assert key in _PROMPT, f"Non-research part1 key '{key}' missing from prompt"
+
+
+# ---------------------------------------------------------------------------
+# build_combined_prompt — critical instructions
+# ---------------------------------------------------------------------------
+
+
+def test_build_combined_prompt_forbids_markdown_fences():
+    """Prompt explicitly forbids markdown fences in the output."""
+    assert "no markdown fences" in _PROMPT
+
+
+def test_build_combined_prompt_mentions_not_reported_fallback():
+    """Prompt instructs the LLM to use 'not reported' for unavailable values."""
+    assert "not reported" in _PROMPT
+
+
+def test_build_combined_prompt_mentions_output_budget_warning():
+    """Prompt contains the output budget / completeness warning."""
+    assert "Output budget" in _PROMPT
+
+
+def test_build_combined_prompt_part2_requires_full_object_for_primary():
+    """Prompt requires a full Part 2 object for primary papers (not just null rules)."""
+    assert "part2 must be a full Part 2 object" in _PROMPT

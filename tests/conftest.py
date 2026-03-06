@@ -77,17 +77,24 @@ MOCK_PART1_DICT = {
     "key_takeaways": "Shows primary feasibility of end-to-end model-based SNN control with competitive performance.",
     "limitations": "Evaluated in simulation only; sim-to-real gap not addressed.",
     "relevance": "Directly relevant as a primary example of SNN-based continuous control with end-to-end learning.",
-    "cite_for": [
-        "End-to-end model-based SNN training for continuous control",
-        "Comparison of SNN vs ANN energy efficiency in robotics",
-    ],
+    "open_problems_future_directions": {
+        "future_work_proposed": ["Extend to physical robot; address sim-to-real transfer"],
+        "open_questions": [
+            "Does the approach scale to higher-DOF tasks? (Reviewer-noted)",
+        ],
+    },
     "critical_assessment": "Strong contribution; simulation-only evaluation limits generalizability.",
-    "quotable_sentences": [
-        "We demonstrate that SNNs can match ANN performance on continuous control tasks.",
-    ],
     "notable_findings": [
         "SNN matches ANN baseline reward within 5% (Measured)",
         "SNN achieves 40% lower average spike rate than equivalent rate-coded baseline (Reported)",
+    ],
+    "citable_snippets": [
+        {
+            "cite_for": "End-to-end model-based SNN training for continuous control",
+            "source": "Sec. 3",
+            "quote_tag": "Method",
+            "quote": None,
+        },
     ],
 }
 

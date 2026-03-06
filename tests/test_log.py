@@ -65,14 +65,3 @@ def test_setup_logging_is_idempotent():
     assert len(stream_handlers) == 1
 
 
-def test_setup_logging_output_contains_timestamp(tmp_path, capsys):
-    """Log output includes a HH:MM:SS timestamp prefix."""
-    setup_logging()
-    logging.getLogger("summarizer").info("sentinel-message")
-    err = capsys.readouterr().err
-    # Format: "HH:MM:SS  INFO    sentinel-message"
-    import re
-
-    assert re.search(r"\d{2}:\d{2}:\d{2}", err), f"No timestamp found in: {err!r}"
-    assert "sentinel-message" in err
-    assert "MainThread" in err

@@ -16,8 +16,8 @@ from pydantic import BaseModel, Field, model_validator
 # Type alias
 # ---------------------------------------------------------------------------
 
-PaperType = Literal["primary", "survey", "commentary"]
-"""The three supported research-paper classifications."""
+PaperType = Literal["primary", "synthesis"]
+"""The two supported research-paper classifications."""
 
 # ---------------------------------------------------------------------------
 # Metadata
@@ -38,6 +38,7 @@ class PaperMetadata(BaseModel):
     venue: str
     is_research_paper: bool
     paper_type: PaperType | None
+    synthesis_subtype: str | None = None
     rejection_reason: str | None = None
     tags: list[str]
 
@@ -63,16 +64,41 @@ class PaperMetadata(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Nested helper models
+# ---------------------------------------------------------------------------
+
+
+class CitableSnippet(BaseModel):
+    """A single citable snippet with an optional verbatim quotable sentence."""
+
+    cite_for: str
+    source: str
+    quote_tag: str | None = None
+    quote: str | None = None
+
+
+class OpenProblemsPrimary(BaseModel):
+    """Open problems and future directions for primary research papers."""
+
+    future_work_proposed: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+
+
+class OpenProblemsSynthesis(BaseModel):
+    """Open problems and future directions for synthesis papers."""
+
+    gaps_identified: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+    suggested_research_focus: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # Part 1 variants (discriminated union on paper_type)
 # ---------------------------------------------------------------------------
 
 
 class SummaryPart1Primary(BaseModel):
-    """Part 1 summary fields for a primary research paper (≤250 words total).
-
-    ``cite_for`` and ``quotable_sentences`` default to empty lists so that
-    local LLMs which occasionally omit these fields do not hard-fail validation.
-    """
+    """Part 1 summary fields for a primary research paper (≤600 words total)."""
 
     paper_type: Literal["primary"]
     tldr: str
@@ -82,48 +108,39 @@ class SummaryPart1Primary(BaseModel):
     results: str
     key_takeaways: str
     limitations: str
-    relevance: str
-    cite_for: list[str] = Field(default_factory=list)
+    open_problems_future_directions: OpenProblemsPrimary = Field(
+        default_factory=OpenProblemsPrimary
+    )
     critical_assessment: str
-    quotable_sentences: list[str] = Field(default_factory=list)
     notable_findings: list[str] = Field(default_factory=list)
+    citable_snippets: list[CitableSnippet] = Field(default_factory=list)
+    relevance: str
 
 
-class SummaryPart1Survey(BaseModel):
-    """Part 1 summary fields for a survey or review paper (≤200 words total).
+class SummaryPart1Synthesis(BaseModel):
+    """Part 1 summary fields for a synthesis paper (≤1000 words total).
 
-    ``cite_for`` and ``quotable_sentences`` default to empty lists so that
-    local LLMs which occasionally omit these fields do not hard-fail validation.
+    Covers reviews, surveys, perspectives, opinions, commentaries.
+    Use ``not applicable`` for sections that genuinely do not apply.
     """
 
-    paper_type: Literal["survey"]
+    paper_type: Literal["synthesis"]
     tldr: str
+    target_papers_field: str
     scope_coverage: str
     taxonomy_organization: str
-    key_claims_narrative: str
-    gaps_identified: str
-    relevance: str
-    cite_for: list[str] = Field(default_factory=list)
-    critical_assessment: str
-    quotable_sentences: list[str] = Field(default_factory=list)
-
-
-class SummaryPart1Commentary(BaseModel):
-    """Part 1 summary fields for a commentary or opinion paper (≤120 words total).
-
-    ``cite_for`` and ``quotable_sentences`` default to empty lists so that
-    local LLMs which occasionally omit these fields do not hard-fail validation.
-    """
-
-    paper_type: Literal["commentary"]
-    tldr: str
     core_argument: str
-    target_papers: str
+    synthesis_contribution: str
+    key_claims_narrative: str
+    key_takeaways: str
     limitations: str
-    relevance: str
-    cite_for: list[str] = Field(default_factory=list)
+    open_problems_future_directions: OpenProblemsSynthesis = Field(
+        default_factory=OpenProblemsSynthesis
+    )
     critical_assessment: str
-    quotable_sentences: list[str] = Field(default_factory=list)
+    notable_findings: list[str] = Field(default_factory=list)
+    citable_snippets: list[CitableSnippet] = Field(default_factory=list)
+    relevance: str
 
 
 class SummaryPart1NonResearch(BaseModel):
@@ -140,8 +157,7 @@ class SummaryPart1NonResearch(BaseModel):
 SummaryPart1 = Annotated[
     Union[
         SummaryPart1Primary,
-        SummaryPart1Survey,
-        SummaryPart1Commentary,
+        SummaryPart1Synthesis,
         SummaryPart1NonResearch,
     ],
     Field(discriminator="paper_type"),
@@ -158,10 +174,10 @@ class SummaryPart2(BaseModel):
 
     Field values should use ``"not reported"`` when a concept applies but the
     paper omits it, and ``"not applicable"`` only when the concept genuinely
-    does not apply (e.g. ``"not applicable (survey)"``).
+    does not apply (e.g. ``"not applicable (synthesis)"``).
 
     Part 2 is produced only for ``paper_type="primary"`` research papers.
-    Survey/commentary and non-research documents use ``part2=null``.
+    Synthesis and non-research documents use ``part2=null``.
     """
 
     neuron_model: str
@@ -196,7 +212,7 @@ class LLMResponse(BaseModel):
     ``metadata``, ``part1``, and ``part2``.
 
     - For primary papers, ``part2`` is required.
-    - For survey/commentary and non-research documents, ``part2`` is ``null``.
+    - For synthesis and non-research documents, ``part2`` is ``null``.
     """
 
     metadata: PaperMetadata
@@ -222,11 +238,8 @@ class LLMResponse(BaseModel):
         if self.metadata.paper_type == "primary" and self.part2 is None:
             raise ValueError("part2 is required for primary papers")
 
-        if (
-            self.metadata.paper_type in {"survey", "commentary"}
-            and self.part2 is not None
-        ):
-            raise ValueError("part2 must be null for survey/commentary papers")
+        if self.metadata.paper_type == "synthesis" and self.part2 is not None:
+            raise ValueError("part2 must be null for synthesis papers")
 
         return self
 
@@ -243,7 +256,7 @@ class PaperSummary(BaseModel):
     all pydantic validation passes. Passed to ``renderer.render_summary()`` to
     produce the final markdown string.
 
-    ``part2`` is ``None`` for survey/commentary and non-research documents.
+    ``part2`` is ``None`` for synthesis and non-research documents.
     Part 2 is generated only for primary research papers.
     """
 
@@ -271,6 +284,7 @@ class BatchReport(BaseModel):
     skipped: int
     failed: int
     failed_papers: list[FailedPaper]
+    total_cost: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -311,8 +325,8 @@ class Config:
         dry_run:        If True, list PDFs that would be processed without
                         making any LLM calls or writing any files.
         output_dir:     Root directory for centralized summary output.
-                        Subdirs ``primary/``, ``survey/``, ``commentary/``,
-                        and ``non_research/`` are created automatically.
+                        Subdirs ``primary/``, ``synthesis/``, and
+                        ``non_research/`` are created automatically.
         skill_data_dir: Path to the directory containing reference .md files
                         (output-template, extraction fields, learning paradigms).
         verbose:        If True, print context size diagnostics (chars, estimated

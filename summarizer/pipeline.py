@@ -7,11 +7,12 @@ in one combined JSON response.
 import logging
 import json
 import re
+import unicodedata
 from pathlib import Path
 
 from pydantic import ValidationError
 
-from summarizer.llm import call_llm, create_client
+from summarizer.llm import CostAccumulator, LMStudioClient, call_llm, create_client
 from summarizer.models import (
     Config,
     LLMResponse,
@@ -27,7 +28,12 @@ logger = logging.getLogger(__name__)
 _MAX_SCHEMA_REPAIR_RETRIES = 2
 
 
-def process_pdf(pdf_path: Path, config: Config) -> PaperSummary:
+def process_pdf(
+    pdf_path: Path,
+    config: Config,
+    client: "LMStudioClient | None" = None,
+    accumulator: "CostAccumulator | None" = None,
+) -> PaperSummary:
     """Process a single PDF end-to-end and return a validated ``PaperSummary``.
 
     Steps
@@ -37,19 +43,31 @@ def process_pdf(pdf_path: Path, config: Config) -> PaperSummary:
     3. Call the LLM once; validate the response into ``LLMResponse``.
     4. Return a fully validated ``PaperSummary``.
 
+    Args:
+        pdf_path:    Path to the PDF to process.
+        config:      Runtime configuration.
+        client:      Optional pre-created LLM client.  When ``None`` a new
+                     client is created from ``config`` (default behaviour).
+        accumulator: Optional cost accumulator updated after each LLM call.
+
     Raises:
         PipelineError: wraps any ``ParseError``, ``LLMError``,
             ``ValidationError``, or other exception that occurs.
     """
     try:
-        return _run_pipeline(pdf_path, config)
+        return _run_pipeline(pdf_path, config, client=client, accumulator=accumulator)
     except PipelineError:
         raise
     except Exception as e:
         raise PipelineError(pdf_path, e) from e
 
 
-def _run_pipeline(pdf_path: Path, config: Config) -> PaperSummary:
+def _run_pipeline(
+    pdf_path: Path,
+    config: Config,
+    client: "LMStudioClient | None" = None,
+    accumulator: "CostAccumulator | None" = None,
+) -> PaperSummary:
     # Step 1: parse PDF → markdown (uses cache if available)
     paper_text = parse_pdf(
         pdf_path,
@@ -60,7 +78,8 @@ def _run_pipeline(pdf_path: Path, config: Config) -> PaperSummary:
 
     # Step 2: load references and build combined prompt
     references = load_references(config.skill_data_dir)
-    client = create_client(config)
+    if client is None:
+        client = create_client(config)
     prompt = build_combined_prompt(
         paper_text=paper_text,
         references=references,
@@ -73,12 +92,13 @@ def _run_pipeline(pdf_path: Path, config: Config) -> PaperSummary:
     )
 
     # Step 3: single LLM call → parse and validate
-    raw = call_llm(client, prompt)
+    raw = call_llm(client, prompt, accumulator=accumulator)
     response = _validate_with_schema_repair(
         raw=raw,
         client=client,
         original_prompt=prompt,
         pdf_path=pdf_path,
+        accumulator=accumulator,
     )
 
     return PaperSummary(
@@ -91,6 +111,7 @@ def _validate_with_schema_repair(
     client,
     original_prompt: str,
     pdf_path: Path,
+    accumulator: "CostAccumulator | None" = None,
 ) -> LLMResponse:
     """Validate response and repair schema with bounded LLM retries."""
     current = raw
@@ -117,7 +138,7 @@ def _validate_with_schema_repair(
                 bad_response=current,
                 validation_errors=compact,
             )
-            current = call_llm(client, repair_prompt)
+            current = call_llm(client, repair_prompt, accumulator=accumulator)
 
     raise RuntimeError("Schema validation retry loop exhausted unexpectedly")
 
@@ -132,6 +153,22 @@ def _compact_validation_errors(exc: ValidationError) -> list[str]:
     return compact
 
 
+_PRIMARY_PART2_FIELDS = (
+    "neuron_model, network_architecture, model_scale, simulator_framework, "
+    "hardware_training, controller_hardware_inference, control_task, task_type, "
+    "task_complexity_scale, simulation_environment, spike_encoding, action_decoding, "
+    "learning_mechanism, credit_assignment_scope, online_vs_offline, data_collection, "
+    "key_training_details, comparison_to_baselines"
+)
+
+_SYNTHESIS_PART1_FIELDS = (
+    "paper_type, tldr, target_papers_field, scope_coverage, taxonomy_organization, "
+    "core_argument, synthesis_contribution, key_claims_narrative, key_takeaways, "
+    "limitations, open_problems_future_directions, critical_assessment, notable_findings, "
+    "citable_snippets, relevance"
+)
+
+
 def _build_schema_repair_prompt(
     original_prompt: str,
     bad_response: dict,
@@ -141,6 +178,22 @@ def _build_schema_repair_prompt(
     rendered_errors = "\n".join(f"- {item}" for item in validation_errors)
     bad_json = json.dumps(bad_response, ensure_ascii=False)
 
+    paper_type = (bad_response.get("metadata") or {}).get("paper_type")
+    if paper_type == "primary":
+        field_hint = (
+            f"Required part2 fields (all must be present): {_PRIMARY_PART2_FIELDS}. "
+            "Use 'not applicable' or 'not reported' for any field that cannot be filled."
+        )
+    elif paper_type == "synthesis":
+        field_hint = (
+            f"Required part1 fields for synthesis (all must be present): {_SYNTHESIS_PART1_FIELDS}. "
+            "Use 'not applicable' for any field that does not apply — never omit the key."
+        )
+    else:
+        field_hint = ""
+
+    field_hint_block = f"\nRequired fields hint:\n{field_hint}\n" if field_hint else ""
+
     return (
         "You are a JSON schema-repair assistant.\n"
         "Task: Fix the RESPONSE JSON so it satisfies the expected schema.\n"
@@ -149,7 +202,8 @@ def _build_schema_repair_prompt(
         "2) Preserve existing fields and values when possible.\n"
         "3) Add/repair only what is needed to satisfy schema requirements.\n"
         "4) Do not invent unsupported facts; use 'not reported' when required and unknown.\n"
-        "5) Keep top-level keys exactly: metadata, part1, part2.\n\n"
+        "5) Keep top-level keys exactly: metadata, part1, part2.\n"
+        f"{field_hint_block}\n"
         "Validation errors:\n"
         f"{rendered_errors}\n\n"
         "Original extraction prompt (for context):\n"
@@ -195,6 +249,16 @@ def _normalize_metadata_year(raw: dict, pdf_path: Path) -> dict:
     return raw
 
 
+def _sanitize_citation_key(value: str) -> str:
+    """Strip diacritics and non-alnum chars from a citation key candidate.
+
+    Applies NFKD Unicode decomposition to convert accented characters to their
+    ASCII base (e.g. é→e, ñ→n), then removes everything outside [a-z0-9].
+    """
+    ascii_val = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]", "", ascii_val.lower())
+
+
 def _normalize_citation_key(raw: dict, pdf_path: Path) -> dict:
     """Repair missing/invalid citation_key values before schema validation."""
     metadata = raw.get("metadata")
@@ -204,6 +268,19 @@ def _normalize_citation_key(raw: dict, pdf_path: Path) -> dict:
     citation_key = metadata.get("citation_key")
     if _is_valid_citation_key(citation_key):
         return raw
+
+    # Try lightweight sanitization first (strips accents, hyphens, spaces).
+    # Preserves the LLM's intent rather than rebuilding from scratch.
+    if isinstance(citation_key, str) and citation_key.strip():
+        sanitized = _sanitize_citation_key(citation_key.strip())
+        if _is_valid_citation_key(sanitized):
+            logger.info(
+                "LLM citation_key=%r sanitized to %s",
+                citation_key,
+                sanitized,
+            )
+            metadata["citation_key"] = sanitized
+            return raw
 
     repaired = _build_citation_key(metadata, pdf_path)
     logger.warning(
@@ -221,7 +298,7 @@ def _is_valid_citation_key(value: object) -> bool:
     stripped = value.strip()
     if not stripped:
         return False
-    if stripped.lower() in {"not reported", "unknown", "n/a", "na"}:
+    if stripped.lower() in {"not reported", "unknown", "n/a", "na", "notreported", "notapplicable"}:
         return False
     return bool(re.fullmatch(r"[a-z][a-z0-9]*", stripped))
 
@@ -257,10 +334,17 @@ def _first_alnum_token(value: str) -> str:
 
 
 def _author_surname_token(author_name: str) -> str:
-    """Extract a surname-like token from an author name string."""
+    """Extract a surname-like token from an author name string.
+
+    Normalizes Unicode (NFKD) before splitting so that accented characters
+    are converted to their ASCII base rather than acting as separators.
+    """
+    ascii_name = (
+        unicodedata.normalize("NFKD", author_name).encode("ascii", "ignore").decode("ascii")
+    )
     tokens = [
         t.lower()
-        for t in re.split(r"[^A-Za-z0-9]+", author_name)
+        for t in re.split(r"[^A-Za-z0-9]+", ascii_name)
         if t and re.search(r"[a-zA-Z]", t)
     ]
     if not tokens:

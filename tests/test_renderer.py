@@ -6,10 +6,9 @@ from pathlib import Path
 from summarizer.models import (
     PaperMetadata,
     PaperSummary,
-    SummaryPart1Commentary,
     SummaryPart1NonResearch,
     SummaryPart1Primary,
-    SummaryPart1Survey,
+    SummaryPart1Synthesis,
     SummaryPart2,
 )
 from summarizer.renderer import render_summary
@@ -66,9 +65,10 @@ def test_render_primary_has_part1_sections(mock_part1_dict, mock_part2_dict):
     assert "### Results" in md
     assert "### Key Takeaways" in md
     assert "### Limitations" in md
-    assert "### Relevance to This Review" in md
+    assert "### Open Problems & Future Directions" in md
     assert "### Critical Assessment" in md
-    assert "### Quotable Sentences" in md
+    assert "### Citable Snippets" in md
+    assert 'Relevance to a review on "spiking neural networks for control"' in md
 
 
 def test_render_primary_has_part2_section(mock_part1_dict, mock_part2_dict):
@@ -79,17 +79,11 @@ def test_render_primary_has_part2_section(mock_part1_dict, mock_part2_dict):
     assert "**Comparison to baselines:**" in md
 
 
-def test_render_primary_cite_for_bullets(mock_part1_dict, mock_part2_dict):
+def test_render_primary_citable_snippets(mock_part1_dict, mock_part2_dict):
     md = render_summary(_make_summary(mock_part1_dict, mock_part2_dict))
-    assert "**Cite for:**" in md
-    for item in mock_part1_dict["cite_for"]:
-        assert f"- {item}" in md
-
-
-def test_render_primary_quotable_sentences(mock_part1_dict, mock_part2_dict):
-    md = render_summary(_make_summary(mock_part1_dict, mock_part2_dict))
-    for sentence in mock_part1_dict["quotable_sentences"]:
-        assert sentence in md
+    # The citable snippet cite_for text should appear bolded
+    snippet = mock_part1_dict["citable_snippets"][0]
+    assert f"**{snippet['cite_for']}**" in md
 
 
 def test_render_primary_notable_findings_bullets(mock_part1_dict, mock_part2_dict):
@@ -109,11 +103,11 @@ def test_render_primary_has_separators(mock_part1_dict, mock_part2_dict):
 
 
 # ---------------------------------------------------------------------------
-# Survey paper rendering
+# Synthesis paper rendering
 # ---------------------------------------------------------------------------
 
 
-def _make_survey_summary() -> PaperSummary:
+def _make_synthesis_summary() -> PaperSummary:
     meta = PaperMetadata(
         citation_key="oikonomou2025reinforcement",
         title="Reinforcement Learning with SNNs: A Survey",
@@ -121,92 +115,53 @@ def _make_survey_summary() -> PaperSummary:
         year=2025,
         venue="Preprint",
         is_research_paper=True,
-        paper_type="survey",
+        paper_type="synthesis",
+        synthesis_subtype="survey",
         rejection_reason=None,
         tags=["SNN", "survey", "RL"],
     )
-    part1 = SummaryPart1Survey(
-        paper_type="survey",
+    part1 = SummaryPart1Synthesis(
+        paper_type="synthesis",
         tldr="A survey of RL methods using spiking neural networks.",
+        target_papers_field="Spiking neural networks applied to reinforcement learning.",
         scope_coverage="80 papers, 2018–2024, keyword search.",
-        taxonomy_organization="Organized by learning algorithm.",
-        key_claims_narrative="SNNs are increasingly viable for RL.",
-        gaps_identified="No standardized benchmarks.",
-        relevance="Background for Section 2.",
-        cite_for=["Overview of SNN-based RL approaches"],
-        critical_assessment="Selection bias toward arXiv; no systematic criteria.",
-        quotable_sentences=["The field is rapidly maturing."],
+        taxonomy_organization="Organized by learning algorithm: STDP, surrogate gradients, reward-based.",
+        core_argument="The authors argue that SNNs are increasingly viable for RL tasks.",
+        synthesis_contribution="Introduces a three-axis taxonomy (neuron model, learning rule, deployment target) not previously formalized.",
+        key_claims_narrative="SNNs achieve competitive performance on simulated tasks; no real-robot benchmarks exist.",
+        key_takeaways="Standardized benchmarks and real-hardware evaluations are needed.",
+        limitations="Narrative selection bias; no systematic inclusion criteria stated.",
+        relevance="Background for Section 2 of the SNN control review.",
+        critical_assessment="Quantitative claims lack trace anchors; selection bias is unacknowledged.",
     )
     return PaperSummary(metadata=meta, part1=part1, part2=None)
 
 
-def test_render_survey_has_survey_sections():
-    md = render_summary(_make_survey_summary())
-    assert "### Scope & Coverage" in md
+def test_render_synthesis_has_synthesis_sections():
+    md = render_summary(_make_synthesis_summary())
+    assert "### Detailed Scope & Coverage" in md
     assert "### Taxonomy & Organization" in md
     assert "### Key Claims & Narrative" in md
-    assert "### Gaps Identified" in md
+    assert "### Core Argument" in md
+    assert "### Synthesis Contribution" in md
+    assert "### Open Problems & Future Directions" in md
 
 
-def test_render_survey_does_not_have_primary_sections():
-    md = render_summary(_make_survey_summary())
+def test_render_synthesis_header_includes_subtype():
+    md = render_summary(_make_synthesis_summary())
+    assert "**Paper Type:** synthesis — survey" in md
+
+
+def test_render_synthesis_does_not_have_primary_sections():
+    md = render_summary(_make_synthesis_summary())
     assert "### Problem & Motivation" not in md
     assert "### Core Contribution" not in md
     assert "### Methods" not in md
     assert "### Results" not in md
 
 
-def test_render_survey_has_no_part2():
-    md = render_summary(_make_survey_summary())
-    assert "## Part 2: SNN Control Extraction" not in md
-
-
-# ---------------------------------------------------------------------------
-# Commentary paper rendering
-# ---------------------------------------------------------------------------
-
-
-def _make_commentary_summary() -> PaperSummary:
-    meta = PaperMetadata(
-        citation_key="dewolf2021spiking",
-        title="Spiking Neural Networks Take Control",
-        authors=["T. W. Dewolf"],
-        year=2021,
-        venue="Science Robotics",
-        is_research_paper=True,
-        paper_type="commentary",
-        rejection_reason=None,
-        tags=["SNN", "commentary", "robotics"],
-    )
-    part1 = SummaryPart1Commentary(
-        paper_type="commentary",
-        tldr="The author argues SNNs are ready for real robotic deployment.",
-        core_argument="Recent advances make SNNs viable for autonomous robots.",
-        target_papers="Stagsted et al. 2020",
-        limitations="Evidence from a single paper; claims may overextend.",
-        relevance="Opinion context for the review.",
-        cite_for=["Optimistic framing of SNN maturity"],
-        critical_assessment="Argument is plausible but rests on limited evidence.",
-        quotable_sentences=["Spiking neural networks are finally ready."],
-    )
-    return PaperSummary(metadata=meta, part1=part1, part2=None)
-
-
-def test_render_commentary_has_commentary_sections():
-    md = render_summary(_make_commentary_summary())
-    assert "### Core Argument" in md
-    assert "### Target Paper(s)" in md
-
-
-def test_render_commentary_does_not_have_primary_sections():
-    md = render_summary(_make_commentary_summary())
-    assert "### Core Contribution" not in md
-    assert "### Methods" not in md
-    assert "### Results" not in md
-
-
-def test_render_commentary_has_no_part2():
-    md = render_summary(_make_commentary_summary())
+def test_render_synthesis_has_no_part2():
+    md = render_summary(_make_synthesis_summary())
     assert "## Part 2: SNN Control Extraction" not in md
 
 
@@ -257,10 +212,10 @@ def test_render_non_research_has_no_part2():
 
 
 def _make_bloated_primary(mock_part1_dict, mock_part2_dict) -> PaperSummary:
-    """Return a primary PaperSummary whose Part 1 prose is far over the 400-word limit."""
+    """Return a primary PaperSummary whose Part 1 prose is far over the 600-word limit."""
     bloated = (
-        "word " * 700
-    )  # 700 words — exceeds 150% of the 400-word limit (threshold: 600)
+        "word " * 1000
+    )  # 1000 words — exceeds 150% of the 600-word limit (threshold: 900)
     meta_data = {k: mock_part1_dict[k] for k in (*_METADATA_ONLY_KEYS, "paper_type")}
     meta_data["is_research_paper"] = True
     meta_data["rejection_reason"] = None

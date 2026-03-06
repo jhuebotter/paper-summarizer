@@ -32,6 +32,7 @@ htmlcov/
 # Data files
 input_papers/
 output_summaries/
+output_summaries_v2/
 test_pdfs/
 test_summaries/
 logs/

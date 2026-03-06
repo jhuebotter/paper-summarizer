@@ -27,12 +27,16 @@ Hard rules:
   "venue": "string",
   "is_research_paper": true,
   "paper_type": "primary",
+  "synthesis_subtype": null,
   "rejection_reason": null,
   "tags": ["tag1", "tag2"]
 }
 ```
 
-If `is_research_paper=false`, then `paper_type` must be `null` and `rejection_reason` must be a short reason.
+- `paper_type`: **exactly** `"primary"` | `"synthesis"` | `null` — no other values are valid. Do NOT use `"commentary"`, `"review"`, `"survey"`, `"opinion"`, `"perspective"`, or any other string here.
+- `synthesis_subtype`: `null` for primary; for synthesis, one of: `"review"` / `"survey"` / `"perspective"` / `"commentary"` / `"opinion"` / `"tutorial"` / `"position"` / `"meta-analysis"` / `"mixed"` — this is where the specific subtype goes.
+- If `is_research_paper=false`, then `paper_type` must be `null` and `rejection_reason` must be a short reason string.
+- **`is_research_paper: false` is reserved strictly for non-academic documents** (slides, forms, websites, software manuals, etc.). Any document published in a scientific journal, conference, or preprint server — including editorials, focus articles, opinions, commentaries, and perspectives — must be `is_research_paper: true`. A paper that argues a position or synthesizes prior work without new experiments is **synthesis**, not non-research.
 
 ---
 
@@ -50,6 +54,7 @@ If `is_research_paper=false`, then `paper_type` must be `null` and `rejection_re
     "venue": "string",
     "is_research_paper": true,
     "paper_type": "primary",
+    "synthesis_subtype": null,
     "rejection_reason": null,
     "tags": ["tag1", "tag2"]
   },
@@ -62,11 +67,21 @@ If `is_research_paper=false`, then `paper_type` must be `null` and `rejection_re
     "results": "string",
     "key_takeaways": "string",
     "limitations": "string",
-    "relevance": "string",
-    "cite_for": ["string"],
+    "open_problems_future_directions": {
+      "future_work_proposed": ["string (Paper-identified)"],
+      "open_questions": ["string (Paper-identified | Reviewer-noted)"]
+    },
     "critical_assessment": "string",
-    "quotable_sentences": ["string"],
-    "notable_findings": ["string (Measured)"]
+    "notable_findings": ["string (Measured|Reported|Claimed|Attributed) (Source: Fig./Tbl./Sec.)"],
+    "citable_snippets": [
+      {
+        "cite_for": "string",
+        "source": "string",
+        "quote_tag": "Definition | Method | Claim | Result",
+        "quote": "string or null"
+      }
+    ],
+    "relevance": "string"
   },
   "part2": {
     "neuron_model": "string",
@@ -91,7 +106,7 @@ If `is_research_paper=false`, then `paper_type` must be `null` and `rejection_re
 }
 ```
 
-### Survey / review
+### Synthesis (review / survey / perspective / commentary / opinion / …)
 
 ```json
 {
@@ -102,51 +117,38 @@ If `is_research_paper=false`, then `paper_type` must be `null` and `rejection_re
     "year": 2025,
     "venue": "string",
     "is_research_paper": true,
-    "paper_type": "survey",
+    "paper_type": "synthesis",
+    "synthesis_subtype": "review",
     "rejection_reason": null,
     "tags": ["tag1", "tag2"]
   },
   "part1": {
-    "paper_type": "survey",
+    "paper_type": "synthesis",
     "tldr": "string",
+    "target_papers_field": "string",
     "scope_coverage": "string",
     "taxonomy_organization": "string",
-    "key_claims_narrative": "string",
-    "gaps_identified": "string",
-    "relevance": "string",
-    "cite_for": ["string"],
-    "critical_assessment": "string",
-    "quotable_sentences": ["string"]
-  },
-  "part2": null
-}
-```
-
-### Commentary / opinion
-
-```json
-{
-  "metadata": {
-    "citation_key": "firstauthor2025firstword",
-    "title": "string",
-    "authors": ["First Last"],
-    "year": 2025,
-    "venue": "string",
-    "is_research_paper": true,
-    "paper_type": "commentary",
-    "rejection_reason": null,
-    "tags": ["tag1", "tag2"]
-  },
-  "part1": {
-    "paper_type": "commentary",
-    "tldr": "string",
     "core_argument": "string",
-    "target_papers": "string",
+    "synthesis_contribution": "string",
+    "key_claims_narrative": "string",
+    "key_takeaways": "string",
     "limitations": "string",
-    "relevance": "string",
-    "cite_for": ["string"],
+    "open_problems_future_directions": {
+      "gaps_identified": ["string (Paper-identified)"],
+      "open_questions": ["string (Paper-identified | Reviewer-noted)"],
+      "suggested_research_focus": ["string (Paper-identified)"]
+    },
     "critical_assessment": "string",
-    "quotable_sentences": ["string"]
+    "notable_findings": ["string (Reported|Claimed|Attributed) (Source: Fig./Tbl./Sec.)"],
+    "citable_snippets": [
+      {
+        "cite_for": "string",
+        "source": "string",
+        "quote_tag": "Definition | Quantitative synthesis | Editorial judgment | Attributed",
+        "quote": "string or null"
+      }
+    ],
+    "relevance": "string"
   },
   "part2": null
 }
@@ -164,6 +166,7 @@ If `is_research_paper=false`, then `paper_type` must be `null` and `rejection_re
     "venue": "not applicable",
     "is_research_paper": false,
     "paper_type": null,
+    "synthesis_subtype": null,
     "rejection_reason": "short reason",
     "tags": ["non-research"]
   },

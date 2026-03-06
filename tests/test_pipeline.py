@@ -5,8 +5,13 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from summarizer.llm import CostAccumulator, ModelPricing, UsageStats
 from summarizer.models import Config, LLMError, ParseError, PipelineError, PaperSummary
-from summarizer.pipeline import process_pdf
+from summarizer.pipeline import (
+    process_pdf,
+    _sanitize_citation_key,
+    _author_surname_token,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -173,13 +178,61 @@ def test_process_pdf_normalizes_invalid_citation_key(
     assert summary.metadata.citation_key == "huebotter2025spiking"
 
 
+def test_process_pdf_sanitizes_accented_citation_key(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    """Accented + hyphenated keys like 'paredes-vallés2024fully' are sanitized to ASCII alnum."""
+    bad_part1 = dict(mock_part1_dict)
+    bad_part1["citation_key"] = "paredes-vallés2024fully"
+    combined = _make_combined_dict(bad_part1, mock_part2_dict)
+    client_patcher, _ = _mock_llm_combined(combined)
+
+    with _mock_parse("Some paper text."), client_patcher:
+        summary = process_pdf(fake_pdf, config)
+
+    assert summary.metadata.citation_key == "paredesvalles2024fully"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for citation key helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("paredes-vallés2024fully", "paredesvalles2024fully"),
+        ("müller2023control", "muller2023control"),
+        ("smith2024neural", "smith2024neural"),  # already clean — no change
+        ("Ño2025spiking", "no2025spiking"),
+        ("de-wolf2021spiking", "dewolf2021spiking"),
+    ],
+)
+def test_sanitize_citation_key(value, expected):
+    assert _sanitize_citation_key(value) == expected
+
+
+@pytest.mark.parametrize(
+    "author_name, expected",
+    [
+        ("F. Paredes-Vallés", "valles"),   # "First. Surname" → last token is surname
+        ("Müller J.", "j"),                # "Surname I." → last token is initial (by design)
+        ("J. Müller", "muller"),           # "I. Surname" → last token is surname
+        ("Travis DeWolf", "dewolf"),
+        ("Smith", "smith"),
+    ],
+)
+def test_author_surname_token_unicode(author_name, expected):
+    assert _author_surname_token(author_name) == expected
+
+
 # ---------------------------------------------------------------------------
 # Non-research document path
 # ---------------------------------------------------------------------------
 
 
-def test_process_pdf_non_research_has_null_part2(fake_pdf, config):
-    """For non-research documents, part2 remains null."""
+def test_process_pdf_non_research(fake_pdf, config):
+    """Non-research documents: part2 is None and a PaperSummary is returned."""
     combined = {
         "metadata": {
             "citation_key": "doc2025foo",
@@ -205,37 +258,9 @@ def test_process_pdf_non_research_has_null_part2(fake_pdf, config):
         summary = process_pdf(fake_pdf, config)
 
     assert mock_client.complete.call_count == 1
+    assert isinstance(summary, PaperSummary)
     assert summary.part1.paper_type == "non_research"
     assert summary.part2 is None
-
-
-def test_process_pdf_non_research_still_returns_paper_summary(fake_pdf, config):
-    """PaperSummary is returned for non-research documents."""
-    combined = {
-        "metadata": {
-            "citation_key": "doc2025foo",
-            "title": "Form",
-            "authors": ["A"],
-            "year": 2025,
-            "venue": "not applicable",
-            "is_research_paper": False,
-            "paper_type": None,
-            "rejection_reason": "Not a paper.",
-            "tags": ["non-research"],
-        },
-        "part1": {"paper_type": "non_research", "note": "Not a paper."},
-        "part2": None,
-    }
-    mock_client = MagicMock()
-    mock_client.complete.return_value = MagicMock(text=json.dumps(combined))
-
-    with (
-        _mock_parse("text"),
-        patch("summarizer.pipeline.create_client", return_value=mock_client),
-    ):
-        summary = process_pdf(fake_pdf, config)
-
-    assert isinstance(summary, PaperSummary)
 
 
 # ---------------------------------------------------------------------------
@@ -243,29 +268,15 @@ def test_process_pdf_non_research_still_returns_paper_summary(fake_pdf, config):
 # ---------------------------------------------------------------------------
 
 
-def test_process_pdf_forwards_reparse_to_parser(
-    fake_pdf, config, mock_part1_dict, mock_part2_dict
+@pytest.mark.parametrize("config_attr,config_value,kwarg_name,expected", [
+    ("reparse", True, "reparse", True),
+    ("extractor", "pypdf", "extractor", "pypdf"),
+])
+def test_process_pdf_forwards_parser_config(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict, config_attr, config_value, kwarg_name, expected
 ):
-    """config.reparse is forwarded to parse_pdf as the reparse argument."""
-    config.reparse = True
-    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
-    client_patcher, mock_client = _mock_llm_combined(combined)
-
-    with (
-        patch("summarizer.pipeline.parse_pdf", return_value="text") as mock_parse,
-        client_patcher,
-    ):
-        process_pdf(fake_pdf, config)
-
-    _, kwargs = mock_parse.call_args
-    assert kwargs.get("reparse") is True or mock_parse.call_args[0][2] is True
-
-
-def test_process_pdf_forwards_extractor_to_parser(
-    fake_pdf, config, mock_part1_dict, mock_part2_dict
-):
-    """config.extractor is forwarded to parse_pdf."""
-    config.extractor = "pypdf"
+    """Config parser flags are forwarded to parse_pdf as keyword arguments."""
+    setattr(config, config_attr, config_value)
     combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
     client_patcher, _ = _mock_llm_combined(combined)
 
@@ -276,7 +287,7 @@ def test_process_pdf_forwards_extractor_to_parser(
         process_pdf(fake_pdf, config)
 
     _, kwargs = mock_parse.call_args
-    assert kwargs.get("extractor") == "pypdf"
+    assert kwargs.get(kwarg_name) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -293,10 +304,22 @@ def test_process_pdf_parse_error_raises_pipeline_error(fake_pdf, config):
     assert isinstance(exc_info.value.cause, ParseError)
 
 
-def test_process_pdf_llm_error_raises_pipeline_error(fake_pdf, config):
-    """LLMError from the combined call is wrapped in PipelineError."""
+_BAD_RESPONSE_JSON = json.dumps({"metadata": {"paper_type": "primary"}, "part1": {}, "part2": {}})
+
+
+@pytest.mark.parametrize("side_effect,return_text,expected_calls", [
+    (Exception("connection refused"), None, 1),
+    (None, _BAD_RESPONSE_JSON, 3),
+])
+def test_process_pdf_llm_errors_raise_pipeline_error(
+    fake_pdf, config, side_effect, return_text, expected_calls
+):
+    """LLM and validation errors are wrapped in PipelineError."""
     mock_client = MagicMock()
-    mock_client.complete.side_effect = Exception("connection refused")
+    if side_effect is not None:
+        mock_client.complete.side_effect = side_effect
+    else:
+        mock_client.complete.return_value = MagicMock(text=return_text)
 
     with (
         _mock_parse("text."),
@@ -305,19 +328,73 @@ def test_process_pdf_llm_error_raises_pipeline_error(fake_pdf, config):
         with pytest.raises(PipelineError):
             process_pdf(fake_pdf, config)
 
+    assert mock_client.complete.call_count == expected_calls
 
-def test_process_pdf_validation_error_raises_pipeline_error(fake_pdf, config):
-    """If the LLM returns invalid JSON structure, PipelineError is raised."""
-    bad_response = {"metadata": {"paper_type": "primary"}, "part1": {}, "part2": {}}
+
+# ---------------------------------------------------------------------------
+# Phase 4: shared client + accumulator
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_client_for_combined(combined_dict: dict) -> MagicMock:
+    """Build a mock client whose complete() returns a proper response with usage."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(combined_dict)
+    mock_response.usage = UsageStats(input_tokens=500, output_tokens=200, reasoning_tokens=0)
     mock_client = MagicMock()
-    mock_client.complete.return_value = MagicMock(text=json.dumps(bad_response))
+    mock_client.pricing = ModelPricing()
+    mock_client.complete.return_value = mock_response
+    return mock_client
+
+
+def test_process_pdf_uses_provided_client_and_skips_create_client(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    """When a client is passed, create_client is NOT called."""
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    mock_client = _make_mock_client_for_combined(combined)
 
     with (
-        _mock_parse("text."),
+        _mock_parse("text"),
+        patch("summarizer.pipeline.create_client") as mock_create,
+    ):
+        process_pdf(fake_pdf, config, client=mock_client)
+
+    mock_create.assert_not_called()
+    mock_client.complete.assert_called_once()
+
+
+def test_process_pdf_creates_client_when_none_provided(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    """When client=None, create_client is called exactly once."""
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    mock_client = _make_mock_client_for_combined(combined)
+
+    with (
+        _mock_parse("text"),
+        patch("summarizer.pipeline.create_client", return_value=mock_client) as mock_create,
+    ):
+        process_pdf(fake_pdf, config)  # no client kwarg
+
+    mock_create.assert_called_once_with(config)
+
+
+def test_process_pdf_accumulator_is_updated(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    """When accumulator is provided, it is updated after the LLM call."""
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    mock_client = _make_mock_client_for_combined(combined)
+    mock_client.pricing = ModelPricing(prompt=1e-6, completion=3e-6)
+
+    acc = CostAccumulator()
+    with (
+        _mock_parse("text"),
         patch("summarizer.pipeline.create_client", return_value=mock_client),
     ):
-        with pytest.raises(PipelineError):
-            process_pdf(fake_pdf, config)
+        process_pdf(fake_pdf, config, accumulator=acc)
 
-    # Initial response + 2 schema-repair retries.
-    assert mock_client.complete.call_count == 3
+    assert acc.total_input_tokens == 500
+    assert acc.total_output_tokens == 200
+    assert acc.total_cost > 0

@@ -5,14 +5,20 @@ Supports any OpenAI-compatible backend: LM Studio (local) or OpenRouter
 injects the extra headers required by OpenRouter when the base URL matches.
 
 The public interface is ``LMStudioClient.complete(prompt)`` returning an
-object with a ``.text`` attribute, keeping all call sites and mocks stable.
+object with ``.text`` and ``.usage`` attributes, keeping all call sites and
+mocks stable.
 """
 
 import json
 import logging
 import os
 import re
+import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
 
 import openai as _openai
 
@@ -21,6 +27,48 @@ from summarizer.models import Config, LLMError
 logger = logging.getLogger(__name__)
 
 _MAX_TRANSIENT_RETRIES = 2
+
+# ---------------------------------------------------------------------------
+# Cost & usage data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ModelPricing:
+    """USD cost per token / per request (0.0 = free or unknown)."""
+
+    prompt: float = 0.0            # per input token
+    completion: float = 0.0        # per output token
+    reasoning: float = 0.0         # per reasoning token
+    request: float = 0.0           # flat per-request fee
+    context_length: int = 0        # max context in tokens (informational)
+
+
+@dataclass
+class UsageStats:
+    """Token counts returned by one completion call."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+
+
+class CostAccumulator:
+    """Thread-safe running total of tokens and USD cost across all calls."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.total_cost: float = 0.0
+        self.total_input_tokens: int = 0
+        self.total_output_tokens: int = 0
+        self.total_reasoning_tokens: int = 0
+
+    def add(self, usage: UsageStats, cost: float) -> None:
+        with self._lock:
+            self.total_cost += cost
+            self.total_input_tokens += usage.input_tokens
+            self.total_output_tokens += usage.output_tokens
+            self.total_reasoning_tokens += usage.reasoning_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -31,10 +79,11 @@ _MAX_TRANSIENT_RETRIES = 2
 class _CompletionResponse:
     """Thin wrapper presenting an openai chat response as ``response.text``."""
 
-    __slots__ = ("text",)
+    __slots__ = ("text", "usage")
 
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, usage: "UsageStats | None" = None) -> None:
         self.text = text
+        self.usage = usage
 
 
 class LMStudioClient:
@@ -44,7 +93,8 @@ class LMStudioClient:
     time and call sites use ``client.complete(prompt)``.
 
     Attributes:
-        model: The model identifier passed to every completion request.
+        model:   The model identifier passed to every completion request.
+        pricing: USD cost rates for this model (zero by default).
     """
 
     def __init__(
@@ -55,11 +105,13 @@ class LMStudioClient:
         extra_headers: dict | None = None,
         timeout_s: int = 120,
         max_output_tokens: int | None = None,
+        pricing: ModelPricing | None = None,
     ) -> None:
         self.model = model
         self.base_url = base_url
         self.timeout_s = timeout_s
         self.max_output_tokens = max_output_tokens
+        self.pricing = pricing or ModelPricing()
         self._client = _openai.OpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -76,7 +128,119 @@ class LMStudioClient:
         if self.max_output_tokens is not None:
             kwargs["max_tokens"] = self.max_output_tokens
         response = self._client.chat.completions.create(**kwargs)
-        return _CompletionResponse(text=response.choices[0].message.content)
+        usage = _extract_usage(response)
+        return _CompletionResponse(
+            text=response.choices[0].message.content,
+            usage=usage,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pricing helpers
+# ---------------------------------------------------------------------------
+
+
+def fetch_model_pricing(model_id: str, api_key: str, base_url: str) -> ModelPricing:
+    """Fetch pricing for ``model_id`` from the OpenRouter Models API.
+
+    Returns a zero ``ModelPricing`` (and logs a WARNING) if the request fails
+    or the model is not found in the response.
+
+    Args:
+        model_id: Model identifier, e.g. ``"openai/gpt-4o"``.
+        api_key:  OpenRouter API key for the Authorization header.
+        base_url: Base URL of the API, e.g. ``"https://openrouter.ai/api/v1"``.
+    """
+    # Derive models endpoint from base_url (strip trailing path components)
+    parsed = urllib.parse.urlparse(base_url)
+    models_url = f"{parsed.scheme}://{parsed.netloc}/api/v1/models"
+
+    req = urllib.request.Request(
+        models_url,
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read())
+    except Exception as exc:
+        logger.warning("Failed to fetch model pricing from %s: %s — using $0.00", models_url, exc)
+        return ModelPricing()
+
+    data = body.get("data", [])
+    model_info = next((m for m in data if m.get("id") == model_id), None)
+    if model_info is None:
+        logger.warning(
+            "Model %r not found in OpenRouter models list — using $0.00 pricing", model_id
+        )
+        return ModelPricing()
+
+    p = model_info.get("pricing", {})
+    context_length = model_info.get("context_length", 0)
+
+    def _f(key: str) -> float:
+        val = p.get(key, "0")
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return 0.0
+
+    pricing = ModelPricing(
+        prompt=_f("prompt"),
+        completion=_f("completion"),
+        reasoning=_f("internal_reasoning"),
+        request=_f("request"),
+        context_length=int(context_length) if context_length else 0,
+    )
+    logger.info(
+        "Model pricing fetched: %s  in=$%.2e  out=$%.2e  reason=$%.2e  ctx=%d",
+        model_id,
+        pricing.prompt,
+        pricing.completion,
+        pricing.reasoning,
+        pricing.context_length,
+    )
+    return pricing
+
+
+def _extract_usage(response) -> "UsageStats | None":
+    """Extract token counts from an OpenAI SDK response object.
+
+    Returns ``None`` if ``response.usage`` is absent or ``None``.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+
+    input_tokens: int = getattr(usage, "prompt_tokens", 0) or 0
+    output_tokens: int = getattr(usage, "completion_tokens", 0) or 0
+
+    reasoning_tokens = 0
+    details = getattr(usage, "completion_tokens_details", None)
+    if details is not None:
+        raw = getattr(details, "reasoning_tokens", None)
+        if raw is not None:
+            reasoning_tokens = int(raw)
+
+    return UsageStats(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
+    )
+
+
+def _calculate_cost(usage: "UsageStats | None", pricing: ModelPricing) -> float:
+    """Compute USD cost from token counts and pricing rates.
+
+    When ``usage`` is ``None``, only the flat ``request`` fee is applied.
+    """
+    cost = pricing.request
+    if usage is not None:
+        cost += (
+            usage.input_tokens * pricing.prompt
+            + usage.output_tokens * pricing.completion
+            + usage.reasoning_tokens * pricing.reasoning
+        )
+    return cost
 
 
 # ---------------------------------------------------------------------------
@@ -93,16 +257,20 @@ def create_client(config: Config) -> LMStudioClient:
         3. ``"lm-studio"`` fallback (LM Studio ignores the value)
 
     OpenRouter headers are injected automatically when ``config.base_url``
-    contains ``"openrouter.ai"``.
+    contains ``"openrouter.ai"``.  Pricing is fetched from the OpenRouter
+    Models API for remote backends; local backends use zero pricing.
     """
     api_key = config.api_key or os.environ.get("LLM_API_KEY") or "lm-studio"
 
     extra_headers: dict = {}
+    pricing: ModelPricing | None = None
+
     if "openrouter.ai" in config.base_url:
         extra_headers = {
             "HTTP-Referer": "https://github.com/agent-paper",
             "X-Title": "agent-paper",
         }
+        pricing = fetch_model_pricing(config.model, api_key, config.base_url)
 
     return LMStudioClient(
         model=config.model,
@@ -111,11 +279,19 @@ def create_client(config: Config) -> LMStudioClient:
         extra_headers=extra_headers,
         timeout_s=config.timeout_s,
         max_output_tokens=config.max_output_tokens,
+        pricing=pricing,
     )
 
 
-def call_llm(client: LMStudioClient, prompt: str) -> dict:
+def call_llm(
+    client: LMStudioClient,
+    prompt: str,
+    accumulator: "CostAccumulator | None" = None,
+) -> dict:
     """Send a prompt to the LLM and return the parsed JSON response.
+
+    Logs per-call token counts and USD cost.  When ``accumulator`` is
+    provided, updates the running totals.
 
     Raises:
         LLMError: if the LLM call fails or the response is not valid JSON.
@@ -123,16 +299,43 @@ def call_llm(client: LMStudioClient, prompt: str) -> dict:
     logger.info("Calling LLM  model=%s  backend=%s", client.model, client.base_url)
     logger.info("Awaiting response...")
     t0 = time.monotonic()
-    text = _complete_with_retries(client, prompt)
+    completion = _complete_with_retries(client, prompt)
     elapsed = time.monotonic() - t0
-    logger.info("Response received (%.1fs, %s chars)", elapsed, f"{len(text):,}")
+
+    usage = completion.usage
+    cost = _calculate_cost(usage, client.pricing)
+
+    if usage is not None:
+        logger.info(
+            "Response received (%.1fs, %s chars, in=%d out=%d reason=%d tokens, cost=$%.6f)",
+            elapsed,
+            f"{len(completion.text):,}",
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.reasoning_tokens,
+            cost,
+        )
+    else:
+        logger.info(
+            "Response received (%.1fs, %s chars, in=0 out=0 reason=0 tokens, cost=$%.6f)",
+            elapsed,
+            f"{len(completion.text):,}",
+            cost,
+        )
+
+    if accumulator is not None:
+        if usage is not None:
+            accumulator.add(usage, cost)
+        else:
+            # Only the flat request fee applies; use zero usage stats
+            accumulator.add(UsageStats(), cost)
 
     try:
-        return _extract_json(text)
+        return _extract_json(completion.text)
     except LLMError as parse_exc:
         logger.warning("Initial JSON parse failed; running one syntax-repair retry")
         try:
-            repaired = _repair_json_once(client, text)
+            repaired = _repair_json_once(client, completion.text, accumulator=accumulator)
         except Exception:
             raise parse_exc
         try:
@@ -161,10 +364,15 @@ def _extract_json(text: str) -> dict:
         raise LLMError(f"Failed to parse LLM response as JSON: {e}") from e
 
 
-def _repair_json_once(client: LMStudioClient, bad_text: str) -> str:
+def _repair_json_once(
+    client: LMStudioClient,
+    bad_text: str,
+    accumulator: "CostAccumulator | None" = None,
+) -> str:
     """Attempt one JSON syntax repair call and return repaired text.
 
     The model is instructed to preserve meaning and output valid JSON only.
+    Tokens and cost are logged and added to ``accumulator`` when provided.
     """
     repair_prompt = (
         "You are a JSON repair assistant.\n"
@@ -178,16 +386,27 @@ def _repair_json_once(client: LMStudioClient, bad_text: str) -> str:
         f"{bad_text}"
     )
     response = client.complete(repair_prompt)
+    usage = response.usage
+    cost = _calculate_cost(usage, client.pricing)
+    if usage is not None:
+        logger.info(
+            "JSON repair call (in=%d out=%d reason=%d tokens, cost=$%.6f)",
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.reasoning_tokens,
+            cost,
+        )
+    if accumulator is not None:
+        accumulator.add(usage if usage is not None else UsageStats(), cost)
     return response.text
 
 
-def _complete_with_retries(client: LMStudioClient, prompt: str) -> str:
+def _complete_with_retries(client: LMStudioClient, prompt: str) -> _CompletionResponse:
     """Run one completion with retry/backoff on transient 429/5xx errors."""
     attempts = _MAX_TRANSIENT_RETRIES + 1
     for attempt in range(1, attempts + 1):
         try:
-            response = client.complete(prompt)
-            return response.text
+            return client.complete(prompt)
         except Exception as exc:
             if attempt >= attempts or not _is_retryable_status_error(exc):
                 raise LLMError(f"LLM call failed: {exc}") from exc

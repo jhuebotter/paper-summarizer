@@ -85,13 +85,18 @@ Research gate rules:
 Part 2 rules:
 - For metadata.paper_type == "primary": part2 must be a full Part 2 object.
 - For primary papers, do NOT omit Part 2 keys even if no control task or no learning setup is present; use "not applicable" (or "not reported") for those fields.
-- For metadata.paper_type in {{"survey", "commentary"}}: part2 must be null.
+- For metadata.paper_type == "synthesis": part2 must be null.
 - For non-research documents: part2 must be null.
+- For synthesis papers, do NOT omit any part1 keys. All fields listed below must be present; use "not applicable" as the string value where genuinely inapplicable — never omit the key.
+
+Output budget (CRITICAL — incomplete JSON is worthless):
+- Your entire JSON response, including all fields of metadata, part1, and part2, must be present and the closing brace must appear.
+- Strictly respect the word/sentence limits in Part 1 (≤600 words total, ≤3 sentences per section). If you are running short on space, trim Part 1 prose — never leave Part 2 fields absent.
+- Part 2: keep every field to exactly 1 sentence. Do not elaborate.
 
 Variant-specific part1 required keys:
-- primary: paper_type, tldr, problem_motivation, core_contribution, methods, results, key_takeaways, limitations, relevance, cite_for, critical_assessment, quotable_sentences, notable_findings
-- survey: paper_type, tldr, scope_coverage, taxonomy_organization, key_claims_narrative, gaps_identified, relevance, cite_for, critical_assessment, quotable_sentences
-- commentary: paper_type, tldr, core_argument, target_papers, limitations, relevance, cite_for, critical_assessment, quotable_sentences
+- primary: paper_type, tldr, problem_motivation, core_contribution, methods, results, key_takeaways, limitations, open_problems_future_directions, critical_assessment, notable_findings, citable_snippets, relevance
+- synthesis: paper_type, tldr, target_papers_field, scope_coverage, taxonomy_organization, core_argument, synthesis_contribution, key_claims_narrative, key_takeaways, limitations, open_problems_future_directions, critical_assessment, notable_findings, citable_snippets, relevance
 - non_research: paper_type, note
 
 ---

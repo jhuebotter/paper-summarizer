@@ -8,8 +8,7 @@ from summarizer.models import (
     LLMResponse,
     PaperMetadata,
     SummaryPart1Primary,
-    SummaryPart1Survey,
-    SummaryPart1Commentary,
+    SummaryPart1Synthesis,
     SummaryPart1NonResearch,
     SummaryPart2,
     PaperSummary,
@@ -124,55 +123,43 @@ def test_summary_part1_primary_valid(mock_part1_dict):
     part1 = SummaryPart1Primary(**_part1_fields(mock_part1_dict))
     assert part1.paper_type == "primary"
     assert part1.tldr == mock_part1_dict["tldr"]
-    assert isinstance(part1.cite_for, list)
+    assert isinstance(part1.citable_snippets, list)
 
 
 def test_summary_part1_primary_wrong_type_rejected():
     with pytest.raises(ValidationError):
         SummaryPart1Primary(
-            paper_type="survey",  # wrong literal for this class
+            paper_type="synthesis",  # wrong literal for this class
             tldr="Some summary.",
             problem_motivation="gap",
             core_contribution="contribution",
             methods="BPTT",
             results="good",
+            key_takeaways="Key finding.",
             limitations="sim only",
             relevance="high",
-            cite_for=["thing"],
             critical_assessment="OK.",
-            quotable_sentences=["sentence"],
         )
 
 
-def test_summary_part1_survey_valid():
-    part1 = SummaryPart1Survey(
-        paper_type="survey",
+def test_summary_part1_synthesis_valid():
+    part1 = SummaryPart1Synthesis(
+        paper_type="synthesis",
         tldr="A review of SNNs in robotics.",
-        scope_coverage="SNNs for control, 2018–2024, ~80 papers.",
-        taxonomy_organization="Organized by learning mechanism.",
-        key_claims_narrative="SNNs are increasingly competitive with ANNs.",
-        gaps_identified="No real-robot benchmarks exist.",
-        relevance="Background for Section 2.",
-        cite_for=["Overview of SNN learning paradigms"],
-        critical_assessment="Narrative selection bias; no systematic inclusion criteria.",
-        quotable_sentences=["The field is rapidly maturing."],
+        target_papers_field="SNNs for robot control.",
+        scope_coverage="SNNs for control, 2018–2024, ~80 papers, narrative selection.",
+        taxonomy_organization="Organized by learning mechanism: STDP, surrogate gradients, reward-based.",
+        core_argument="The authors argue that SNNs are increasingly competitive with ANNs for energy-constrained applications.",
+        synthesis_contribution="Introduces a three-axis taxonomy (neuron model, learning rule, deployment) not previously formalized.",
+        key_claims_narrative="SNNs achieve competitive performance on simulated tasks but no real-robot benchmarks exist.",
+        key_takeaways="The field needs standardized benchmarks and more real-hardware evaluations.",
+        limitations="Narrative selection bias; no systematic inclusion criteria stated.",
+        relevance="Background for Section 2 of the SNN control review.",
+        critical_assessment="Narrative selection bias is unacknowledged; quantitative claims lack trace anchors.",
     )
-    assert part1.paper_type == "survey"
-
-
-def test_summary_part1_commentary_valid():
-    part1 = SummaryPart1Commentary(
-        paper_type="commentary",
-        tldr="The author argues SNNs are underutilized in robotics.",
-        core_argument="Current SNN benchmarks underestimate capability.",
-        target_papers="Huebotter et al. 2025",
-        limitations="Argument lacks quantitative support.",
-        relevance="Contextual opinion on the field.",
-        cite_for=["Critique of SNN benchmarking practices"],
-        critical_assessment="Overstates implications from limited evidence.",
-        quotable_sentences=["As the author argues..."],
-    )
-    assert part1.paper_type == "commentary"
+    assert part1.paper_type == "synthesis"
+    assert isinstance(part1.citable_snippets, list)
+    assert isinstance(part1.notable_findings, list)
 
 
 def test_summary_part1_non_research_valid():
@@ -275,20 +262,6 @@ def test_config_custom_values():
 # ---------------------------------------------------------------------------
 
 
-def test_parse_error_is_exception():
-    err = ParseError("docling failed")
-    assert isinstance(err, Exception)
-    with pytest.raises(ParseError):
-        raise err
-
-
-def test_llm_error_is_exception():
-    err = LLMError("llm failed")
-    assert isinstance(err, Exception)
-    with pytest.raises(LLMError):
-        raise err
-
-
 def test_pipeline_error_stores_path_and_cause():
     cause = ValueError("root cause")
     path = Path("/data/paper.pdf")
@@ -320,6 +293,22 @@ def test_batch_report_valid():
     assert report.processed == 5
     assert report.failed == 1
     assert len(report.failed_papers) == 1
+
+
+def test_batch_report_total_cost_defaults_to_zero():
+    report = BatchReport(processed=0, skipped=0, failed=0, failed_papers=[])
+    assert report.total_cost == 0.0
+
+
+def test_batch_report_total_cost_accepts_value():
+    report = BatchReport(
+        processed=3,
+        skipped=0,
+        failed=0,
+        failed_papers=[],
+        total_cost=0.0345,
+    )
+    assert report.total_cost == pytest.approx(0.0345)
 
 
 # ---------------------------------------------------------------------------

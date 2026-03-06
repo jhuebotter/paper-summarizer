@@ -26,6 +26,7 @@ from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
+from summarizer.llm import CostAccumulator, create_client
 from summarizer.models import BatchReport, Config, FailedPaper, PipelineError
 from summarizer.pipeline import process_pdf
 from summarizer.renderer import render_summary
@@ -46,24 +47,38 @@ def find_pdfs(source_dir: Path) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
-def load_processed_index(output_dir: Path) -> set[str]:
-    """Read ``output_dir/processed.txt`` and return the set of recorded paths.
+def load_processed_index(output_dir: Path) -> dict[str, list[str]]:
+    """Read ``output_dir/processed.txt`` and return a mapping of PDF path to summary paths.
 
-    Returns an empty set if the file does not exist.
+    Each line is comma-separated: ``pdf_path, summary_path1, summary_path2, ...``
+    Lines with only a PDF path (no comma) are loaded with an empty summary list.
+
+    Returns an empty dict if the file does not exist.
     """
     index_path = output_dir / "processed.txt"
     if not index_path.exists():
-        return set()
-    lines = index_path.read_text(encoding="utf-8").splitlines()
-    return {line for line in lines if line.strip()}
+        return {}
+    result: dict[str, list[str]] = {}
+    for line in index_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        result[parts[0]] = parts[1:]
+    return result
 
 
-def save_processed_index(output_dir: Path, paths: set[str]) -> None:
-    """Write ``paths`` to ``output_dir/processed.txt``, one path per line."""
+def save_processed_index(output_dir: Path, index: dict[str, list[str]]) -> None:
+    """Write ``index`` to ``output_dir/processed.txt``.
+
+    Each line: ``pdf_path, summary_path1, summary_path2, ...``
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "processed.txt").write_text(
-        "\n".join(sorted(paths)) + "\n", encoding="utf-8"
-    )
+    lines = []
+    for pdf_path in sorted(index):
+        parts = [pdf_path] + index[pdf_path]
+        lines.append(", ".join(parts))
+    (output_dir / "processed.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +86,7 @@ def save_processed_index(output_dir: Path, paths: set[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def should_skip(pdf_path: Path, processed: set[str], force_summary: bool) -> bool:
+def should_skip(pdf_path: Path, processed: dict[str, list[str]], force_summary: bool) -> bool:
     """Return ``True`` if the PDF should be skipped for the LLM step.
 
     A PDF is skipped when its absolute path is in ``processed`` and
@@ -79,7 +94,7 @@ def should_skip(pdf_path: Path, processed: set[str], force_summary: bool) -> boo
 
     Args:
         pdf_path:  Path to the PDF being evaluated.
-        processed: Set of absolute path strings loaded from processed.txt.
+        processed: Mapping of absolute PDF path → summary paths from processed.txt.
         force_summary: If True, always return False (never skip).
     """
     if force_summary:
@@ -128,11 +143,16 @@ def get_versioned_output_path(path: Path) -> Path:
 
 
 def _process_one_pdf(
-    pdf_path: Path, config: Config, run_idx: int, run_total: int
+    pdf_path: Path,
+    config: Config,
+    run_idx: int,
+    run_total: int,
+    client,
+    accumulator: CostAccumulator,
 ) -> dict:
     """Worker task: process one PDF and return renderable artifacts."""
     logger.info("  Processing [%d/%d]: %s", run_idx, run_total, pdf_path.name)
-    summary = process_pdf(pdf_path, config)
+    summary = process_pdf(pdf_path, config, client=client, accumulator=accumulator)
     markdown = render_summary(summary)
     return {
         "pdf_path": pdf_path,
@@ -207,8 +227,6 @@ def run_batch(source_dir: Path, config: Config) -> BatchReport:
             n_skipped_by_index += 1
             continue
 
-        # On --force-summary: remove from index so it is re-added after success
-        processed_set.discard(abs_path)
         jobs.append(pdf_path)
 
         if config.dry_run:
@@ -226,6 +244,10 @@ def run_batch(source_dir: Path, config: Config) -> BatchReport:
             failed_papers=failed_papers,
         )
 
+    # Create the LLM client and cost accumulator once for the entire batch.
+    client = create_client(config)
+    accumulator = CostAccumulator()
+
     with ThreadPoolExecutor(
         max_workers=config.workers,
         thread_name_prefix="worker",
@@ -233,7 +255,7 @@ def run_batch(source_dir: Path, config: Config) -> BatchReport:
         run_total = len(jobs)
         for run_idx, pdf_path in enumerate(jobs, start=1):
             future = executor.submit(
-                _process_one_pdf, pdf_path, config, run_idx, run_total
+                _process_one_pdf, pdf_path, config, run_idx, run_total, client, accumulator
             )
             futures_to_path[future] = (pdf_path, run_idx)
 
@@ -259,7 +281,9 @@ def run_batch(source_dir: Path, config: Config) -> BatchReport:
                     )
                     output_path = get_versioned_output_path(base_output_path)
                     output_path.write_text(markdown, encoding="utf-8")
-                    processed_set.add(abs_path)
+                    if abs_path not in processed_set:
+                        processed_set[abs_path] = []
+                    processed_set[abs_path].append(str(output_path))
                     save_processed_index(config.output_dir, processed_set)
                     logger.info(
                         "  [%d/%d] Written: %s", run_idx, run_total, output_path
@@ -279,11 +303,16 @@ def run_batch(source_dir: Path, config: Config) -> BatchReport:
                     )
                 finally:
                     progress.update(1)
-                    progress.set_postfix(ok=n_processed, failed=n_failed)
+                    progress.set_postfix(
+                        ok=n_processed,
+                        failed=n_failed,
+                        cost=f"${accumulator.total_cost:.4f}",
+                    )
 
     return BatchReport(
         processed=n_processed,
         skipped=n_skipped,
         failed=n_failed,
         failed_papers=failed_papers,
+        total_cost=accumulator.total_cost,
     )

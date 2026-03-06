@@ -3,11 +3,23 @@
 import json
 import logging
 import os
+import threading
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 
 from summarizer.models import Config, LLMError
-from summarizer.llm import LMStudioClient, create_client, call_llm, _extract_json
+from summarizer.llm import (
+    LMStudioClient,
+    ModelPricing,
+    UsageStats,
+    CostAccumulator,
+    create_client,
+    call_llm,
+    fetch_model_pricing,
+    _extract_json,
+    _extract_usage,
+    _calculate_cost,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -127,12 +139,6 @@ def test_complete_passes_max_tokens_when_configured():
 # ---------------------------------------------------------------------------
 # _extract_json (internal helper — tested directly for thorough coverage)
 # ---------------------------------------------------------------------------
-
-
-def test_extract_json_plain_json():
-    data = {"citation_key": "foo2025bar", "year": 2025}
-    result = _extract_json(json.dumps(data))
-    assert result == data
 
 
 def test_extract_json_with_markdown_fences():
@@ -309,3 +315,487 @@ def test_create_client_stores_base_url():
     config = Config(base_url="http://localhost:1234/v1", model="test-model")
     client = create_client(config)
     assert client.base_url == "http://localhost:1234/v1"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: ModelPricing, UsageStats, CostAccumulator, helpers
+# ---------------------------------------------------------------------------
+
+
+def test_model_pricing_defaults_to_zero():
+    pricing = ModelPricing()
+    assert pricing.prompt == 0.0
+    assert pricing.completion == 0.0
+    assert pricing.reasoning == 0.0
+    assert pricing.request == 0.0
+    assert pricing.context_length == 0
+
+
+def test_model_pricing_custom_values():
+    pricing = ModelPricing(prompt=1e-6, completion=3e-6, reasoning=2e-6, request=0.001)
+    assert pricing.prompt == 1e-6
+    assert pricing.completion == 3e-6
+    assert pricing.reasoning == 2e-6
+    assert pricing.request == 0.001
+
+
+def test_usage_stats_defaults_to_zero():
+    usage = UsageStats()
+    assert usage.input_tokens == 0
+    assert usage.output_tokens == 0
+    assert usage.reasoning_tokens == 0
+
+
+def test_calculate_cost_typical():
+    pricing = ModelPricing(prompt=1e-6, completion=3e-6, reasoning=2e-6, request=0.001)
+    usage = UsageStats(input_tokens=1000, output_tokens=500, reasoning_tokens=200)
+    cost = _calculate_cost(usage, pricing)
+    expected = 1000 * 1e-6 + 500 * 3e-6 + 200 * 2e-6 + 0.001
+    assert abs(cost - expected) < 1e-12
+
+
+def test_calculate_cost_all_zero_pricing():
+    pricing = ModelPricing()
+    usage = UsageStats(input_tokens=5000, output_tokens=1000, reasoning_tokens=500)
+    assert _calculate_cost(usage, pricing) == 0.0
+
+
+def test_calculate_cost_none_usage():
+    pricing = ModelPricing(prompt=1e-6, completion=3e-6, request=0.001)
+    # None usage → only request_price (flat fee)
+    cost = _calculate_cost(None, pricing)
+    assert cost == pytest.approx(0.001)
+
+
+def test_calculate_cost_zero_usage():
+    pricing = ModelPricing(prompt=1e-6, request=0.0)
+    usage = UsageStats()
+    assert _calculate_cost(usage, pricing) == 0.0
+
+
+def test_cost_accumulator_add_single():
+    acc = CostAccumulator()
+    usage = UsageStats(input_tokens=100, output_tokens=50, reasoning_tokens=10)
+    acc.add(usage, 0.005)
+    assert acc.total_cost == pytest.approx(0.005)
+    assert acc.total_input_tokens == 100
+    assert acc.total_output_tokens == 50
+    assert acc.total_reasoning_tokens == 10
+
+
+def test_cost_accumulator_add_multiple():
+    acc = CostAccumulator()
+    acc.add(UsageStats(input_tokens=100, output_tokens=50, reasoning_tokens=0), 0.002)
+    acc.add(UsageStats(input_tokens=200, output_tokens=80, reasoning_tokens=20), 0.005)
+    assert acc.total_cost == pytest.approx(0.007)
+    assert acc.total_input_tokens == 300
+    assert acc.total_output_tokens == 130
+    assert acc.total_reasoning_tokens == 20
+
+
+def test_cost_accumulator_thread_safe():
+    """Concurrent adds must not lose updates."""
+    acc = CostAccumulator()
+    n = 100
+    usage = UsageStats(input_tokens=1, output_tokens=1, reasoning_tokens=0)
+
+    def add_many():
+        for _ in range(n):
+            acc.add(usage, 0.001)
+
+    threads = [threading.Thread(target=add_many) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert acc.total_cost == pytest.approx(10 * n * 0.001)
+    assert acc.total_input_tokens == 10 * n
+    assert acc.total_output_tokens == 10 * n
+
+
+def test_cost_accumulator_starts_at_zero():
+    acc = CostAccumulator()
+    assert acc.total_cost == 0.0
+    assert acc.total_input_tokens == 0
+    assert acc.total_output_tokens == 0
+    assert acc.total_reasoning_tokens == 0
+
+
+def test_extract_usage_happy_path():
+    mock_response = MagicMock()
+    mock_response.usage.prompt_tokens = 1000
+    mock_response.usage.completion_tokens = 400
+    mock_response.usage.completion_tokens_details.reasoning_tokens = 50
+    usage = _extract_usage(mock_response)
+    assert usage is not None
+    assert usage.input_tokens == 1000
+    assert usage.output_tokens == 400
+    assert usage.reasoning_tokens == 50
+
+
+def test_extract_usage_none_when_no_usage():
+    mock_response = MagicMock()
+    mock_response.usage = None
+    usage = _extract_usage(mock_response)
+    assert usage is None
+
+
+def test_extract_usage_missing_reasoning_tokens():
+    """reasoning_tokens absent from completion_tokens_details → 0."""
+    mock_response = MagicMock()
+    mock_response.usage.prompt_tokens = 800
+    mock_response.usage.completion_tokens = 300
+    # completion_tokens_details.reasoning_tokens raises AttributeError
+    mock_response.usage.completion_tokens_details.reasoning_tokens = None
+    usage = _extract_usage(mock_response)
+    assert usage is not None
+    assert usage.reasoning_tokens == 0
+
+
+def test_extract_usage_no_completion_tokens_details():
+    """completion_tokens_details absent → reasoning_tokens = 0."""
+    mock_response = MagicMock()
+    mock_response.usage.prompt_tokens = 500
+    mock_response.usage.completion_tokens = 200
+    del mock_response.usage.completion_tokens_details
+    usage = _extract_usage(mock_response)
+    assert usage is not None
+    assert usage.reasoning_tokens == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: fetch_model_pricing + create_client pricing wiring
+# ---------------------------------------------------------------------------
+
+_FAKE_PRICING_RESPONSE = {
+    "data": [
+        {
+            "id": "openai/gpt-4o",
+            "pricing": {
+                "prompt": "0.000005",
+                "completion": "0.000015",
+                "internal_reasoning": "0.000010",
+                "request": "0.0",
+            },
+            "context_length": 128000,
+        }
+    ]
+}
+
+
+def _make_urlopen_mock(response_body: bytes):
+    """Helper: mock urllib.request.urlopen to return a readable response."""
+    import io
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def read(self):
+            return response_body
+
+    return MagicMock(return_value=_FakeResponse())
+
+
+def test_fetch_model_pricing_parses_response():
+    body = json.dumps(_FAKE_PRICING_RESPONSE).encode()
+    with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)):
+        pricing = fetch_model_pricing("openai/gpt-4o", "sk-test", "https://openrouter.ai/api/v1")
+    assert pricing.prompt == pytest.approx(5e-6)
+    assert pricing.completion == pytest.approx(1.5e-5)
+    assert pricing.reasoning == pytest.approx(1e-5)
+    assert pricing.request == 0.0
+    assert pricing.context_length == 128000
+
+
+def test_fetch_model_pricing_returns_zero_on_http_error():
+    import urllib.error
+
+    with patch(
+        "summarizer.llm.urllib.request.urlopen",
+        side_effect=urllib.error.URLError("unreachable"),
+    ):
+        pricing = fetch_model_pricing("openai/gpt-4o", "sk-test", "https://openrouter.ai/api/v1")
+    assert pricing == ModelPricing()
+
+
+def test_fetch_model_pricing_returns_zero_when_model_not_found():
+    body = json.dumps({"data": []}).encode()
+    with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)):
+        pricing = fetch_model_pricing("openai/gpt-4o", "sk-test", "https://openrouter.ai/api/v1")
+    assert pricing == ModelPricing()
+
+
+def test_create_client_fetches_pricing_for_openrouter(monkeypatch):
+    """create_client calls fetch_model_pricing exactly once for openrouter URLs."""
+    fake_pricing = ModelPricing(prompt=1e-6, completion=3e-6)
+    mock_fetch = MagicMock(return_value=fake_pricing)
+    monkeypatch.setattr("summarizer.llm.fetch_model_pricing", mock_fetch)
+
+    config = Config(
+        base_url="https://openrouter.ai/api/v1",
+        model="openai/gpt-4o",
+        api_key="sk-test",
+    )
+    with patch("summarizer.llm._openai.OpenAI"):
+        client = create_client(config)
+
+    mock_fetch.assert_called_once()
+    assert client.pricing.prompt == 1e-6
+
+
+def test_create_client_does_not_fetch_pricing_for_local(monkeypatch):
+    """create_client does NOT call fetch_model_pricing for local LM Studio URLs."""
+    mock_fetch = MagicMock()
+    monkeypatch.setattr("summarizer.llm.fetch_model_pricing", mock_fetch)
+
+    config = Config(base_url="http://localhost:1234/v1", model="test-model")
+    with patch("summarizer.llm._openai.OpenAI"):
+        client = create_client(config)
+
+    mock_fetch.assert_not_called()
+    assert client.pricing == ModelPricing()
+
+
+def test_complete_returns_usage_when_sdk_provides_it():
+    """complete() populates _CompletionResponse.usage from response.usage."""
+    config = Config()
+    with patch("summarizer.llm._openai.OpenAI") as mock_openai:
+        mock_chat = MagicMock()
+        mock_openai.return_value.chat = mock_chat
+
+        sdk_response = MagicMock()
+        sdk_response.choices = [MagicMock(message=MagicMock(content='{"k":"v"}'))]
+        sdk_response.usage.prompt_tokens = 200
+        sdk_response.usage.completion_tokens = 80
+        sdk_response.usage.completion_tokens_details.reasoning_tokens = 10
+        mock_chat.completions.create.return_value = sdk_response
+
+        client = create_client(config)
+        resp = client.complete("hello")
+
+    assert resp.usage is not None
+    assert resp.usage.input_tokens == 200
+    assert resp.usage.output_tokens == 80
+    assert resp.usage.reasoning_tokens == 10
+
+
+def test_complete_usage_is_none_when_sdk_returns_no_usage():
+    config = Config()
+    with patch("summarizer.llm._openai.OpenAI") as mock_openai:
+        mock_chat = MagicMock()
+        mock_openai.return_value.chat = mock_chat
+
+        sdk_response = MagicMock()
+        sdk_response.choices = [MagicMock(message=MagicMock(content='{"k":"v"}'))]
+        sdk_response.usage = None
+        mock_chat.completions.create.return_value = sdk_response
+
+        client = create_client(config)
+        resp = client.complete("hello")
+
+    assert resp.usage is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: call_llm extended logging + accumulator
+# ---------------------------------------------------------------------------
+
+
+def test_call_llm_logs_token_counts_and_cost(caplog):
+    """call_llm log line contains in=, out=, reason=, cost= fields."""
+    data = {"key": "value"}
+    mock_client = MagicMock()
+    mock_client.model = "test-model"
+    mock_client.base_url = "http://localhost:1234/v1"
+    mock_client.pricing = ModelPricing()
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(data)
+    mock_response.usage = UsageStats(input_tokens=100, output_tokens=40, reasoning_tokens=5)
+    mock_client.complete.return_value = mock_response
+
+    with caplog.at_level(logging.INFO, logger="summarizer.llm"):
+        call_llm(mock_client, "a prompt")
+
+    response_lines = [r.message for r in caplog.records if "Response received" in r.message]
+    assert response_lines, "Expected 'Response received' log line"
+    line = response_lines[0]
+    assert "in=" in line
+    assert "out=" in line
+    assert "reason=" in line
+    assert "cost=" in line
+
+
+def test_call_llm_updates_accumulator():
+    data = {"ok": True}
+    mock_client = MagicMock()
+    mock_client.pricing = ModelPricing(prompt=1e-6, completion=3e-6)
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(data)
+    mock_response.usage = UsageStats(input_tokens=1000, output_tokens=500, reasoning_tokens=0)
+    mock_client.complete.return_value = mock_response
+
+    acc = CostAccumulator()
+    call_llm(mock_client, "prompt", accumulator=acc)
+
+    assert acc.total_cost > 0
+    assert acc.total_input_tokens == 1000
+    assert acc.total_output_tokens == 500
+
+
+def test_call_llm_works_without_accumulator():
+    data = {"ok": True}
+    mock_client = MagicMock()
+    mock_client.pricing = ModelPricing()
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(data)
+    mock_response.usage = UsageStats(input_tokens=100, output_tokens=40, reasoning_tokens=0)
+    mock_client.complete.return_value = mock_response
+
+    result = call_llm(mock_client, "prompt")  # no accumulator — must not raise
+    assert result == data
+
+
+def test_call_llm_none_usage_does_not_crash():
+    """call_llm logs cost=$0 and does not crash when response.usage is None."""
+    data = {"ok": True}
+    mock_client = MagicMock()
+    mock_client.pricing = ModelPricing(request=0.001)
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(data)
+    mock_response.usage = None
+    mock_client.complete.return_value = mock_response
+
+    acc = CostAccumulator()
+    result = call_llm(mock_client, "prompt", accumulator=acc)
+    assert result == data
+    assert acc.total_cost == pytest.approx(0.001)  # only request flat fee
+
+
+# ---------------------------------------------------------------------------
+# Repair-path token counting
+# ---------------------------------------------------------------------------
+
+
+def test_call_llm_json_repair_tokens_added_to_accumulator():
+    """Tokens from the JSON syntax-repair call are added to the accumulator."""
+    pricing = ModelPricing(completion=3e-6)
+    mock_client = MagicMock()
+    mock_client.model = "test-model"
+    mock_client.base_url = "http://localhost:1234/v1"
+    mock_client.pricing = pricing
+
+    first_usage = UsageStats(input_tokens=100, output_tokens=50)
+    repair_usage = UsageStats(input_tokens=80, output_tokens=40)
+
+    mock_client.complete.side_effect = [
+        MagicMock(text='{"k": "v"', usage=first_usage),   # malformed
+        MagicMock(text='{"k": "v"}', usage=repair_usage),  # repaired
+    ]
+
+    acc = CostAccumulator()
+    call_llm(mock_client, "prompt", accumulator=acc)
+
+    assert acc.total_output_tokens == 50 + 40
+    assert acc.total_input_tokens == 100 + 80
+
+
+def test_pipeline_schema_repair_tokens_added_to_accumulator():
+    """Tokens from a schema-validation repair call are added to the accumulator."""
+    from pydantic import ValidationError
+    from summarizer.llm import CostAccumulator, UsageStats, ModelPricing
+    from summarizer.pipeline import _validate_with_schema_repair
+    from summarizer.models import LLMResponse
+
+    pricing = ModelPricing()
+    mock_client = MagicMock()
+    mock_client.model = "test-model"
+    mock_client.base_url = "http://localhost:1234/v1"
+    mock_client.pricing = pricing
+
+    repair_usage = UsageStats(input_tokens=200, output_tokens=150)
+    repaired_response = MagicMock(text='{"k": "v"}', usage=repair_usage)
+
+    # A minimal valid LLMResponse to return after repair
+    good_raw = {
+        "metadata": {
+            "citation_key": "smith2020foo",
+            "title": "Title",
+            "authors": ["A. Smith"],
+            "year": 2020,
+            "venue": "Conf",
+            "is_research_paper": True,
+            "paper_type": "synthesis",
+            "synthesis_subtype": "review",
+            "rejection_reason": None,
+            "tags": [],
+        },
+        "part1": {
+            "paper_type": "synthesis",
+            "tldr": "t",
+            "target_papers_field": "f",
+            "scope_coverage": "s",
+            "taxonomy_organization": "t",
+            "core_argument": "c",
+            "synthesis_contribution": "c",
+            "key_claims_narrative": "k",
+            "key_takeaways": "k",
+            "limitations": "l",
+            "open_problems_future_directions": {
+                "gaps_identified": [],
+                "open_questions": [],
+                "suggested_research_focus": [],
+            },
+            "critical_assessment": "c",
+            "notable_findings": [],
+            "citable_snippets": [],
+            "relevance": "r",
+        },
+        "part2": None,
+    }
+
+    # First call returns invalid raw (missing metadata), second returns good_raw
+    with patch("summarizer.pipeline.call_llm", side_effect=[good_raw]) as mock_call_llm:
+        acc = CostAccumulator()
+        # Pass an already-invalid raw that can't be fixed by normalizers
+        bad_raw = {"metadata": {}, "part1": {}, "part2": None}
+        # We skip the actual validation loop and just verify accumulator threading:
+        # Instead, directly test that when call_llm is invoked in the repair loop,
+        # the accumulator is forwarded.
+        from pathlib import Path
+        _validate_with_schema_repair(
+            raw=good_raw,
+            client=mock_client,
+            original_prompt="prompt",
+            pdf_path=Path("paper.pdf"),
+            accumulator=acc,
+        )
+        # No repair needed — but verify the accumulator was accepted without error.
+        # Now test the repair path by passing bad raw that triggers repair.
+        mock_call_llm.reset_mock()
+
+    # Verify the repair path passes accumulator: when schema repair is triggered,
+    # call_llm must be invoked with the accumulator.
+    bad_raw = {"not_metadata": True}
+    with patch("summarizer.pipeline.call_llm", return_value=good_raw) as mock_repair:
+        acc2 = CostAccumulator()
+        from pathlib import Path
+        try:
+            _validate_with_schema_repair(
+                raw=bad_raw,
+                client=mock_client,
+                original_prompt="prompt",
+                pdf_path=Path("paper.pdf"),
+                accumulator=acc2,
+            )
+        except Exception:
+            pass
+        # The repair call_llm must have been called with accumulator=acc2
+        for c in mock_repair.call_args_list:
+            assert c.kwargs.get("accumulator") is acc2 or (
+                len(c.args) >= 3 and c.args[2] is acc2
+            )

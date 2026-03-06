@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 
 from summarizer.batch import (
     get_output_path,
+    get_versioned_output_path,
     load_processed_index,
     run_batch,
     save_processed_index,
@@ -130,13 +131,18 @@ def _run_single(pdf_path: Path, config: Config) -> None:
 
     markdown = render_summary(summary)
     paper_category = summary.metadata.paper_type or "non_research"
-    output_path = get_output_path(
-        config.output_dir,
-        paper_category,
-        summary.metadata.citation_key,
+    output_path = get_versioned_output_path(
+        get_output_path(
+            config.output_dir,
+            paper_category,
+            summary.metadata.citation_key,
+        )
     )
     output_path.write_text(markdown, encoding="utf-8")
-    processed.add(str(pdf_path.resolve()))
+    abs_path = str(pdf_path.resolve())
+    if abs_path not in processed:
+        processed[abs_path] = []
+    processed[abs_path].append(str(output_path))
     save_processed_index(config.output_dir, processed)
     logger.info("Written: %s", output_path)
 
@@ -155,10 +161,11 @@ def _run_batch(source_dir: Path, config: Config) -> None:
     report = run_batch(source_dir, config)
 
     logger.info(
-        "Done — processed: %d, skipped: %d, failed: %d",
+        "Done — processed: %d, skipped: %d, failed: %d, cost=$%.4f",
         report.processed,
         report.skipped,
         report.failed,
+        report.total_cost,
     )
 
     if report.failed_papers:

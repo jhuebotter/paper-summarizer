@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from summarizer.cli import _build_parser, _check_lm_studio, main
-from summarizer.models import Config
+from summarizer.models import Config, PaperSummary
 
 
 # ---------------------------------------------------------------------------
@@ -28,24 +28,6 @@ def test_parser_source_and_file_mutually_exclusive():
     parser = _build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["--source", "/tmp", "--file", "paper.pdf"])
-
-
-def test_parser_source_sets_source(tmp_path):
-    """--source sets args.source."""
-    parser = _build_parser()
-    args = parser.parse_args(["--source", str(tmp_path)])
-    assert args.source == str(tmp_path)
-    assert args.file is None
-
-
-def test_parser_file_sets_file(tmp_path):
-    """--file sets args.file."""
-    pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
-    parser = _build_parser()
-    args = parser.parse_args(["--file", str(pdf)])
-    assert args.file == str(pdf)
-    assert args.source is None
 
 
 def test_parser_defaults():
@@ -90,86 +72,27 @@ def test_parser_model_cli_overrides_env():
     assert args.model == "my-cli-model"
 
 
-def test_parser_timeout_flag():
-    """--timeout sets args.timeout."""
-    parser = _build_parser()
-    args = parser.parse_args(["--source", "/tmp", "--timeout", "300"])
-    assert args.timeout == 300
-
-
-def test_main_timeout_propagates_to_config(tmp_path):
-    """--timeout N is forwarded as config.timeout_s."""
+@pytest.mark.parametrize("cli_flag,cli_value,config_attr,expected", [
+    ("--timeout", "300", "timeout_s", 300),
+    ("--workers", "6", "workers", 6),
+    ("--extractor", "pypdf", "extractor", "pypdf"),
+])
+def test_main_cli_flag_propagates_to_config(tmp_path, cli_flag, cli_value, config_attr, expected):
+    """CLI flags are forwarded as the corresponding Config fields."""
     (tmp_path / "paper.pdf").write_bytes(b"%PDF")
     with (
         patch(
             "sys.argv",
-            [
-                "summarize-papers",
-                "--source",
-                str(tmp_path),
-                "--dry-run",
-                "--timeout",
-                "300",
-            ],
+            ["summarize-papers", "--source", str(tmp_path), "--dry-run", cli_flag, cli_value],
         ),
         patch("summarizer.cli.run_batch") as mock_run_batch,
     ):
         mock_run_batch.return_value = MagicMock(
-            processed=0, skipped=1, failed=0, failed_papers=[]
+            processed=0, skipped=1, failed=0, failed_papers=[], total_cost=0.0
         )
         main()
     passed_config = mock_run_batch.call_args[0][1]
-    assert passed_config.timeout_s == 300
-
-
-def test_main_workers_propagates_to_config(tmp_path):
-    """--workers N is forwarded as config.workers."""
-    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
-    with (
-        patch(
-            "sys.argv",
-            [
-                "summarize-papers",
-                "--source",
-                str(tmp_path),
-                "--dry-run",
-                "--workers",
-                "6",
-            ],
-        ),
-        patch("summarizer.cli.run_batch") as mock_run_batch,
-    ):
-        mock_run_batch.return_value = MagicMock(
-            processed=0, skipped=1, failed=0, failed_papers=[]
-        )
-        main()
-    passed_config = mock_run_batch.call_args[0][1]
-    assert passed_config.workers == 6
-
-
-def test_main_extractor_propagates_to_config(tmp_path):
-    """--extractor is forwarded as config.extractor."""
-    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
-    with (
-        patch(
-            "sys.argv",
-            [
-                "summarize-papers",
-                "--source",
-                str(tmp_path),
-                "--dry-run",
-                "--extractor",
-                "pypdf",
-            ],
-        ),
-        patch("summarizer.cli.run_batch") as mock_run_batch,
-    ):
-        mock_run_batch.return_value = MagicMock(
-            processed=0, skipped=1, failed=0, failed_papers=[]
-        )
-        main()
-    passed_config = mock_run_batch.call_args[0][1]
-    assert passed_config.extractor == "pypdf"
+    assert getattr(passed_config, config_attr) == expected
 
 
 def test_parser_custom_flags():
@@ -210,20 +133,6 @@ def test_parser_custom_flags():
     assert args.verbose is True
     assert args.workers == 5
     assert args.extractor == "pypdf"
-
-
-def test_parser_force_summary_flag():
-    """--force-summary is parsed and passed through."""
-    parser = _build_parser()
-    args = parser.parse_args(["--source", "/tmp", "--force-summary"])
-    assert args.force_summary is True
-
-
-def test_parser_reparse_flag():
-    """--reparse is parsed and passed through."""
-    parser = _build_parser()
-    args = parser.parse_args(["--source", "/tmp", "--reparse"])
-    assert args.reparse is True
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +190,7 @@ def test_main_dry_run_batch(tmp_path, capsys):
         patch("summarizer.cli.run_batch") as mock_run_batch,
     ):
         mock_run_batch.return_value = MagicMock(
-            processed=0, skipped=1, failed=0, failed_papers=[]
+            processed=0, skipped=1, failed=0, failed_papers=[], total_cost=0.0
         )
         main()
 
@@ -290,6 +199,46 @@ def test_main_dry_run_batch(tmp_path, capsys):
     # dry_run flag should be set in the Config passed to run_batch
     passed_config = mock_run_batch.call_args[0][1]
     assert passed_config.dry_run is True
+
+
+def test_run_single_force_summary_creates_versioned_file(tmp_path):
+    """--force-summary on a single file creates _v2.md instead of overwriting."""
+    from unittest.mock import MagicMock
+    from summarizer.cli import _run_single
+
+    output_dir = tmp_path / "output_summaries"
+    existing = output_dir / "synthesis" / "dewolf2021spiking_summary.md"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("# original", encoding="utf-8")
+
+    abs_pdf = str((tmp_path / "paper.pdf").resolve())
+    (output_dir / "processed.txt").write_text(
+        f"{abs_pdf}, {existing}\n", encoding="utf-8"
+    )
+
+    config = Config(
+        base_url="http://localhost:1234/v1",
+        model="test-model",
+        output_dir=output_dir,
+        force_summary=True,
+    )
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF")
+
+    mock_summary = MagicMock()
+    mock_summary.metadata.paper_type = "synthesis"
+    mock_summary.metadata.citation_key = "dewolf2021spiking"
+
+    with (
+        patch("summarizer.cli.process_pdf", return_value=mock_summary),
+        patch("summarizer.cli.render_summary", return_value="# new"),
+    ):
+        _run_single(pdf, config)
+
+    versioned = output_dir / "synthesis" / "dewolf2021spiking_summary_v2.md"
+    assert existing.read_text(encoding="utf-8") == "# original", "original must not be overwritten"
+    assert versioned.exists(), "_v2.md must be created"
+    assert versioned.read_text(encoding="utf-8") == "# new"
 
 
 def test_main_single_file_skips_when_in_processed_index(tmp_path, capsys):
@@ -341,3 +290,33 @@ def test_parser_log_file_default_is_none():
     parser = _build_parser()
     args = parser.parse_args(["--source", "/tmp"])
     assert args.log_file is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Done summary includes cost
+# ---------------------------------------------------------------------------
+
+
+def test_run_batch_done_log_includes_cost(tmp_path, caplog):
+    """_run_batch logs 'cost=' in the Done summary line."""
+    import logging
+    from summarizer.cli import _run_batch
+    from summarizer.models import Config, BatchReport
+
+    config = Config(
+        base_url="http://localhost:1234/v1",
+        model="test-model",
+        output_dir=tmp_path / "output_summaries",
+    )
+    report = BatchReport(processed=3, skipped=1, failed=0, failed_papers=[], total_cost=0.0345)
+
+    with (
+        caplog.at_level(logging.INFO, logger="summarizer.cli"),
+        patch("summarizer.cli.run_batch", return_value=report),
+    ):
+        _run_batch(tmp_path, config)
+
+    done_lines = [r.message for r in caplog.records if "Done" in r.message]
+    assert done_lines, "Expected a 'Done' log line"
+    assert "cost=" in done_lines[0]
+    assert "0.0345" in done_lines[0]

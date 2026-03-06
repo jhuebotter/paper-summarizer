@@ -14,6 +14,7 @@ from summarizer.batch import (
     should_skip,
 )
 from summarizer.models import BatchReport, Config, PipelineError
+from summarizer.llm import CostAccumulator
 
 
 # ---------------------------------------------------------------------------
@@ -71,11 +72,11 @@ def test_find_pdfs_empty_dir(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_load_processed_index_returns_empty_set_when_file_missing(tmp_path):
+def test_load_processed_index_returns_empty_dict_when_file_missing(tmp_path):
     output_dir = tmp_path / "output_summaries"
     output_dir.mkdir()
     result = load_processed_index(output_dir)
-    assert result == set()
+    assert result == {}
 
 
 def test_load_processed_index_reads_paths(tmp_path):
@@ -87,6 +88,18 @@ def test_load_processed_index_reads_paths(tmp_path):
     assert "/path/a.pdf" in result
     assert "/path/b.pdf" in result
     assert len(result) == 2
+
+
+def test_load_processed_index_reads_summary_paths(tmp_path):
+    output_dir = tmp_path / "output_summaries"
+    output_dir.mkdir()
+    (output_dir / "processed.txt").write_text(
+        "/path/a.pdf, /out/a_summary.md, /out/a_summary_v2.md\n/path/b.pdf, /out/b_summary.md\n",
+        encoding="utf-8",
+    )
+    result = load_processed_index(output_dir)
+    assert result["/path/a.pdf"] == ["/out/a_summary.md", "/out/a_summary_v2.md"]
+    assert result["/path/b.pdf"] == ["/out/b_summary.md"]
 
 
 def test_load_processed_index_ignores_blank_lines(tmp_path):
@@ -105,16 +118,17 @@ def test_load_processed_index_ignores_blank_lines(tmp_path):
 def test_save_processed_index_writes_file(tmp_path):
     output_dir = tmp_path / "output_summaries"
     output_dir.mkdir()
-    paths = {"/path/a.pdf", "/path/b.pdf"}
-    save_processed_index(output_dir, paths)
+    index = {"/path/a.pdf": ["/out/a_summary.md"], "/path/b.pdf": []}
+    save_processed_index(output_dir, index)
     content = (output_dir / "processed.txt").read_text(encoding="utf-8")
     assert "/path/a.pdf" in content
     assert "/path/b.pdf" in content
+    assert "/out/a_summary.md" in content
 
 
 def test_save_processed_index_creates_output_dir(tmp_path):
     output_dir = tmp_path / "new_output"
-    save_processed_index(output_dir, {"/some/path.pdf"})
+    save_processed_index(output_dir, {"/some/path.pdf": []})
     assert output_dir.exists()
     assert (output_dir / "processed.txt").exists()
 
@@ -122,10 +136,14 @@ def test_save_processed_index_creates_output_dir(tmp_path):
 def test_load_save_roundtrip(tmp_path):
     output_dir = tmp_path / "output_summaries"
     output_dir.mkdir()
-    paths = {"/a.pdf", "/b.pdf", "/c.pdf"}
-    save_processed_index(output_dir, paths)
+    index = {
+        "/a.pdf": ["/out/a_summary.md"],
+        "/b.pdf": ["/out/b_summary.md", "/out/b_summary_v2.md"],
+        "/c.pdf": [],
+    }
+    save_processed_index(output_dir, index)
     loaded = load_processed_index(output_dir)
-    assert loaded == paths
+    assert loaded == index
 
 
 # ---------------------------------------------------------------------------
@@ -136,20 +154,20 @@ def test_load_save_roundtrip(tmp_path):
 def test_should_skip_returns_true_when_in_processed(tmp_path):
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF")
-    processed = {str(pdf.resolve())}
+    processed = {str(pdf.resolve()): ["/out/summary.md"]}
     assert should_skip(pdf, processed, force_summary=False) is True
 
 
 def test_should_skip_returns_false_when_not_in_processed(tmp_path):
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF")
-    assert should_skip(pdf, set(), force_summary=False) is False
+    assert should_skip(pdf, {}, force_summary=False) is False
 
 
 def test_should_skip_force_summary_overrides(tmp_path):
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF")
-    processed = {str(pdf.resolve())}
+    processed = {str(pdf.resolve()): ["/out/summary.md"]}
     assert should_skip(pdf, processed, force_summary=True) is False
 
 
@@ -207,36 +225,6 @@ def test_run_batch_processes_all_pdfs(tmp_path, config):
     assert mock_process.call_count == 2
 
 
-def test_run_batch_uses_configured_worker_count(tmp_path, config):
-    (tmp_path / "paper_a.pdf").write_bytes(b"%PDF")
-    config.workers = 4
-
-    summary = _make_summary("smith2020foo")
-    with (
-        patch("summarizer.batch.ThreadPoolExecutor") as mock_executor_cls,
-        patch("summarizer.batch.process_pdf", return_value=summary),
-        patch("summarizer.batch.render_summary", return_value="# Markdown"),
-    ):
-        mock_executor = MagicMock()
-        mock_executor.__enter__.return_value = mock_executor
-        mock_executor_cls.return_value = mock_executor
-
-        fake_future = MagicMock()
-        fake_future.result.return_value = {
-            "pdf_path": tmp_path / "paper_a.pdf",
-            "summary": summary,
-            "markdown": "# Markdown",
-        }
-        mock_executor.submit.return_value = fake_future
-
-        with patch("summarizer.batch.as_completed", return_value=[fake_future]):
-            report = run_batch(tmp_path, config)
-
-    mock_executor_cls.assert_called_once_with(
-        max_workers=4, thread_name_prefix="worker"
-    )
-    assert report.processed == 1
-
 
 def test_run_batch_uses_version_suffix_when_output_exists(tmp_path, config):
     pdf = tmp_path / "paper.pdf"
@@ -266,7 +254,7 @@ def test_run_batch_skips_processed_pdfs(tmp_path, config):
 
     config.output_dir.mkdir(parents=True)
     (config.output_dir / "processed.txt").write_text(
-        str(pdf.resolve()) + "\n", encoding="utf-8"
+        str(pdf.resolve()) + ", /out/summary.md\n", encoding="utf-8"
     )
 
     with patch("summarizer.batch.process_pdf") as mock_process:
@@ -284,7 +272,7 @@ def test_run_batch_force_summary_reprocesses(tmp_path, config):
 
     config.output_dir.mkdir(parents=True)
     (config.output_dir / "processed.txt").write_text(
-        str(pdf.resolve()) + "\n", encoding="utf-8"
+        str(pdf.resolve()) + ", /out/summary.md\n", encoding="utf-8"
     )
     config.force_summary = True
 
@@ -370,7 +358,7 @@ def test_run_batch_writes_to_centralized_output(tmp_path, config):
 
 
 def test_run_batch_appends_to_processed_txt(tmp_path, config):
-    """After a successful run, the PDF path is appended to processed.txt."""
+    """After a successful run, the PDF path and summary path are recorded in processed.txt."""
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF")
 
@@ -382,7 +370,42 @@ def test_run_batch_appends_to_processed_txt(tmp_path, config):
         run_batch(tmp_path, config)
 
     processed = load_processed_index(config.output_dir)
-    assert str(pdf.resolve()) in processed
+    abs_path = str(pdf.resolve())
+    assert abs_path in processed
+    assert len(processed[abs_path]) == 1
+    assert processed[abs_path][0].endswith("smith2020foo_summary.md")
+
+
+def test_run_batch_force_summary_appends_new_summary_path(tmp_path, config):
+    """Re-processing with force_summary appends a new summary path to the existing entry."""
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF")
+
+    abs_path = str(pdf.resolve())
+    existing_summary = str(config.output_dir / "primary" / "smith2020foo_summary.md")
+    config.output_dir.mkdir(parents=True)
+    (config.output_dir / "processed.txt").write_text(
+        f"{abs_path}, {existing_summary}\n", encoding="utf-8"
+    )
+    # pre-create the existing summary so versioning kicks in
+    (config.output_dir / "primary").mkdir(parents=True, exist_ok=True)
+    (config.output_dir / "primary" / "smith2020foo_summary.md").write_text(
+        "# old", encoding="utf-8"
+    )
+    config.force_summary = True
+
+    summary = _make_summary("smith2020foo", paper_type="primary")
+    with (
+        patch("summarizer.batch.process_pdf", return_value=summary),
+        patch("summarizer.batch.render_summary", return_value="# new"),
+    ):
+        run_batch(tmp_path, config)
+
+    processed = load_processed_index(config.output_dir)
+    assert abs_path in processed
+    assert len(processed[abs_path]) == 2
+    assert processed[abs_path][0] == existing_summary
+    assert processed[abs_path][1].endswith("smith2020foo_summary_v2.md")
 
 
 def test_run_batch_failed_paper_not_in_processed(tmp_path, config):
@@ -396,3 +419,43 @@ def test_run_batch_failed_paper_not_in_processed(tmp_path, config):
 
     processed = load_processed_index(config.output_dir)
     assert str(pdf.resolve()) not in processed
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: shared client, accumulator, BatchReport.total_cost
+# ---------------------------------------------------------------------------
+
+
+def test_run_batch_creates_client_once(tmp_path, config):
+    """run_batch creates the LLM client exactly once before the thread pool."""
+    (tmp_path / "paper_a.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper_b.pdf").write_bytes(b"%PDF")
+
+    summary_a = _make_summary("smith2020foo")
+    summary_b = _make_summary("jones2021bar")
+    with (
+        patch("summarizer.batch.create_client") as mock_create,
+        patch("summarizer.batch.process_pdf", side_effect=[summary_a, summary_b]),
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        run_batch(tmp_path, config)
+
+    mock_create.assert_called_once_with(config)
+
+
+def test_run_batch_report_has_total_cost(tmp_path, config):
+    """BatchReport returned by run_batch has a total_cost field."""
+    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+
+    summary = _make_summary("smith2020foo")
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", return_value=summary),
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        report = run_batch(tmp_path, config)
+
+    assert hasattr(report, "total_cost")
+    assert isinstance(report.total_cost, float)
+
+

@@ -67,7 +67,7 @@ Neuromorphic chip examples (non-exhaustive): Loihi/Loihi 2 (Intel), BrainScaleS/
 ---
 
 ## Control task
-What is controlled, in what environment, toward what goal (be concrete; include task name if given).
+What is controlled, in what environment, toward what goal (be concrete; include task name if given). Observations → actions: what goes in, what comes out?
 
 ---
 

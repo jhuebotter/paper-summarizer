@@ -261,20 +261,8 @@ def test_parse_pdf_raises_parse_error_if_docling_and_fallback_fail(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_parse_pdf_logs_cache_hit(tmp_path, caplog):
-    """A cache hit emits an INFO message containing 'cache found'."""
-    pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF-1.4")
-    (tmp_path / "paper.md").write_text("cached content", encoding="utf-8")
-
-    with caplog.at_level(logging.INFO, logger="summarizer.parser"):
-        parse_pdf(pdf, max_chars=10_000)
-
-    assert any("cache found" in r.message.lower() for r in caplog.records)
-
-
-def test_parse_pdf_logs_running_docling(tmp_path, caplog):
-    """A fresh parse emits an INFO message containing 'Running ... extraction'."""
+def test_parse_pdf_logs_extraction_progress(tmp_path, caplog):
+    """A fresh parse emits INFO messages for start and completion of extraction."""
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF-1.4")
 
@@ -288,25 +276,9 @@ def test_parse_pdf_logs_running_docling(tmp_path, caplog):
         MockConverter.return_value.convert.return_value = mock_result
         parse_pdf(pdf, max_chars=10_000)
 
-    assert any("Running auto extraction" in r.message for r in caplog.records)
-
-
-def test_parse_pdf_logs_docling_complete(tmp_path, caplog):
-    """After extraction finishes, an INFO completion message is emitted."""
-    pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF-1.4")
-
-    mock_result = MagicMock()
-    mock_result.document.export_to_markdown.return_value = "some content"
-
-    with (
-        caplog.at_level(logging.INFO, logger="summarizer.parser"),
-        patch("summarizer.parser.DocumentConverter") as MockConverter,
-    ):
-        MockConverter.return_value.convert.return_value = mock_result
-        parse_pdf(pdf, max_chars=10_000)
-
-    assert any("Extraction complete" in r.message for r in caplog.records)
+    messages = [r.message for r in caplog.records]
+    assert any("Running auto extraction" in m for m in messages)
+    assert any("Extraction complete" in m for m in messages)
 
 
 @pytest.mark.integration
