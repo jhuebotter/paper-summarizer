@@ -1,8 +1,9 @@
-"""
-paper-summarizer — local pipeline replicating the snn-paper-reader skill.
+"""paper-summarizer — structured, critical summaries of research PDFs.
 
-Converts PDF research papers to structured markdown summaries using docling
-(PDF parsing) and a locally hosted LLM via LM Studio.
+Extracts PDF text (docling or pypdf), asks an OpenAI-compatible LLM
+(OpenRouter by default, or a local server such as LM Studio) for one JSON
+object per paper, validates it with pydantic, and renders markdown.
+Originally a port of the ``snn-paper-reader`` skill.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0.dev0"

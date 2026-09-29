@@ -42,7 +42,7 @@ def pdf_dir(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# find_pdfs (unchanged from v1.0)
+# find_pdfs
 # ---------------------------------------------------------------------------
 
 
@@ -65,8 +65,15 @@ def test_find_pdfs_empty_dir(tmp_path):
     assert find_pdfs(tmp_path) == []
 
 
+def test_find_pdfs_matches_uppercase_extension_and_skips_appledouble(tmp_path):
+    (tmp_path / "upper.PDF").write_bytes(b"%PDF")
+    (tmp_path / "._upper.pdf").write_bytes(b"junk")
+    (tmp_path / "notes.md").write_text("x")
+    assert [p.name for p in find_pdfs(tmp_path)] == ["upper.PDF"]
+
+
 # ---------------------------------------------------------------------------
-# load_processed_index
+# load_processed_index (legacy processed.txt is still read)
 # ---------------------------------------------------------------------------
 
 
@@ -118,7 +125,7 @@ def test_save_processed_index_writes_file(tmp_path):
     output_dir.mkdir()
     index = {"/path/a.pdf": ["/out/a_summary.md"], "/path/b.pdf": []}
     save_processed_index(output_dir, index)
-    content = (output_dir / "processed.txt").read_text(encoding="utf-8")
+    content = (output_dir / "processed.jsonl").read_text(encoding="utf-8")
     assert "/path/a.pdf" in content
     assert "/path/b.pdf" in content
     assert "/out/a_summary.md" in content
@@ -128,7 +135,7 @@ def test_save_processed_index_creates_output_dir(tmp_path):
     output_dir = tmp_path / "new_output"
     save_processed_index(output_dir, {"/some/path.pdf": []})
     assert output_dir.exists()
-    assert (output_dir / "processed.txt").exists()
+    assert (output_dir / "processed.jsonl").exists()
 
 
 def test_load_save_roundtrip(tmp_path):
@@ -142,6 +149,49 @@ def test_load_save_roundtrip(tmp_path):
     save_processed_index(output_dir, index)
     loaded = load_processed_index(output_dir)
     assert loaded == index
+
+
+def test_roundtrip_preserves_paths_with_commas(tmp_path):
+    """Regression: the old comma-separated format truncated such paths."""
+    pdf = tmp_path / "Smith et al. - 2024 - Spikes, Robots, and Control.pdf"
+    pdf.write_bytes(b"%PDF")
+    index = {str(pdf.resolve()): [str(tmp_path / "a, b_summary.md")]}
+    save_processed_index(tmp_path, index)
+    loaded = load_processed_index(tmp_path)
+    assert loaded == index
+    assert should_skip(pdf, loaded, force_summary=False) is True
+
+
+def test_legacy_index_with_commas_in_paths_is_parsed(tmp_path):
+    (tmp_path / "processed.txt").write_text(
+        "/lib/Smith - 2024 - Spikes, Robots.pdf, /out/smith2024spikes_summary.md, "
+        "/out/smith2024spikes_summary_v2.md\n",
+        encoding="utf-8",
+    )
+    assert load_processed_index(tmp_path) == {
+        "/lib/Smith - 2024 - Spikes, Robots.pdf": [
+            "/out/smith2024spikes_summary.md",
+            "/out/smith2024spikes_summary_v2.md",
+        ]
+    }
+
+
+def test_jsonl_index_takes_precedence_over_legacy(tmp_path):
+    (tmp_path / "processed.txt").write_text("/old.pdf\n", encoding="utf-8")
+    save_processed_index(tmp_path, {"/new.pdf": []})
+    assert load_processed_index(tmp_path) == {"/new.pdf": []}
+
+
+def test_malformed_jsonl_line_is_ignored(tmp_path):
+    (tmp_path / "processed.jsonl").write_text(
+        '{"pdf_path": "/a.pdf", "outputs": []}\nnot json\n', encoding="utf-8"
+    )
+    assert load_processed_index(tmp_path) == {"/a.pdf": []}
+
+
+def test_save_processed_index_leaves_no_temp_files(tmp_path):
+    save_processed_index(tmp_path, {"/a.pdf": []})
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["processed.jsonl"]
 
 
 # ---------------------------------------------------------------------------
@@ -454,3 +504,29 @@ def test_run_batch_report_has_total_cost(tmp_path, config):
 
     assert hasattr(report, "total_cost")
     assert isinstance(report.total_cost, float)
+
+
+def test_run_batch_loads_references_once_and_passes_them(tmp_path, config):
+    (tmp_path / "paper_a.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper_b.pdf").write_bytes(b"%PDF")
+
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.load_references", return_value="REFS") as mock_refs,
+        patch(
+            "summarizer.batch.process_pdf",
+            side_effect=[_make_summary("a2020x"), _make_summary("b2020y")],
+        ) as mock_process,
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        run_batch(tmp_path, config)
+
+    mock_refs.assert_called_once()
+    assert all(c.kwargs["references"] == "REFS" for c in mock_process.call_args_list)
+
+
+def test_run_batch_nothing_to_do_creates_no_client(tmp_path, config):
+    with patch("summarizer.batch.create_client") as mock_create:
+        report = run_batch(tmp_path, config)
+    mock_create.assert_not_called()
+    assert report.processed == 0
