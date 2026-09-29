@@ -213,6 +213,55 @@ def test_citation_key_is_rebuilt_when_it_does_not_match_the_first_author(
         assert process_pdf(fake_pdf, config).metadata.citation_key == expected
 
 
+@pytest.mark.parametrize(
+    "key, author",
+    [
+        ("smith2020spiking", "Smith JA"),
+        ("smith2020spiking", "John Smith et al."),
+        ("smith2020spiking", "J. Smith and K. Lee"),
+        ("song2020spiking", "Le Song"),
+        ("zhang2020spiking", "Zhang Wei"),
+        ("garcia2020spiking", "Gabriel García Márquez"),
+        ("garciamarquez2020spiking", "Gabriel García Márquez"),
+        ("sogaard2020spiking", "Anders Søgaard"),
+        ("weiss2020spiking", "Thomas Weiß"),
+        ("groot2020spiking", "Jan de Groot"),
+        ("snn2020spiking", "The SNN Consortium"),
+        ("smith2020spiking", "Not reported"),
+    ],
+)
+def test_citation_keys_taken_from_the_name_are_kept(key, author):
+    """Review finding: an earlier version rewrote these to ja…, al…, lee…, lesong…, sgaard…."""
+    from summarizer.pipeline import _match_metadata
+
+    assert _match_metadata(key, {"authors": [author], "year": 2020}) == key
+
+
+def test_citation_key_of_a_non_research_document_is_kept():
+    from summarizer.pipeline import _match_metadata
+
+    metadata = {"authors": ["Jane Doe"], "year": 2025, "is_research_paper": False}
+    assert _match_metadata("document2025slug", metadata) == "document2025slug"
+
+
+def test_sanitized_citation_key_is_also_checked_against_the_author(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    combined = _make_combined_dict(
+        dict(mock_part1_dict, citation_key="c-kl2024local"), mock_part2_dict
+    )
+    combined["metadata"].update(authors=["Christian Stöckl"], year=2024)
+    client_patcher, _ = _mock_llm_combined(combined)
+    with _mock_parse("Some paper text."), client_patcher:
+        assert process_pdf(fake_pdf, config).metadata.citation_key == "stockl2024local"
+
+
+def test_rebuilt_citation_key_without_a_year_uses_nd():
+    from summarizer.pipeline import _match_metadata
+
+    assert _match_metadata("x2020foo", {"authors": ["Jane Doe"], "year": None}) == "doendfoo"
+
+
 # ---------------------------------------------------------------------------
 # Unit tests for citation key helpers
 # ---------------------------------------------------------------------------
@@ -236,8 +285,9 @@ def test_sanitize_citation_key(value, expected):
     "author_name, expected",
     [
         ("F. Paredes-Vallés", "paredesvalles"),  # hyphenated surname kept whole
-        ("Robin Van den Berghe", "vandenberghe"),  # leading particles kept
-        ("Lancelot Da Costa", "dacosta"),
+        ("Robin Van den Berghe", "vandenberghe"),  # particles kept
+        ("Le Song", "song"),  # ... but a first word is never a particle
+        ("Thomas Weiß", "weiss"),
         ("DeWolf, Travis", "dewolf"),  # "Surname, Given"
         ("Martin Luther King Jr.", "king"),
         ("Müller J.", "j"),  # "Surname I." → last token is initial (by design)

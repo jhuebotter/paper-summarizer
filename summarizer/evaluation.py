@@ -176,7 +176,11 @@ def score_gold(summary: PaperSummary, labels: dict) -> dict[str, bool]:
         got = predicted[field]
         if field == "first_author":
             expected = author_surname_token(str(expected))
-        if got is None and field.startswith("classification."):
+            # "Groot" vs "de Groot", "Vallés" vs "Paredes-Vallés"
+            scores[field] = bool(got and expected) and (
+                got.endswith(expected) or expected.endswith(got)
+            )
+        elif got is None and field.startswith("classification."):
             scores[field] = False  # no Part 2: the model didn't classify the paper
         elif isinstance(expected, list):
             scores[field] = {_norm(v) for v in got} == {_norm(v) for v in expected}

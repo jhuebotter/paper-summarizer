@@ -429,20 +429,35 @@ def _normalize_citation_key(raw: dict, pdf_path: Path) -> dict:
 
 
 def _match_metadata(key: str, metadata: dict) -> str:
-    """Rebuild *key* from the first author and year when it doesn't start with them.
+    """Rebuild *key* when its prefix isn't taken from the first author's name or
+    its year differs from the metadata.
 
     Models mangle surnames (``ckl2024local`` for Stöckl, ``s2024fully`` for
-    Paredes-Vallés, ``apolinaro`` for Apolinario); the descriptive word after
-    the year is kept.
+    Paredes-Vallés, ``apolinaro`` for Apolinario).  Any run of words from the
+    name is accepted (``smith`` for "Smith JA", ``garcia`` for "García Márquez");
+    the descriptive word after the year is kept.
     """
-    authors = metadata.get("authors")
-    surname = author_surname_token(str(authors[0])) if isinstance(authors, list) and authors else ""
+    name = _first_author_name(metadata.get("authors"))
+    surname = author_surname_token(name)
+    if (
+        metadata.get("is_research_paper") is False
+        or len(surname) < 2
+        or surname in _PLACEHOLDER_NAMES
+    ):
+        return key[:_MAX_CITATION_KEY_LEN]
+    words = _name_words(name.replace(",", " "))
+    runs = {"".join(words[a:b]) for a in range(len(words)) for b in range(a + 1, len(words) + 1)}
+    runs.add(surname)
     year = metadata.get("year")
-    prefix = f"{surname}{year if isinstance(year, int) else ''}"
-    if len(surname) > 1 and not key.startswith(prefix):
-        match = re.fullmatch(r"[a-z]*\d{4}([a-z]+)", key)
-        word = match.group(1) if match else _first_alnum_token(str(metadata.get("title") or ""))
-        rebuilt = f"{surname}{year if isinstance(year, int) else 'nd'}{word or 'paper'}"
+    match = re.fullmatch(r"([a-z]+)(\d{4})([a-z0-9]*)", key)
+    if isinstance(year, int):
+        ok = bool(match) and match.group(1) in runs and int(match.group(2)) == year
+    else:
+        ok = any(key.startswith(run) for run in runs)
+    if not ok:
+        word = match.group(3) if match and match.group(3).isalpha() else ""
+        word = word or _first_alnum_token(str(metadata.get("title") or "")) or "paper"
+        rebuilt = f"{surname}{year if isinstance(year, int) else 'nd'}{word}"
         logger.info("Citation key %s does not match the first author/year; using %s", key, rebuilt)
         key = rebuilt
     return key[:_MAX_CITATION_KEY_LEN]
@@ -492,36 +507,51 @@ def _first_alnum_token(value: str) -> str:
 
 _SURNAME_PARTICLES = {"da", "de", "del", "della", "den", "der", "di", "dos", "du", "la", "le"}
 _SURNAME_PARTICLES |= {"st", "ten", "ter", "van", "von"}
-
-
 _NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
+_PLACEHOLDER_NAMES = {"anonymous", "na", "notreported", "reported", "unknown"}
+# Letters NFKD doesn't decompose to ASCII.
+_TRANSLITERATION = str.maketrans(
+    {"ß": "ss", "æ": "ae", "Æ": "Ae", "œ": "oe", "Œ": "Oe", "ø": "o", "Ø": "O"}
+    | {"ł": "l", "Ł": "L", "đ": "d", "Đ": "D", "ı": "i", "þ": "th", "Þ": "Th"}
+)
+
+
+def _first_author_name(authors: object) -> str:
+    """First entry of an authors list, without "et al." or co-authors joined by "and"/"&"."""
+    if not isinstance(authors, list) or not authors:
+        return ""
+    name = re.sub(r"\bet al\b\.?", "", str(authors[0]), flags=re.IGNORECASE)
+    return re.split(r"\s+and\s+|&|;", name)[0].strip()
+
+
+def _name_words(name: str) -> list[str]:
+    """Lowercase ASCII words of a name; hyphenated parts joined, suffixes dropped."""
+    ascii_name = unicodedata.normalize("NFKD", name.translate(_TRANSLITERATION))
+    words = (
+        re.sub(r"[^a-z0-9]", "", w)
+        for w in ascii_name.encode("ascii", "ignore").decode().lower().split()
+    )
+    return [w for w in words if re.search(r"[a-z]", w) and w not in _NAME_SUFFIXES]
 
 
 def author_surname_token(author_name: str) -> str:
     """Surname token of "Given Surname" or "Surname, Given", lowercase ASCII.
 
-    Hyphenated surnames and leading particles are kept whole
-    (Paredes-Vallés → paredesvalles, Robin Van den Berghe → vandenberghe);
-    suffixes like Jr. are dropped.
+    Hyphenated surnames and particles are kept whole (Paredes-Vallés →
+    paredesvalles, Robin Van den Berghe → vandenberghe); a first word is never a
+    particle (Le Song → song).
     """
-    ascii_name = (
-        unicodedata.normalize("NFKD", author_name).encode("ascii", "ignore").decode("ascii")
-    )
-    if "," in ascii_name:
-        ascii_name = ascii_name.split(",")[0]
-    words = [
-        w
-        for w in ascii_name.split()
-        if re.search(r"[A-Za-z]", w) and w.lower().strip(".") not in _NAME_SUFFIXES
-    ]
+    if "," in author_name:
+        return "".join(_name_words(author_name.split(",")[0]))
+    words = _name_words(author_name)
     if not words:
         return ""
     surname = words[-1]
-    for word in reversed(words[:-1]):
-        if word.lower().rstrip(".") not in _SURNAME_PARTICLES:
+    for word in reversed(words[1:-1]):
+        if word not in _SURNAME_PARTICLES:
             break
         surname = word + surname
-    return re.sub(r"[^a-z0-9]", "", surname.lower())
+    return surname
 
 
 def _extract_year_candidate(value: object) -> int | None:
