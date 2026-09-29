@@ -10,6 +10,7 @@ CLI that turns research PDFs into structured markdown summaries via an OpenAI-co
 - Tests: `uv run pytest` — unit tests block network access (`tests/conftest.py::_no_network`); `uv run pytest -m integration` for real PDFs/OpenRouter
 - Lint/format: `uv run ruff check . && uv run ruff format .`
 - Run: `uv run summarize-papers --source DIR | --file PDF [--dry-run]`
+- Evaluate: `uv run summarize-papers eval --source DIR [--models A,B] [--extractors pypdf,docling]` (outputs in `eval/runs/`)
 
 Python >=3.12, developed on 3.14 (`.python-version`). Use uv, not pip/conda; commit `uv.lock` changes.
 

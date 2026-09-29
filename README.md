@@ -119,7 +119,7 @@ The authors train a recurrent LIF controller with surrogate-gradient BPTT on a s
 ├── skill_data/references/        # Prompt references: JSON contract, template, field guides
 ├── collect_pdfs.sh               # Flatten nested PDF libraries
 ├── eval/                         # Evaluation papers, gold labels, runs and cache (gitignored)
-└── summarizer/                   # Package source (cli, batch, pipeline, llm, parser, prompts, renderer, models)
+└── summarizer/                   # Package source (cli, batch, pipeline, llm, parser, prompts, renderer, models, log, evaluation, metrics)
 ```
 
 ## Configuration
@@ -168,30 +168,32 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 mkdir -p eval/papers && cp /path/to/some/papers/*.pdf eval/papers/   # extraction caches are written next to the PDFs
 uv run summarize-papers eval --source eval/papers --init-gold          # adds unlabelled entries to eval/gold.jsonl
 # optionally fill in labels in eval/gold.jsonl, then:
-uv run summarize-papers eval --source eval/papers --models nvidia/nemotron-3-super-120b-a12b:free,qwen/qwen3.8-27b:free --workers 1
+uv run summarize-papers eval --source eval/papers --models nvidia/nemotron-3-super-120b-a12b:free,qwen/qwen3.8-27b:free
 ```
 
 Each run writes `eval/runs/<timestamp>/`:
 - `report.md`: per-configuration summary, a per-paper table, every quote that wasn't found, and label accuracy per field;
-- `results.jsonl`: one row per paper × configuration, with metrics, tokens, cost, repairs, timings and provenance (git commit, reference hash, `--max-chars`);
-- `summaries/<config>/<sha256>.json`: the validated summaries.
+- `results.jsonl`: one row per paper × configuration, with metrics, tokens, cost, repairs, LLM seconds and provenance (git commit, reference hash, `--max-chars`);
+- `summaries/<config>/<sha256>.json`: the validated summaries;
+- `eval.log`.
 
-LLM responses are cached in `eval/cache/`. Re-running the same configuration is free and resumes an interrupted run.
+Duplicate PDFs (same content) are evaluated once. Successful LLM responses are cached in `eval/cache/`, keyed by backend, model, output cap and the full prompt, so changing the references, `--max-chars` or a PDF's filename gives a cache miss. Re-running is therefore free for everything that already succeeded; an interrupted run writes no report until you re-run it. Delete `eval/cache/` to force fresh calls. Eval uses one worker by default because of free-tier limits.
 
 **Gold labels:** `eval/gold.jsonl` holds one `{"sha256", "file", "labels"}` object per paper. The labels are `is_research_paper`, `paper_type` (`primary`/`synthesis`/`non_research`), `synthesis_subtype`, `year`, `first_author` (surname) and `title`. `null` means not labelled, and the field is skipped.
 
 **Metrics** (a rate with nothing to count is reported as n/a):
-- **Quotes:** each `citable_snippets` quote is checked against the exact text the model saw. It counts as verbatim (after normalizing hyphenation, ligatures, quotes and whitespace), near (≥70% of its word 3-grams found), or not found.
-- **Anchor coverage:** the share of sentences with a number (not a year or a name like "Loihi 2") that carry a `Source:` anchor in the same or the next sentence.
-- **First person:** uses of "we/our/us" outside quotes, per 1k words.
+- **Quotes:** each `citable_snippets` quote is checked against the exact text the model saw, word by word, ignoring punctuation, hyphenation, ligatures and `[12]`-style citations. It counts as verbatim, near (≥70% of its word 3-grams found), or not found. Parts separated by an ellipsis must appear in order, and parts shorter than three words make a quote at best near.
+- **Anchor coverage:** the share of sentences with a number that carry a `Source:` anchor in the same or the next sentence. Years in date context, references such as "Table 3", chip names such as "Loihi 2", and identifiers such as "CIFAR-10" don't count as numbers.
+- **First person:** uses of "we/our/us" outside quoted text, per 1k words.
+- Quality columns cover successful papers only; a failed paper counts as wrong for each of its gold labels.
 - **Word budget:** Part 1 prose words ÷ the limit (600 primary, 1000 synthesis).
 - **Evidence tags:** notable findings with exactly one allowed tag (no `Measured` for synthesis papers).
-- **Reliability and cost:** first-try validity, JSON and schema repairs, tokens, cost, parse and LLM seconds.
+- **Reliability and cost:** first-try validity, JSON and schema repairs, tokens and cost (LLM seconds per paper are in `results.jsonl`).
 - **Duplicate citation keys.**
 
 **Caveats:**
 - Zotero-style filenames ("Author - Year - Title.pdf") are part of the prompt, which inflates title, year and author accuracy. `paper_type` and `is_research_paper` are the informative labels.
-- Free models are capped at 50 requests per day (1,000 once you've bought $10 of credits); use `--workers 1` and let the cache carry runs across days.
+- Free models are capped at 50 requests per day (1,000 once you've bought $10 of credits); the cache lets a set of papers be spread across days.
 - With about 30 papers and one sample each, compare configurations per paper rather than by small differences in averages.
 
 ## Troubleshooting
