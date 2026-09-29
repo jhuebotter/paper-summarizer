@@ -28,14 +28,15 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
-from summarizer.llm import CostAccumulator, create_client
-from summarizer.models import BatchReport, Config, FailedPaper
+from summarizer.llm import CostAccumulator, QuotaExhausted, create_client
+from summarizer.models import BatchReport, Config, FailedPaper, PipelineError
 from summarizer.pipeline import process_pdf
 from summarizer.prompts import load_references
 from summarizer.renderer import render_summary
@@ -220,6 +221,31 @@ def get_versioned_output_path(path: Path) -> Path:
         version += 1
 
 
+class StopSignal:
+    """Thread-safe "start no new papers" flag that keeps the first reason given."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reason: str | None = None
+
+    def trip(self, reason: str) -> None:
+        with self._lock:
+            if self.reason is None:
+                self.reason = reason
+                logger.warning("Stopping: %s", reason)
+
+    def is_set(self) -> bool:
+        return self.reason is not None
+
+    def check_budget(self, accumulator: CostAccumulator, max_cost: float | None) -> None:
+        if max_cost is not None and accumulator.total_cost >= max_cost:
+            self.trip(f"--max-cost ${max_cost:g} reached")
+
+
+class _Stopped(Exception):
+    """The run was stopped (quota or --max-cost) before this paper started."""
+
+
 def _process_one_pdf(
     pdf_path: Path,
     config: Config,
@@ -228,12 +254,21 @@ def _process_one_pdf(
     client,
     accumulator: CostAccumulator,
     references: str,
+    stop: StopSignal,
 ) -> dict:
     """Worker task: process one PDF and return renderable artifacts."""
+    stop.check_budget(accumulator, config.max_cost)
+    if stop.is_set():
+        raise _Stopped
     logger.info("  Processing [%d/%d]: %s", run_idx, run_total, pdf_path.name)
-    summary = process_pdf(
-        pdf_path, config, client=client, accumulator=accumulator, references=references
-    )
+    try:
+        summary = process_pdf(
+            pdf_path, config, client=client, accumulator=accumulator, references=references
+        )
+    except PipelineError as exc:
+        if isinstance(exc.cause, QuotaExhausted):
+            stop.trip(str(exc.cause))
+        raise
     markdown = render_summary(summary)
     return {
         "pdf_path": pdf_path,
@@ -265,6 +300,8 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
        progress).
     5. On failure, record it and continue; the index is not updated, so the
        next run retries the paper.
+    6. Stop early (cancel queued papers, count them as skipped) when the
+       backend reports an exhausted quota or ``config.max_cost`` is reached.
     """
     total = len(pdfs)
 
@@ -311,6 +348,7 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
 
     show_progress = sys.stderr.isatty()
     run_total = len(jobs)
+    stop = StopSignal()
     executor = ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="worker")
     try:
         futures_to_path = {
@@ -323,6 +361,7 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
                 client,
                 accumulator,
                 references,
+                stop,
             ): (pdf_path, run_idx)
             for run_idx, pdf_path in enumerate(jobs, start=1)
         }
@@ -355,7 +394,12 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
                     save_processed_index(config.output_dir, processed_set)
                     logger.info("  [%d/%d] Written: %s", run_idx, run_total, output_path)
                     n_processed += 1
+                except _Stopped:
+                    n_skipped += 1
                 except Exception as exc:
+                    if isinstance(getattr(exc, "cause", None), QuotaExhausted):
+                        n_skipped += 1
+                        continue
                     logger.error("  [%d/%d] Failed: %s", run_idx, run_total, exc)
                     n_failed += 1
                     failed_papers.append(FailedPaper(pdf_path=str(pdf_path), error=str(exc)))
@@ -380,4 +424,5 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
         total_cost=accumulator.total_cost,
         input_tokens=accumulator.total_input_tokens,
         output_tokens=accumulator.total_output_tokens,
+        stopped_reason=stop.reason,
     )

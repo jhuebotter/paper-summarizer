@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import threading
+import time
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
@@ -215,7 +216,10 @@ def test_call_llm_retries_on_429_then_succeeds():
         MagicMock(text=json.dumps(data)),
     ]
 
-    with patch("summarizer.llm.time.sleep") as mock_sleep:
+    with (
+        patch("summarizer.llm.time.sleep") as mock_sleep,
+        patch("summarizer.llm.random.uniform", return_value=1.0),
+    ):
         result = call_llm(mock_client, "some prompt")
 
     assert result == data
@@ -233,7 +237,10 @@ def test_call_llm_retries_on_5xx_then_succeeds():
         MagicMock(text=json.dumps(data)),
     ]
 
-    with patch("summarizer.llm.time.sleep") as mock_sleep:
+    with (
+        patch("summarizer.llm.time.sleep") as mock_sleep,
+        patch("summarizer.llm.random.uniform", return_value=1.0),
+    ):
         result = call_llm(mock_client, "some prompt")
 
     assert result == data
@@ -906,39 +913,38 @@ def test_openrouter_headers_name_this_project():
     assert "jhuebotter/paper-summarizer" in headers["HTTP-Referer"]
 
 
-def test_fetch_openrouter_model_ids():
-    from summarizer.llm import fetch_openrouter_model_ids
+def test_fetch_openrouter_models():
+    from summarizer.llm import fetch_openrouter_models
 
     body = json.dumps({"data": [{"id": "a/b"}, {"id": "c/d"}]}).encode()
-    resp = MagicMock()
-    resp.read.return_value = body
-    resp.__enter__ = lambda s: s
-    resp.__exit__ = MagicMock(return_value=False)
-    with patch("summarizer.llm.urllib.request.urlopen", return_value=resp):
-        assert fetch_openrouter_model_ids("https://openrouter.ai/api/v1") == {"a/b", "c/d"}
+    with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)):
+        assert [m["id"] for m in fetch_openrouter_models("https://openrouter.ai/api/v1")] == [
+            "a/b",
+            "c/d",
+        ]
 
 
-def test_fetch_openrouter_model_ids_returns_none_when_unreachable():
-    from summarizer.llm import fetch_openrouter_model_ids
+def test_fetch_openrouter_models_returns_none_when_unreachable():
+    from summarizer.llm import fetch_openrouter_models
 
-    assert fetch_openrouter_model_ids("https://openrouter.ai/api/v1") is None
+    assert fetch_openrouter_models("https://openrouter.ai/api/v1") is None
 
 
 @pytest.mark.parametrize("body", [b"[]", b"null", b'{"data": null}', b"not json"])
 def test_malformed_model_list_is_treated_as_unknown(body):
-    from summarizer.llm import fetch_openrouter_model_ids
+    from summarizer.llm import fetch_openrouter_models
 
     with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)):
-        assert fetch_openrouter_model_ids("https://openrouter.ai/api/v1") is None
+        assert fetch_openrouter_models("https://openrouter.ai/api/v1") is None
         assert fetch_model_pricing("a/b", "k", "https://openrouter.ai/api/v1") == ModelPricing()
 
 
 def test_model_list_skips_malformed_entries():
-    from summarizer.llm import fetch_openrouter_model_ids
+    from summarizer.llm import fetch_openrouter_models
 
     body = json.dumps({"data": ["x", {"no_id": 1}, {"id": "a/b"}]}).encode()
     with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)):
-        assert fetch_openrouter_model_ids("https://openrouter.ai/api/v1") == {"a/b"}
+        assert fetch_openrouter_models("https://openrouter.ai/api/v1") == [{"id": "a/b"}]
 
 
 def test_pricing_null_fields_do_not_crash():
@@ -953,3 +959,223 @@ def test_pricing_lookup_strips_routing_suffix():
     with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)):
         pricing = fetch_model_pricing("a/b:nitro", "k", "https://openrouter.ai/api/v1")
     assert pricing.prompt == 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Quotas, backoff, billed cost, structured output
+# ---------------------------------------------------------------------------
+
+
+def _api_error(status: int, message: str = "error", headers: dict | None = None):
+    exc = Exception(f"Error code: {status} - {message}")
+    exc.status_code = status
+    exc.body = {"message": message, "metadata": {"headers": headers or {}}}
+    return exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _api_error(402, "Insufficient credits"),
+        _api_error(429, "Rate limit exceeded: free-models-per-day"),
+        _api_error(
+            429,
+            "Rate limit exceeded",
+            {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str((time.time() + 7200) * 1000)},
+        ),
+    ],
+)
+def test_exhausted_quota_is_not_retried(exc):
+    from summarizer.llm import QuotaExhausted
+
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = exc
+    with patch("summarizer.llm.time.sleep") as sleep, pytest.raises(QuotaExhausted):
+        call_llm(mock_client, "prompt")
+    sleep.assert_not_called()
+    assert mock_client.complete.call_count == 1
+
+
+def test_per_minute_rate_limit_is_retried_with_retry_after():
+    mock_client = MagicMock()
+    exc = _api_error(429, "Rate limit exceeded: 20 per minute")
+    exc.response = MagicMock(headers={"retry-after": "7"})
+    mock_client.complete.side_effect = [exc, MagicMock(text='{"ok": true}', usage=None)]
+    with patch("summarizer.llm.time.sleep") as sleep:
+        assert call_llm(mock_client, "prompt") == {"ok": True}
+    sleep.assert_called_once_with(7.0)
+
+
+def test_quota_message_includes_reset_time():
+    from summarizer.llm import _quota_exhausted_message
+
+    reset = (time.time() + 3600) * 1000
+    message = _quota_exhausted_message(
+        _api_error(429, "limit", {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(reset)})
+    )
+    assert "resets at" in message
+
+
+def test_billed_cost_and_cached_tokens_are_read_from_usage():
+    usage = MagicMock(
+        prompt_tokens=1000,
+        completion_tokens=100,
+        completion_tokens_details=MagicMock(reasoning_tokens=20),
+        prompt_tokens_details=MagicMock(cached_tokens=800),
+        cost=0.0042,
+    )
+    stats = _extract_usage(MagicMock(usage=usage))
+    assert (stats.cached_tokens, stats.cost) == (800, 0.0042)
+    assert _calculate_cost(stats, ModelPricing(prompt=1.0)) == 0.0042  # billed beats list price
+
+
+def test_non_numeric_cost_is_ignored():
+    usage = MagicMock(prompt_tokens=1, completion_tokens=1)  # .cost is a MagicMock
+    assert _extract_usage(MagicMock(usage=usage)).cost is None
+
+
+def test_structured_output_request_shape():
+    config = Config(
+        base_url="https://openrouter.ai/api/v1", model="m", api_key="k", structured_output=True
+    )
+    with (
+        patch("summarizer.llm._openai.OpenAI") as mock_openai,
+        patch("summarizer.llm.fetch_model_pricing", return_value=ModelPricing()),
+    ):
+        mock_openai.return_value.chat.completions.create.return_value = _sdk_response()
+        create_client(config).complete("hello")
+    kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
+    assert kwargs["response_format"]["type"] == "json_schema"
+    assert "metadata" in kwargs["response_format"]["json_schema"]["schema"]["properties"]
+    assert kwargs["extra_body"] == {"provider": {"require_parameters": True}}
+
+
+def test_structured_output_off_by_default():
+    with _client_returning(_sdk_response()) as (client, mock_openai):
+        client.complete("hello")
+    kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
+    assert "response_format" not in kwargs and "extra_body" not in kwargs
+
+
+def test_fetch_openrouter_key_info():
+    from summarizer.llm import fetch_openrouter_key_info
+
+    body = json.dumps({"data": {"usage": 0.5, "is_free_tier": True}}).encode()
+    with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)) as urlopen:
+        info = fetch_openrouter_key_info("https://openrouter.ai/api/v1", "sk-1")
+    assert info == {"usage": 0.5, "is_free_tier": True}
+    request = urlopen.call_args.args[0]
+    assert request.full_url == "https://openrouter.ai/api/v1/key"
+    assert request.headers["Authorization"] == "Bearer sk-1"
+    with patch("summarizer.llm.urllib.request.urlopen", side_effect=OSError("down")):
+        assert fetch_openrouter_key_info("https://openrouter.ai/api/v1", "sk-1") is None
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://openrouter.ai/api/v1", True),
+        ("http://localhost:1234/v1", False),
+        ("http://proxy.local/openrouter.ai/v1", False),
+        ("https://evilopenrouter.ai/api/v1", False),
+        ("https://eu.openrouter.ai/api/v1", True),
+    ],
+)
+def test_is_openrouter(url, expected):
+    from summarizer.llm import is_openrouter
+
+    assert is_openrouter(url) is expected
+
+
+@pytest.mark.parametrize(
+    "exc,exhausted",
+    [
+        (_api_error(403, "Key limit exceeded (daily limit)"), True),
+        (_api_error(403, "Forbidden"), False),
+        (_api_error(429, "Rate limit exceeded: 50 requests per day"), True),
+        (_api_error(429, "Daily limit reached"), True),
+        (
+            _api_error(429, "limit", {"X-RateLimit-Remaining": "5", "X-RateLimit-Reset": "9e15"}),
+            False,
+        ),
+        (
+            _api_error(
+                429,
+                "limit",
+                {
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": str((time.time() + 120) * 1000),
+                },
+            ),
+            False,  # resets within minutes: retry instead
+        ),
+        (_api_error(500, "per-day"), False),
+    ],
+)
+def test_quota_classification(exc, exhausted):
+    from summarizer.llm import _quota_exhausted_message
+
+    assert bool(_quota_exhausted_message(exc)) is exhausted
+
+
+def test_quota_reset_time_is_exact():
+    from summarizer.llm import _quota_exhausted_message
+
+    now = 1_790_000_000.0
+    reset_ms = (now + 3 * 3600) * 1000
+    with patch("summarizer.llm.time.time", return_value=now):
+        message = _quota_exhausted_message(
+            _api_error(429, "x", {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(reset_ms)})
+        )
+    assert message.endswith(time.strftime("%H:%M", time.localtime(now + 3 * 3600)))
+
+
+def test_backoff_is_jittered_within_bounds():
+    from summarizer.llm import _retry_delay_seconds
+
+    delays = {_retry_delay_seconds(3) for _ in range(50)}
+    assert all(2.0 <= d <= 6.0 for d in delays) and len(delays) > 1
+
+
+def test_long_retry_after_falls_back_to_backoff():
+    from summarizer.llm import _retry_delay_seconds
+
+    exc = _api_error(429)
+    exc.response = MagicMock(headers={"retry-after": "3600"})
+    assert _retry_delay_seconds(1, exc) <= 1.5
+
+
+def test_quota_during_json_repair_propagates():
+    from summarizer.llm import QuotaExhausted
+
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = [
+        MagicMock(text="not json", usage=None),
+        _api_error(402, "Insufficient credits"),
+    ]
+    with pytest.raises(QuotaExhausted):
+        call_llm(mock_client, "prompt")
+
+
+def test_boolean_cost_is_ignored():
+    usage = MagicMock(prompt_tokens=1, completion_tokens=1, cost=True)
+    assert _extract_usage(MagicMock(usage=usage)).cost is None
+
+
+def test_portable_schema_has_no_refs_or_discriminator():
+    from summarizer.llm import portable_schema
+    from summarizer.models import LLMResponse
+
+    text = json.dumps(portable_schema(LLMResponse.model_json_schema()))
+    assert "$ref" not in text and "discriminator" not in text and "oneOf" not in text
+    assert '"neuron_model"' in text
+
+
+def test_accumulator_forwards_to_parent():
+    parent = CostAccumulator()
+    child = CostAccumulator(parent=parent)
+    child.add(UsageStats(input_tokens=5), 0.25)
+    child.note_json_repair()
+    child.note_schema_repair()
+    assert (parent.calls, parent.total_cost, parent.total_input_tokens) == (1, 0.25, 5)
+    assert (parent.json_repairs, parent.schema_repairs) == (1, 1)

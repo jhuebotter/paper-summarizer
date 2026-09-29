@@ -462,3 +462,98 @@ def test_no_truncation_warning_when_text_fits(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="summarizer.parser"):
         _mocked_parse(tmp_path, text="short", max_chars=100)
     assert not any("truncated" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Reference section
+# ---------------------------------------------------------------------------
+
+BODY = "Intro text. " * 200
+
+
+def test_strip_references_keeps_appendix_after_markdown_references():
+    from summarizer.parser import strip_reference_section
+
+    text = BODY + "\n## References\n[1] A. Author. Title. 2020.\n\n## Appendix A\nDetails.\n"
+    stripped = strip_reference_section(text)
+    assert "A. Author" not in stripped
+    assert "## Appendix A\nDetails." in stripped and stripped.startswith(BODY)
+
+
+def test_strip_references_cuts_to_end_without_headings():
+    from summarizer.parser import strip_reference_section
+
+    text = BODY + "\nREFERENCES\n[1] A. Author. Title. 2020.\n[2] B. Author."
+    assert strip_reference_section(text) == BODY + "\n"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "## References\n[1] early heading in the first half\n" + BODY,
+        BODY + "\nSee the references in Sec. 2 for details.\n",
+        BODY,
+    ],
+)
+def test_strip_references_leaves_other_text_alone(text):
+    from summarizer.parser import strip_reference_section
+
+    assert strip_reference_section(text) == text
+
+
+def test_parse_pdf_strips_before_truncating_and_caches_full_text(tmp_path):
+    text = "x" * 100 + "\n## Bibliography\n" + "r" * 50
+    result = _mocked_parse(tmp_path, text, max_chars=1000, extractor="docling")
+    assert result == text  # off by default
+    pdf = tmp_path / "paper.pdf"
+    assert parse_pdf(pdf, max_chars=1000, extractor="docling", strip_references=True) == (
+        "x" * 100 + "\n"
+    )
+    assert (tmp_path / "paper.docling.md").read_text(encoding="utf-8") == text
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "References",
+        "REFERENCES AND NOTES",
+        "References Cited",
+        "7 References",
+        "8. References",
+        "VII. REFERENCES",
+        "## 6 . References",
+        "## References ##",
+        "**References**",
+        "Bibliography:",
+        "Literature Cited",
+    ],
+)
+def test_reference_heading_variants(heading):
+    from summarizer.parser import strip_reference_section
+
+    text = BODY + f"\n{heading}\n[1] A. Author. Title. 2020.\n"
+    assert "A. Author" not in strip_reference_section(text)
+
+
+def test_last_reference_heading_wins():
+    from summarizer.parser import strip_reference_section
+
+    text = BODY + "\n## References\nsee below\n" + BODY + "\n## References\n[1] x\n"
+    stripped = strip_reference_section(text)
+    assert "see below" in stripped and "[1] x" not in stripped
+
+
+def test_plain_text_keeps_sections_after_references():
+    from summarizer.parser import strip_reference_section
+
+    text = BODY + "\nReferences\n1. x 2020.\nMethods\nWe used Loihi.\n"
+    assert strip_reference_section(text) == BODY + "\nMethods\nWe used Loihi.\n"
+
+
+def test_strip_happens_before_truncation(tmp_path):
+    body = "x" * 1000 + "\n"
+    text = body + "## References\n" + "r" * 500 + "\n## Appendix\nkeep"
+    _mocked_parse(tmp_path, text, max_chars=10_000, extractor="docling")
+    pdf = tmp_path / "paper.pdf"
+    result = parse_pdf(pdf, max_chars=1010, extractor="docling", strip_references=True)
+    assert result == (body + "## Appendix\nkeep")[:1010]  # truncation after stripping

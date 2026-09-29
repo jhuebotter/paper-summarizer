@@ -19,6 +19,7 @@ fails to start, ``auto`` uses pypdf.
 
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -46,6 +47,7 @@ def parse_pdf(
     max_chars: int = _DEFAULT_MAX_CHARS,
     reparse: bool = False,
     extractor: str = "auto",
+    strip_references: bool = False,
 ) -> str:
     """Parse a PDF to markdown, using a disk cache when available.
 
@@ -55,6 +57,9 @@ def parse_pdf(
         reparse:   If True, ignore any existing cache and re-run extraction.
         extractor: Extraction strategy: ``auto`` (docling with pypdf fallback),
                    ``docling`` (docling only), ``pypdf`` (pypdf only).
+        strip_references: Remove the References/Bibliography section (see
+                   ``strip_reference_section``) before truncating.  Caches
+                   always keep the full text.
 
     Returns:
         Markdown string, truncated to ``max_chars``.
@@ -65,16 +70,57 @@ def parse_pdf(
     if extractor not in _EXTRACTORS:
         raise ValueError(f"Unknown extractor {extractor!r}; expected one of {_EXTRACTORS}")
 
-    if not reparse:
-        cached = _read_cache(pdf_path, extractor)
-        if cached is not None:
-            return _truncate(cached, max_chars, pdf_path)
-
-    logger.info("Running %s extraction on: %s", extractor, pdf_path.name)
-    text, used = _extract_text(pdf_path, extractor=extractor)
-    _write_cache(_cache_path(pdf_path, used), text)
-    logger.info("Extraction complete (%s): %s chars", used, f"{len(text):,}")
+    text = None if reparse else _read_cache(pdf_path, extractor)
+    if text is None:
+        logger.info("Running %s extraction on: %s", extractor, pdf_path.name)
+        text, used = _extract_text(pdf_path, extractor=extractor)
+        _write_cache(_cache_path(pdf_path, used), text)
+        logger.info("Extraction complete (%s): %s chars", used, f"{len(text):,}")
+    if strip_references:
+        text = strip_reference_section(text, pdf_path.name)
     return _truncate(text, max_chars, pdf_path)
+
+
+# ---------------------------------------------------------------------------
+# Reference section
+# ---------------------------------------------------------------------------
+
+_REFERENCE_HEADING = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]*)?(?:(?:\d+|[IVXLC]+)[ \t]*\.?[ \t]*)?(?:\*\*)?"
+    r"(?:references(?:[ \t]+(?:and[ \t]+notes|cited))?|bibliography|literature(?:[ \t]+cited)?"
+    r"|works[ \t]+cited|reference[ \t]+list)"
+    r"(?:\*\*)?[ \t]*:?[ \t]*#*[ \t]*$",
+    re.I | re.M,
+)
+_MARKDOWN_HEADING = re.compile(r"^#{1,6}[ \t]+\S", re.M)
+# Sections that commonly follow the reference list in plain (pypdf) text.
+_PLAIN_SECTION_AFTER = re.compile(
+    r"^[ \t]*(?:[A-Z]\.?|\d+\.?)?[ \t]*(?:appendix|appendices|supplementary|supplemental"
+    r"|(?:online[ \t]+)?methods|materials[ \t]+and[ \t]+methods|acknowledg(?:e)?ments?)\b.{0,80}$",
+    re.I | re.M,
+)
+
+
+def strip_reference_section(text: str, name: str = "") -> str:
+    """Remove the References/Bibliography section.
+
+    Takes the last heading-only line named References (or a variant) in the
+    second half of the text and cuts to the next markdown heading, or, in
+    plain text without markdown headings, to the next Appendix / Supplementary /
+    Methods / Acknowledgements line, or to the end.  Text without such a heading
+    is returned unchanged.
+    """
+    matches = [m for m in _REFERENCE_HEADING.finditer(text) if m.start() >= len(text) / 2]
+    if not matches:
+        return text
+    start = matches[-1].start()
+    following = _MARKDOWN_HEADING if _MARKDOWN_HEADING.search(text) else _PLAIN_SECTION_AFTER
+    next_section = following.search(text, matches[-1].end())
+    end = next_section.start() if next_section else len(text)
+    logger.info(
+        "Removed reference section of %s (%s chars)", name or "document", f"{end - start:,}"
+    )
+    return text[:start] + text[end:]
 
 
 # ---------------------------------------------------------------------------

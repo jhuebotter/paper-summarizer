@@ -77,6 +77,7 @@ def test_parser_model_cli_overrides_env():
         ("--timeout", "300", "timeout_s", 300),
         ("--workers", "6", "workers", 6),
         ("--extractor", "pypdf", "extractor", "pypdf"),
+        ("--max-cost", "0.25", "max_cost", 0.25),
     ],
 )
 def test_main_cli_flag_propagates_to_config(tmp_path, cli_flag, cli_value, config_attr, expected):
@@ -90,7 +91,7 @@ def test_main_cli_flag_propagates_to_config(tmp_path, cli_flag, cli_value, confi
         patch("summarizer.cli.run_batch") as mock_run_batch,
     ):
         mock_run_batch.return_value = MagicMock(
-            processed=0, skipped=1, failed=0, failed_papers=[], total_cost=0.0
+            processed=0, skipped=1, failed=0, failed_papers=[], total_cost=0.0, stopped_reason=None
         )
         main()
     passed_config = mock_run_batch.call_args[0][1]
@@ -190,7 +191,7 @@ def test_main_dry_run_batch(tmp_path, capsys):
         patch("summarizer.cli.run_batch") as mock_run_batch,
     ):
         mock_run_batch.return_value = MagicMock(
-            processed=0, skipped=1, failed=0, failed_papers=[], total_cost=0.0
+            processed=0, skipped=1, failed=0, failed_papers=[], total_cost=0.0, stopped_reason=None
         )
         main()
 
@@ -346,7 +347,7 @@ def test_openrouter_preflight_exits_when_model_not_listed(monkeypatch):
 
     monkeypatch.setenv("LLM_API_KEY", "k")
     with (
-        patch("summarizer.cli.fetch_openrouter_model_ids", return_value={"other/model"}),
+        patch("summarizer.cli.fetch_openrouter_models", return_value=[{"id": "other/model"}]),
         pytest.raises(SystemExit) as exc_info,
     ):
         _check_openrouter_config(_or_config())
@@ -357,7 +358,7 @@ def test_openrouter_preflight_passes_for_listed_model(monkeypatch):
     from summarizer.cli import _check_openrouter_config
 
     monkeypatch.setenv("LLM_API_KEY", "k")
-    with patch("summarizer.cli.fetch_openrouter_model_ids", return_value={"meta/some-model"}):
+    with patch("summarizer.cli.fetch_openrouter_models", return_value=[{"id": "meta/some-model"}]):
         _check_openrouter_config(_or_config())  # no exit
 
 
@@ -365,7 +366,7 @@ def test_openrouter_preflight_tolerates_unreachable_model_list(monkeypatch):
     from summarizer.cli import _check_openrouter_config
 
     monkeypatch.setenv("LLM_API_KEY", "k")
-    with patch("summarizer.cli.fetch_openrouter_model_ids", return_value=None):
+    with patch("summarizer.cli.fetch_openrouter_models", return_value=None):
         _check_openrouter_config(_or_config())  # no exit
 
 
@@ -373,7 +374,7 @@ def test_preflight_is_noop_for_local_backends(monkeypatch):
     from summarizer.cli import _check_openrouter_config
 
     monkeypatch.delenv("LLM_API_KEY", raising=False)
-    with patch("summarizer.cli.fetch_openrouter_model_ids") as mock_ids:
+    with patch("summarizer.cli.fetch_openrouter_models") as mock_ids:
         _check_openrouter_config(Config(base_url="http://localhost:1234/v1"))
     mock_ids.assert_not_called()
 
@@ -468,3 +469,132 @@ def test_keyboard_interrupt_exits_130(tmp_path):
     ):
         main()
     assert exc_info.value.code == 130
+
+
+def test_preflight_rejects_structured_output_for_unsupported_model(monkeypatch):
+    from summarizer.cli import _check_openrouter_config
+
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    models = [{"id": "meta/some-model", "supported_parameters": ["max_tokens"]}]
+    with (
+        patch("summarizer.cli.fetch_openrouter_models", return_value=models),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        _check_openrouter_config(_or_config(structured_output=True))
+    assert exc_info.value.code == 1
+
+    models[0]["supported_parameters"].append("structured_outputs")
+    with patch("summarizer.cli.fetch_openrouter_models", return_value=models):
+        _check_openrouter_config(_or_config(structured_output=True))  # no exit
+
+
+@pytest.mark.parametrize("model,warned", [("meta/m:free", True), ("meta/m", False)])
+def test_key_info_warns_about_free_tier_daily_cap(monkeypatch, caplog, model, warned):
+    import logging
+
+    from summarizer.cli import _log_key_info
+
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    info = {"usage": 0.0, "limit": None, "limit_remaining": None, "is_free_tier": True}
+    with (
+        patch("summarizer.cli.fetch_openrouter_key_info", return_value=info),
+        caplog.at_level(logging.INFO, logger="summarizer.cli"),
+    ):
+        _log_key_info(Config(base_url="https://openrouter.ai/api/v1", model=model))
+    assert any("50 requests/day" in r.message for r in caplog.records) is warned
+
+
+def test_structured_output_preflight_with_routing_suffix(monkeypatch):
+    from summarizer.cli import _check_openrouter_config
+
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    models = [{"id": "a/b", "supported_parameters": ["structured_outputs"]}]
+    config = Config(
+        base_url="https://openrouter.ai/api/v1", model="a/b:nitro", structured_output=True
+    )
+    with patch("summarizer.cli.fetch_openrouter_models", return_value=models):
+        _check_openrouter_config(config)  # no exit
+
+
+def test_eval_flags_propagate(tmp_path):
+    (tmp_path / "p.pdf").write_bytes(b"%PDF")
+    with (
+        patch("summarizer.cli._check_backend"),
+        patch("summarizer.cli._check_openrouter_config"),
+        patch("summarizer.cli.run_eval", return_value=([], None)) as run,
+    ):
+        main(
+            [
+                "eval",
+                "--source",
+                str(tmp_path),
+                "--extractors",
+                "pypdf",
+                "--no-strip-references",
+                "--max-cost",
+                "0.5",
+                "--out",
+                str(tmp_path / "run"),
+            ]
+        )
+    config = run.call_args.args[1]
+    assert (config.strip_references, config.max_cost) == (False, 0.5)
+
+
+def test_stopped_eval_exits_1(tmp_path):
+    (tmp_path / "p.pdf").write_bytes(b"%PDF")
+    with (
+        patch("summarizer.cli._check_backend"),
+        patch("summarizer.cli._check_openrouter_config"),
+        patch("summarizer.cli.run_eval", return_value=([], "daily cap")),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main(
+            [
+                "eval",
+                "--source",
+                str(tmp_path),
+                "--extractors",
+                "pypdf",
+                "--out",
+                str(tmp_path / "r"),
+            ]
+        )
+    assert exc_info.value.code == 1
+
+
+def test_stopped_run_exits_1(caplog):
+    from summarizer.cli import _report_and_exit
+    from summarizer.models import BatchReport
+
+    report = BatchReport(
+        processed=1, skipped=4, failed=0, failed_papers=[], stopped_reason="daily cap"
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        _report_and_exit(report)
+    assert exc_info.value.code == 1
+
+
+@pytest.mark.parametrize(
+    "flag,attr,expected",
+    [
+        ("--no-strip-references", "strip_references", False),
+        ("--structured-output", "structured_output", True),
+    ],
+)
+def test_boolean_flags_propagate_to_config(tmp_path, flag, attr, expected):
+    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    with (
+        patch("sys.argv", ["summarize-papers", "--source", str(tmp_path), "--dry-run", flag]),
+        patch("summarizer.cli.run_batch") as mock_run_batch,
+    ):
+        mock_run_batch.return_value = MagicMock(
+            processed=0, skipped=1, failed=0, failed_papers=[], total_cost=0.0, stopped_reason=None
+        )
+        main()
+    assert getattr(mock_run_batch.call_args[0][1], attr) is expected
+
+
+def test_new_flag_defaults():
+    args = _build_parser().parse_args(["--source", "/tmp"])
+    assert (args.strip_references, args.structured_output, args.max_cost) == (True, False, None)

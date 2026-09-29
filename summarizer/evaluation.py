@@ -18,12 +18,18 @@ from dataclasses import asdict, dataclass, replace
 from functools import partial
 from pathlib import Path
 
-from summarizer.batch import atomic_write_text, sha256_file
-from summarizer.llm import CompletionResponse, CostAccumulator, UsageStats, create_client
+from summarizer.batch import StopSignal, atomic_write_text, sha256_file
+from summarizer.llm import (
+    CompletionResponse,
+    CostAccumulator,
+    QuotaExhausted,
+    UsageStats,
+    create_client,
+)
 from summarizer.metrics import compute_metrics, duplicate_keys
 from summarizer.models import Config, PaperSummary, PipelineError
 from summarizer.parser import parse_pdf
-from summarizer.pipeline import author_surname_token, process_pdf
+from summarizer.pipeline import author_surname_token, fit_to_context, process_pdf
 from summarizer.prompts import load_references
 
 logger = logging.getLogger(__name__)
@@ -57,10 +63,11 @@ class CachingClient:
     """Wraps an LLM client with an on-disk response cache.
 
     One instance per paper, so ``hits`` / ``misses`` / ``llm_seconds`` describe
-    that paper.  Failed calls are never cached.  On a hit, the stored usage and
-    the original call's duration are used, so tokens, cost (at current pricing)
-    and ``llm_seconds`` match the original call.  The key covers backend,
-    model, output cap and the full prompt (so a renamed PDF misses).
+    that paper.  Failed calls are never cached.  On a hit, the stored usage
+    (including the billed cost, when the backend reported one) and the original
+    call's duration are replayed.  The key covers backend,
+    model, output cap, structured-output mode and the full prompt (so a renamed
+    PDF misses).
     """
 
     def __init__(self, inner, cache_dir: Path) -> None:
@@ -69,13 +76,20 @@ class CachingClient:
         self.model = inner.model
         self.base_url = inner.base_url
         self.pricing = inner.pricing
+        self.response_format = getattr(inner, "response_format", None)
         self.hits = 0
         self.misses = 0
         self.llm_seconds = 0.0
 
     def _path(self, prompt: str) -> Path:
         key = json.dumps(
-            [self.base_url, self.model, getattr(self._inner, "max_output_tokens", None), prompt]
+            [
+                self.base_url,
+                self.model,
+                getattr(self._inner, "max_output_tokens", None),
+                self.response_format is not None,
+                prompt,
+            ]
         )
         return self._cache_dir / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
 
@@ -208,8 +222,16 @@ def _eval_one(
     cache_dir: Path,
     gold: dict[str, dict],
     summaries_dir: Path,
-) -> dict:
-    """Evaluate one paper; a failed paper counts as wrong on every labelled gold field."""
+    stop: StopSignal,
+    total: CostAccumulator,
+) -> dict | None:
+    """Evaluate one paper; ``None`` if the run was stopped before or during it.
+
+    A failed paper counts as wrong on every labelled gold field.
+    """
+    stop.check_budget(total, config.max_cost)
+    if stop.is_set():
+        return None
     labelled = {f: False for f, v in gold.get(sha, {}).items() if v is not None}
     row = {
         "config": cfg.name,
@@ -222,12 +244,24 @@ def _eval_one(
         "gold": labelled or None,
     }
     try:
-        full_text = parse_pdf(pdf, max_chars=sys.maxsize, extractor=cfg.extractor)
+        full_text = parse_pdf(
+            pdf,
+            max_chars=sys.maxsize,
+            extractor=cfg.extractor,
+            strip_references=config.strip_references,
+        )
+        # The exact text the model is shown (same truncation as the pipeline).
+        paper_text = fit_to_context(
+            full_text[: config.max_chars],
+            references,
+            pdf.name,
+            client.pricing.context_length,
+            config,
+        )
     except Exception as exc:
-        return row | {"error": f"parse failed: {exc}"}
-    paper_text = full_text[: config.max_chars]
+        return row | {"error": f"text preparation failed: {exc}"}
 
-    accumulator = CostAccumulator()
+    accumulator = CostAccumulator(parent=total)
     cached_client = CachingClient(client, cache_dir)
     summary = None
     try:
@@ -235,6 +269,9 @@ def _eval_one(
             pdf, config, client=cached_client, accumulator=accumulator, references=references
         )
     except PipelineError as exc:
+        if isinstance(exc.cause, QuotaExhausted):
+            stop.trip(str(exc.cause))
+            return None
         row["error"] = str(exc.cause)
 
     row |= {
@@ -276,8 +313,12 @@ def run_eval(
     out_dir: Path,
     cache_dir: Path,
     gold_path: Path | None = None,
-) -> list[dict]:
-    """Evaluate every configuration on every PDF; write results and a report."""
+) -> tuple[list[dict], str | None]:
+    """Evaluate every configuration on every PDF; write results and a report.
+
+    Returns the result rows and, if the run stopped early (exhausted quota or
+    ``--max-cost``), the reason.  Papers hit by the stop are not scored.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     gold = load_gold(gold_path) if gold_path else {}
     references = load_references(base_config.skill_data_dir)
@@ -285,6 +326,8 @@ def run_eval(
         "git_commit": _git_commit(),
         "references_sha256": hashlib.sha256(references.encode()).hexdigest()[:12],
         "max_chars": base_config.max_chars,
+        "strip_references": base_config.strip_references,
+        "structured_output": base_config.structured_output,
     }
     shas: dict[Path, str] = {}
     for pdf in pdfs:
@@ -296,6 +339,8 @@ def run_eval(
     results_path = out_dir / "results.jsonl"
     results_path.write_text("", encoding="utf-8")
     rows: list[dict] = []
+    stop = StopSignal()
+    total = CostAccumulator()
 
     for cfg in configs:
         config = replace(base_config, model=cfg.model, extractor=cfg.extractor, dry_run=False)
@@ -309,13 +354,22 @@ def run_eval(
             cache_dir=cache_dir,
             gold=gold,
             summaries_dir=out_dir / "summaries" / cfg.name,
+            stop=stop,
+            total=total,
         )
         logger.info("Evaluating %s on %d PDFs", cfg.name, len(shas))
         executor = ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="eval")
         try:
             futures = [executor.submit(evaluate, pdf, sha) for pdf, sha in shas.items()]
             for future in as_completed(futures):
-                row = future.result() | {"provenance": provenance}
+                if future.cancelled():
+                    continue
+                result = future.result()
+                if result is None:  # stopped
+                    for pending in futures:
+                        pending.cancel()
+                    continue
+                row = result | {"provenance": provenance}
                 with results_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(row) + "\n")
                 rows.append(row)
@@ -326,10 +380,12 @@ def run_eval(
             executor.shutdown(wait=False, cancel_futures=True)
             raise
         executor.shutdown()
+        if stop.is_set():
+            break
 
-    report = render_report(rows, configs, provenance)
+    report = render_report(rows, configs, provenance, stop.reason)
     atomic_write_text(out_dir / "report.md", report)
-    return rows
+    return rows, stop.reason
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +439,12 @@ def config_summary(rows: list[dict]) -> list[tuple[str, str]]:
     ]
 
 
-def render_report(rows: list[dict], configs: list[EvalConfig], provenance: dict) -> str:
+def render_report(
+    rows: list[dict],
+    configs: list[EvalConfig],
+    provenance: dict,
+    stopped_reason: str | None = None,
+) -> str:
     """Markdown report: per-config summary, per-paper table, missing quotes, labels."""
     by_config = {c.name: [r for r in rows if r["config"] == c.name] for c in configs}
     summaries = {name: config_summary(config_rows) for name, config_rows in by_config.items()}
@@ -394,6 +455,11 @@ def render_report(rows: list[dict], configs: list[EvalConfig], provenance: dict)
         f"Commit `{provenance['git_commit']}` · references `{provenance['references_sha256']}` · "
         f"max_chars {provenance['max_chars']:,} · {len({r['sha256'] for r in rows})} PDFs",
         "",
+        *(
+            [f"**Stopped early: {stopped_reason}.** Re-run to finish (cached calls are free).", ""]
+            if stopped_reason
+            else []
+        ),
         "## Per configuration",
         "",
         "Quality columns cover successful papers only; failed papers count as wrong for gold "

@@ -8,12 +8,15 @@ The public interface is ``LLMClient.complete(prompt)`` returning an object
 with ``.text`` and ``.usage`` attributes.
 
 Retries live in exactly one place (``_complete_with_retries``); the SDK's own
-retry loop is disabled so attempts don't multiply.
+retry loop is disabled so attempts don't multiply.  Exhausted quotas (daily
+free-model cap, credits, key limits) raise ``QuotaExhausted`` instead, so runs
+can stop cleanly.
 """
 
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -24,7 +27,7 @@ from dataclasses import dataclass
 
 import openai as _openai
 
-from summarizer.models import Config, LLMError
+from summarizer.models import Config, LLMError, LLMResponse
 
 logger = logging.getLogger(__name__)
 
@@ -37,28 +40,35 @@ _MAX_TRANSIENT_RETRIES = 2
 
 @dataclass
 class ModelPricing:
-    """USD cost per token / per request (0.0 = free or unknown)."""
+    """USD cost per token / per request and model limits (0 / False = free or unknown)."""
 
     prompt: float = 0.0  # per input token
     completion: float = 0.0  # per output token
     reasoning: float = 0.0  # per reasoning token
     request: float = 0.0  # flat per-request fee
-    context_length: int = 0  # max context in tokens (informational)
+    context_length: int = 0  # max context in tokens
 
 
 @dataclass
 class UsageStats:
-    """Token counts returned by one completion call."""
+    """Token counts (and, from OpenRouter, the billed cost) of one completion."""
 
     input_tokens: int = 0
     output_tokens: int = 0
     reasoning_tokens: int = 0
+    cached_tokens: int = 0
+    cost: float | None = None  # USD actually charged, when the backend reports it
 
 
 class CostAccumulator:
-    """Thread-safe running totals of tokens, USD cost, completions and repairs."""
+    """Thread-safe running totals of tokens, USD cost, completions and repairs.
 
-    def __init__(self) -> None:
+    With a ``parent``, every update is also applied to it, so a per-paper
+    accumulator can feed a run-wide total.
+    """
+
+    def __init__(self, parent: "CostAccumulator | None" = None) -> None:
+        self._parent = parent
         self._lock = threading.Lock()
         self.total_cost: float = 0.0
         self.total_input_tokens: int = 0
@@ -76,19 +86,29 @@ class CostAccumulator:
             self.total_input_tokens += usage.input_tokens
             self.total_output_tokens += usage.output_tokens
             self.total_reasoning_tokens += usage.reasoning_tokens
+        if self._parent is not None:
+            self._parent.add(usage, cost)
 
     def note_json_repair(self) -> None:
         with self._lock:
             self.json_repairs += 1
+        if self._parent is not None:
+            self._parent.note_json_repair()
 
     def note_schema_repair(self) -> None:
         with self._lock:
             self.schema_repairs += 1
+        if self._parent is not None:
+            self._parent.note_schema_repair()
 
 
 # ---------------------------------------------------------------------------
 # Client wrapper
 # ---------------------------------------------------------------------------
+
+
+class QuotaExhausted(LLMError):
+    """The backend refuses further calls for now (daily cap, credits, key limit)."""
 
 
 class RejectedCompletion(LLMError):
@@ -129,12 +149,16 @@ class LLMClient:
         timeout_s: int = 120,
         max_output_tokens: int | None = None,
         pricing: ModelPricing | None = None,
+        response_format: dict | None = None,
+        extra_body: dict | None = None,
     ) -> None:
         self.model = model
         self.base_url = base_url
         self.timeout_s = timeout_s
         self.max_output_tokens = max_output_tokens
         self.pricing = pricing or ModelPricing()
+        self.response_format = response_format
+        self.extra_body = extra_body
         self._client = _openai.OpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -158,6 +182,10 @@ class LLMClient:
         )
         if self.max_output_tokens is not None:
             kwargs["max_tokens"] = self.max_output_tokens
+        if self.response_format is not None:
+            kwargs["response_format"] = self.response_format
+        if self.extra_body is not None:
+            kwargs["extra_body"] = self.extra_body
         response = self._client.chat.completions.create(**kwargs)
         usage = _extract_usage(response)
         if not getattr(response, "choices", None):
@@ -182,6 +210,27 @@ class LLMClient:
 # ---------------------------------------------------------------------------
 
 
+def is_openrouter(base_url: str) -> bool:
+    host = urllib.parse.urlparse(base_url).hostname or ""
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+
+
+def fetch_openrouter_key_info(base_url: str, api_key: str) -> dict | None:
+    """Return the key's usage/limit info from ``GET /api/v1/key``, or ``None``."""
+    parsed = urllib.parse.urlparse(base_url)
+    request = urllib.request.Request(
+        f"{parsed.scheme}://{parsed.netloc}/api/v1/key",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as resp:
+            data = json.loads(resp.read())["data"]
+        return data if isinstance(data, dict) else None
+    except Exception as exc:
+        logger.debug("Could not read OpenRouter key info: %s", exc)
+        return None
+
+
 #: OpenRouter routing shortcuts that are valid on any listed model but are not
 #: themselves listed.  Other suffixes (notably ``:free``) are distinct model ids.
 OPENROUTER_ROUTING_SUFFIXES = frozenset({"nitro", "floor", "online", "exacto"})
@@ -193,7 +242,7 @@ def openrouter_listed_id(model: str) -> str:
     return base if sep and suffix in OPENROUTER_ROUTING_SUFFIXES else model
 
 
-def _fetch_openrouter_models(base_url: str, api_key: str | None = None) -> list[dict] | None:
+def fetch_openrouter_models(base_url: str, api_key: str | None = None) -> list[dict] | None:
     """Return OpenRouter's model entries, or ``None`` if unavailable or malformed."""
     parsed = urllib.parse.urlparse(base_url)
     models_url = f"{parsed.scheme}://{parsed.netloc}/api/v1/models"
@@ -223,7 +272,7 @@ def fetch_model_pricing(model_id: str, api_key: str, base_url: str) -> ModelPric
         api_key:  OpenRouter API key for the Authorization header.
         base_url: Base URL of the API, e.g. ``"https://openrouter.ai/api/v1"``.
     """
-    models = _fetch_openrouter_models(base_url, api_key)
+    models = fetch_openrouter_models(base_url, api_key)
     if models is None:
         logger.warning("Model pricing unavailable — using $0.00")
         return ModelPricing()
@@ -266,17 +315,6 @@ def fetch_model_pricing(model_id: str, api_key: str, base_url: str) -> ModelPric
     return pricing
 
 
-def fetch_openrouter_model_ids(base_url: str) -> set[str] | None:
-    """Return the set of model ids OpenRouter currently serves.
-
-    The models endpoint is public.  Returns ``None`` if it cannot be reached
-    or returns something unexpected, so callers can distinguish "unknown" from
-    "not listed".
-    """
-    models = _fetch_openrouter_models(base_url)
-    return None if models is None else {m["id"] for m in models}
-
-
 def _extract_usage(response) -> "UsageStats | None":
     """Extract token counts from an OpenAI SDK response object.
 
@@ -289,25 +327,36 @@ def _extract_usage(response) -> "UsageStats | None":
     input_tokens: int = getattr(usage, "prompt_tokens", 0) or 0
     output_tokens: int = getattr(usage, "completion_tokens", 0) or 0
 
-    reasoning_tokens = 0
-    details = getattr(usage, "completion_tokens_details", None)
-    if details is not None:
-        raw = getattr(details, "reasoning_tokens", None)
-        if raw is not None:
-            reasoning_tokens = int(raw)
+    reasoning_tokens = _int_attr(
+        getattr(usage, "completion_tokens_details", None), "reasoning_tokens"
+    )
+    cached_tokens = _int_attr(getattr(usage, "prompt_tokens_details", None), "cached_tokens")
+    # OpenRouter adds the billed USD amount as an extra (untyped) field.
+    cost = getattr(usage, "cost", None)
+    if not isinstance(cost, int | float) or isinstance(cost, bool):
+        cost = None
 
     return UsageStats(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         reasoning_tokens=reasoning_tokens,
+        cached_tokens=cached_tokens,
+        cost=cost,
     )
 
 
+def _int_attr(obj, name: str) -> int:
+    value = getattr(obj, name, None) if obj is not None else None
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
 def _calculate_cost(usage: "UsageStats | None", pricing: ModelPricing) -> float:
-    """Compute USD cost from token counts and pricing rates.
+    """Return the billed cost if the backend reported it, else estimate from list prices.
 
     When ``usage`` is ``None``, only the flat ``request`` fee is applied.
     """
+    if usage is not None and usage.cost is not None:
+        return float(usage.cost)
     cost = pricing.request
     if usage is not None:
         cost += (
@@ -331,21 +380,37 @@ def create_client(config: Config) -> LLMClient:
         2. ``LLM_API_KEY`` environment variable
         3. ``"lm-studio"`` fallback (LM Studio ignores the value)
 
-    OpenRouter headers are injected automatically when ``config.base_url``
-    contains ``"openrouter.ai"``.  Pricing is fetched from the OpenRouter
-    Models API for remote backends; local backends use zero pricing.
+    For OpenRouter, attribution headers are added and pricing is fetched from
+    its Models API; local backends use zero pricing.  With
+    ``config.structured_output`` the JSON schema of ``LLMResponse`` is sent as
+    ``response_format`` (and OpenRouter is told to route only to endpoints that
+    support it).
     """
     api_key = config.api_key or os.environ.get("LLM_API_KEY") or "lm-studio"
 
     extra_headers: dict = {}
     pricing: ModelPricing | None = None
+    extra_body: dict | None = None
 
-    if "openrouter.ai" in config.base_url:
+    if is_openrouter(config.base_url):
         extra_headers = {
             "HTTP-Referer": "https://github.com/jhuebotter/paper-summarizer",
             "X-Title": "paper-summarizer",
         }
         pricing = fetch_model_pricing(config.model, api_key, config.base_url)
+        if config.structured_output:
+            extra_body = {"provider": {"require_parameters": True}}
+
+    response_format = None
+    if config.structured_output:
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "paper_summary",
+                "strict": False,
+                "schema": portable_schema(LLMResponse.model_json_schema()),
+            },
+        }
 
     return LLMClient(
         model=config.model,
@@ -355,7 +420,33 @@ def create_client(config: Config) -> LLMClient:
         timeout_s=config.timeout_s,
         max_output_tokens=config.max_output_tokens,
         pricing=pricing,
+        response_format=response_format,
+        extra_body=extra_body,
     )
+
+
+def portable_schema(schema: dict) -> dict:
+    """Inline ``$ref``s and use ``anyOf`` instead of ``oneOf``/``discriminator``.
+
+    Many providers support only a JSON Schema subset without references or
+    OpenAPI's ``discriminator`` keyword.
+    """
+    defs = schema.get("$defs", {})
+
+    def resolve(node):
+        if isinstance(node, dict):
+            if "$ref" in node:
+                return resolve(defs[node["$ref"].rsplit("/", 1)[-1]])
+            return {
+                ("anyOf" if key == "oneOf" else key): resolve(value)
+                for key, value in node.items()
+                if key not in ("$defs", "discriminator")
+            }
+        if isinstance(node, list):
+            return [resolve(item) for item in node]
+        return node
+
+    return resolve(schema)
 
 
 def call_llm(
@@ -386,10 +477,12 @@ def call_llm(
 
     if usage is not None:
         logger.info(
-            "Response received (%.1fs, %s chars, in=%d out=%d reason=%d tokens, cost=$%.6f)",
+            "Response received (%.1fs, %s chars, in=%d (cached %d) out=%d reason=%d tokens, "
+            "cost=$%.6f)",
             elapsed,
             f"{len(completion.text):,}",
             usage.input_tokens,
+            usage.cached_tokens,
             usage.output_tokens,
             usage.reasoning_tokens,
             cost,
@@ -413,6 +506,8 @@ def call_llm(
         logger.debug("Unparseable response (first 500 chars): %r", completion.text[:500])
         try:
             repaired = _repair_json_once(client, completion.text, accumulator=accumulator)
+        except QuotaExhausted:
+            raise
         except Exception:
             raise parse_exc from None
         try:
@@ -463,7 +558,7 @@ def _repair_json_once(
         f"{bad_text}"
     )
     try:
-        response = client.complete(repair_prompt)
+        response = _complete_with_retries(client, repair_prompt)
     except RejectedCompletion as exc:
         _record(accumulator, exc.usage, _calculate_cost(exc.usage, client.pricing))
         raise
@@ -489,7 +584,9 @@ def _record(accumulator: "CostAccumulator | None", usage: "UsageStats | None", c
 def _complete_with_retries(client: LLMClient, prompt: str) -> CompletionResponse:
     """Run one completion with retry/backoff on transient errors.
 
-    Retried: HTTP 429, 5xx, timeouts and connection errors.
+    Retried: HTTP 429 (per-minute limits), 5xx, timeouts and connection errors.
+    Exhausted quotas (daily free-model cap, credits, key limit) raise
+    ``QuotaExhausted`` without retrying.
     """
     attempts = _MAX_TRANSIENT_RETRIES + 1
     for attempt in range(1, attempts + 1):
@@ -498,10 +595,13 @@ def _complete_with_retries(client: LLMClient, prompt: str) -> CompletionResponse
         except LLMError:
             raise
         except Exception as exc:
+            quota = _quota_exhausted_message(exc)
+            if quota:
+                raise QuotaExhausted(quota) from exc
             if attempt >= attempts or not _is_retryable_status_error(exc):
                 raise LLMError(f"LLM call failed: {exc}") from exc
 
-            delay_s = _retry_delay_seconds(attempt)
+            delay_s = _retry_delay_seconds(attempt, exc)
             logger.warning(
                 "Transient LLM error on attempt %d/%d (%s); retrying in %.1fs",
                 attempt,
@@ -514,9 +614,52 @@ def _complete_with_retries(client: LLMClient, prompt: str) -> CompletionResponse
     raise LLMError("LLM call failed after retries")
 
 
-def _retry_delay_seconds(attempt: int) -> float:
-    """Exponential backoff delay: 1.0s, 2.0s, ..."""
-    return float(2 ** (attempt - 1))
+def _retry_delay_seconds(attempt: int, exc: Exception | None = None) -> float:
+    """``Retry-After`` if the server sent a short one, else jittered exponential backoff."""
+    response = getattr(exc, "response", None)
+    try:
+        retry_after = float(response.headers.get("retry-after"))
+    except (AttributeError, TypeError, ValueError):
+        retry_after = None
+    if retry_after is not None and 0 < retry_after <= 60:
+        return retry_after
+    return 2 ** (attempt - 1) * random.uniform(0.5, 1.5)
+
+
+def _error_details(exc: Exception) -> tuple[str, dict]:
+    """Return (error message, rate-limit headers) from an OpenAI SDK API error."""
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return str(exc), {}
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    headers = metadata.get("headers") if isinstance(metadata.get("headers"), dict) else {}
+    return str(body.get("message") or exc), headers
+
+
+def _quota_exhausted_message(exc: Exception) -> str | None:
+    """Describe an exhausted quota: 402 (credits), 403 key limit, or a 429 that won't clear soon."""
+    status = _extract_status_code(exc)
+    if status not in (402, 403, 429):
+        return None
+    message, headers = _error_details(exc)
+    if status == 402:
+        return f"Credits exhausted: {message}"
+    if status == 403:
+        return f"Key limit exhausted: {message}" if "key limit" in message.lower() else None
+    lowered = message.lower()
+    reset_ms = headers.get("X-RateLimit-Reset")
+    try:
+        reset_in_s = float(reset_ms) / 1000 - time.time()
+    except (TypeError, ValueError):
+        reset_in_s = None
+    daily = "per-day" in lowered or "per day" in lowered or "daily" in lowered
+    drained = str(headers.get("X-RateLimit-Remaining")) == "0" and (reset_in_s or 0) > 600
+    if not (daily or drained):
+        return None
+    when = ""
+    if reset_in_s is not None and reset_in_s > 0:
+        when = f"; resets at {time.strftime('%H:%M', time.localtime(time.time() + reset_in_s))}"
+    return f"Rate limit exhausted ({message}){when}"
 
 
 def _is_retryable_status_error(exc: Exception) -> bool:
