@@ -113,8 +113,9 @@ def _findings_as_strings(value: object) -> object:
             out.append(item)
             continue
         for key, template in (("evidence", " ({})"), ("source", " (Source: {})")):
-            if isinstance(item.get(key), str) and item[key] and item[key] not in text:
-                text += template.format(item[key])
+            if isinstance(item.get(key), str) and item[key]:
+                tag = template.format(item[key])
+                text += "" if tag.strip() in text else tag
         out.append(text)
     return out
 

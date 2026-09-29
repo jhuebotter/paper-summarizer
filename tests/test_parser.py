@@ -370,8 +370,8 @@ def test_converter_is_reused_across_pdfs(tmp_path):
     """Building a DocumentConverter loads models; it must happen once per process."""
     a = tmp_path / "a.pdf"
     b = tmp_path / "b.pdf"
-    a.write_bytes(b"%PDF")
-    b.write_bytes(b"%PDF")
+    a.write_bytes(b"%PDF-a")
+    b.write_bytes(b"%PDF-b")  # different content, so the extraction cache doesn't hide a rebuild
     with patch("summarizer.parser.DocumentConverter") as MockConverter:
         MockConverter.return_value.convert.return_value.document.export_to_markdown.return_value = (
             "t"
@@ -394,6 +394,16 @@ def test_docling_retries_with_ocr_when_the_pdf_has_no_text_layer(tmp_path, _no_d
         export.side_effect = ["<!-- image -->\n\n<!-- image -->", "scanned text"]
         assert parse_pdf(pdf, extractor="docling") == "scanned text"
     assert [c.args for c in _no_docling_options.call_args_list] == [(False,), (True,)]
+
+
+def test_docling_retries_with_ocr_when_most_pages_have_no_text(tmp_path, _no_docling_options):
+    """A scan with a text cover page or a per-page download stamp is still a scan."""
+    pdf = _fake_pdf(tmp_path)
+    with patch("summarizer.parser.DocumentConverter") as MockConverter:
+        document = MockConverter.return_value.convert.return_value.document
+        document.num_pages.return_value = 12
+        document.export_to_markdown.side_effect = ["Downloaded from IEEE Xplore " * 12, "ocr"]
+        assert parse_pdf(pdf, extractor="docling") == "ocr"
 
 
 def test_auto_falls_back_to_pypdf_when_docling_not_installed(tmp_path, caplog):
@@ -441,8 +451,8 @@ def test_auto_falls_back_to_pypdf_when_docling_fails_to_start(tmp_path):
     """Regression: a converter constructor failure bypassed the pypdf fallback."""
     a = tmp_path / "a.pdf"
     b = tmp_path / "b.pdf"
-    a.write_bytes(b"%PDF")
-    b.write_bytes(b"%PDF")
+    a.write_bytes(b"%PDF-a")
+    b.write_bytes(b"%PDF-b")  # different content, so the extraction cache doesn't hide a rebuild
     with (
         patch("summarizer.parser.DocumentConverter", side_effect=OSError("model download")) as cls,
         patch("summarizer.parser._extract_text_with_pypdf", return_value="pypdf text"),

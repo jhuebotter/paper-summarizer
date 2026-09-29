@@ -142,6 +142,13 @@ def test_quote_matches_text_extracted_with_glued_words():
     assert _status("The design process involved four stages", paper) == "not_found"
 
 
+def test_glued_text_match_needs_every_fragment_to_be_long():
+    """Without spaces a short fragment can match mid-word ("ron model" in "neuronmodel")."""
+    paper = "Theneuronmodelisused.Thedevelopmentprocessinvolvedfourstages"
+    quote = "ron model is used ... The development process involved four stages"
+    assert _status(quote, paper) == "not_found"
+
+
 def test_quote_ignores_punctuation_and_numeric_citations():
     paper = "As shown in prior work [12], spiking networks can control robot arms."
     assert _status("As shown in prior work, spiking networks can control robot arms", paper) == (

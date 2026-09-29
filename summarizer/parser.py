@@ -316,17 +316,24 @@ def _run_docling(pdf_path: Path) -> str:
         ParseError: wrapping any exception raised by docling.
     """
     with _DOCLING_LOCK:
-        text = _convert(pdf_path, ocr=False)
-        if not re.search(r"\w", text.replace("<!-- image -->", "")):
+        text, pages = _convert(pdf_path, ocr=False)
+        chars = len(re.findall(r"\w", text.replace("<!-- image -->", "")))
+        if chars < _MIN_CHARS_PER_PAGE * pages or not chars:
             logger.info("No text layer in %s; retrying with OCR", pdf_path.name)
-            text = _convert(pdf_path, ocr=True)
+            text, _ = _convert(pdf_path, ocr=True)
         return text
 
 
-def _convert(pdf_path: Path, ocr: bool) -> str:
+_MIN_CHARS_PER_PAGE = 100  # below this the PDF is (mostly) a scan, e.g. with a text cover page
+
+
+def _convert(pdf_path: Path, ocr: bool) -> tuple[str, int]:
+    """Return the markdown and the page count (0 if unknown)."""
     converter = _get_converter(ocr)
     try:
-        return converter.convert(str(pdf_path)).document.export_to_markdown()
+        document = converter.convert(str(pdf_path)).document
+        pages = document.num_pages()
+        return document.export_to_markdown(), pages if isinstance(pages, int) else 0
     except Exception as e:
         raise ParseError(f"Failed to parse {pdf_path}: {e}") from e
 
