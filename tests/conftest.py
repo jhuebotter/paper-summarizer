@@ -1,6 +1,5 @@
 """Shared pytest fixtures for the snn_summarizer test suite."""
 
-import json
 import logging
 from pathlib import Path
 
@@ -37,6 +36,32 @@ def _reset_summarizer_logger():
     logger.propagate = True
 
 
+@pytest.fixture(autouse=True)
+def _no_network(request, monkeypatch):
+    """Unit tests must not hit the network (e.g. OpenRouter pricing lookups).
+
+    Tests that need a response patch ``urlopen`` themselves (their patch wins);
+    tests marked ``integration`` are exempt.
+    """
+    if request.node.get_closest_marker("integration"):
+        return
+
+    def _blocked(*args, **kwargs):
+        raise OSError("network access is disabled in unit tests")
+
+    monkeypatch.setattr("urllib.request.urlopen", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def _default_log_dir_in_tmp(tmp_path, monkeypatch):
+    """``main()`` writes ``logs/run_<ts>.log`` relative to the CWD by default.
+
+    Run each test from its own tmp dir so tests never litter the repo. Tests
+    that need repo files use absolute paths (see ``PROJECT_ROOT``).
+    """
+    monkeypatch.chdir(tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -52,12 +77,18 @@ def sample_pdf_path() -> Path:
         / "test_pdfs"
         / "Huebotter et al. - 2025 - Spiking Neural Networks for Continuous Control via End-to-End Model-Based Learning.pdf"
     )
-    assert path.exists(), f"Sample PDF not found at {path}"
+    if not path.exists():
+        pytest.skip(f"Sample PDF not found at {path} (test_pdfs/ is gitignored)")
     return path
 
 
 # ---------------------------------------------------------------------------
-# Mock LLM responses (JSON strings the LLM would return)
+# Mock LLM data
+#
+# MOCK_PART1_DICT is a *flat* dict holding metadata and Part 1 fields together
+# (a leftover of the old two-call design). Tests split it into the combined
+# ``{"metadata", "part1", "part2"}`` shape with their ``_make_combined_dict``
+# helpers.
 # ---------------------------------------------------------------------------
 
 MOCK_PART1_DICT = {
@@ -120,24 +151,12 @@ MOCK_PART2_DICT = {
 
 
 @pytest.fixture
-def mock_part1_response() -> str:
-    """Raw JSON string the LLM would return for Call 1 (metadata + Part 1)."""
-    return json.dumps(MOCK_PART1_DICT)
-
-
-@pytest.fixture
-def mock_part2_response() -> str:
-    """Raw JSON string the LLM would return for Call 2 (Part 2 extraction)."""
-    return json.dumps(MOCK_PART2_DICT)
-
-
-@pytest.fixture
 def mock_part1_dict() -> dict:
-    """Parsed dict for mock Part 1 response — useful for building pydantic models."""
+    """Flat metadata + Part 1 dict (copy) for building models and combined responses."""
     return MOCK_PART1_DICT.copy()
 
 
 @pytest.fixture
 def mock_part2_dict() -> dict:
-    """Parsed dict for mock Part 2 response — useful for building pydantic models."""
+    """Part 2 (SNN extraction) dict (copy)."""
     return MOCK_PART2_DICT.copy()

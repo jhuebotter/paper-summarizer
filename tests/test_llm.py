@@ -10,7 +10,7 @@ import pytest
 
 from summarizer.llm import (
     CostAccumulator,
-    LMStudioClient,
+    LLMClient,
     ModelPricing,
     UsageStats,
     _calculate_cost,
@@ -27,11 +27,11 @@ from summarizer.models import Config, LLMError
 # ---------------------------------------------------------------------------
 
 
-def test_create_client_returns_lm_studio_client():
-    """create_client returns an LMStudioClient with the correct model set."""
+def test_create_client_returns_llm_client():
+    """create_client returns an LLMClient with the correct model set."""
     config = Config(base_url="http://localhost:1234/v1", model="test-model")
     client = create_client(config)
-    assert isinstance(client, LMStudioClient)
+    assert isinstance(client, LLMClient)
     assert client.model == "test-model"
 
 
@@ -92,7 +92,7 @@ def test_create_client_no_extra_headers_for_local_url():
 
 
 def test_complete_passes_timeout():
-    """LMStudioClient.complete passes timeout_s to the openai create call."""
+    """LLMClient.complete passes timeout_s to the openai create call."""
     config = Config(timeout_s=42)
     with patch("summarizer.llm._openai.OpenAI") as mock_openai:
         mock_chat = MagicMock()
@@ -311,7 +311,7 @@ def test_call_llm_logs_call_await_and_response(caplog):
 
 
 def test_create_client_stores_base_url():
-    """LMStudioClient stores base_url for use in log messages."""
+    """LLMClient stores base_url for use in log messages."""
     config = Config(base_url="http://localhost:1234/v1", model="test-model")
     client = create_client(config)
     assert client.base_url == "http://localhost:1234/v1"
@@ -705,7 +705,7 @@ def test_call_llm_json_repair_tokens_added_to_accumulator():
 
 def test_pipeline_schema_repair_tokens_added_to_accumulator():
     """Tokens from a schema-validation repair call are added to the accumulator."""
-    from summarizer.llm import CostAccumulator, ModelPricing, UsageStats
+    from summarizer.llm import CostAccumulator, ModelPricing
     from summarizer.pipeline import _validate_with_schema_repair
 
     pricing = ModelPricing()
@@ -713,9 +713,6 @@ def test_pipeline_schema_repair_tokens_added_to_accumulator():
     mock_client.model = "test-model"
     mock_client.base_url = "http://localhost:1234/v1"
     mock_client.pricing = pricing
-
-    repair_usage = UsageStats(input_tokens=200, output_tokens=150)
-    repaired_response = MagicMock(text='{"k": "v"}', usage=repair_usage)
 
     # A minimal valid LLMResponse to return after repair
     good_raw = {
@@ -796,3 +793,111 @@ def test_pipeline_schema_repair_tokens_added_to_accumulator():
         # The repair call_llm must have been called with accumulator=acc2
         for c in mock_repair.call_args_list:
             assert c.kwargs.get("accumulator") is acc2 or (len(c.args) >= 3 and c.args[2] is acc2)
+
+
+# ---------------------------------------------------------------------------
+# Regressions: retries, empty/truncated responses, headers
+# ---------------------------------------------------------------------------
+
+
+def _client_returning(sdk_response, **config_kwargs):
+    config = Config(base_url="http://localhost:1234/v1", model="m", **config_kwargs)
+    patcher = patch("summarizer.llm._openai.OpenAI")
+    mock_openai = patcher.start()
+    mock_openai.return_value.chat.completions.create.return_value = sdk_response
+    client = create_client(config)
+    return client, mock_openai, patcher
+
+
+def _sdk_response(content='{"k": "v"}', finish_reason="stop"):
+    return MagicMock(
+        choices=[MagicMock(message=MagicMock(content=content), finish_reason=finish_reason)],
+        usage=None,
+    )
+
+
+def test_sdk_retries_are_disabled():
+    """Regression: SDK retries (2x) stacked with ours (2x) gave up to 9 attempts."""
+    client, mock_openai, patcher = _client_returning(_sdk_response())
+    patcher.stop()
+    assert mock_openai.call_args.kwargs["max_retries"] == 0
+
+
+def test_complete_raises_on_none_content():
+    """Regression: content=None (reasoning models, refusals) crashed with TypeError."""
+    client, _, patcher = _client_returning(_sdk_response(content=None))
+    try:
+        with pytest.raises(LLMError, match="no content"):
+            client.complete("hello")
+    finally:
+        patcher.stop()
+
+
+def test_complete_raises_on_length_truncation():
+    """Regression: truncated JSON was sent to a repair call that cannot recover it."""
+    client, _, patcher = _client_returning(_sdk_response(content='{"a": ', finish_reason="length"))
+    try:
+        with pytest.raises(LLMError, match="truncated"):
+            client.complete("hello")
+    finally:
+        patcher.stop()
+
+
+def test_call_llm_does_not_retry_or_repair_truncated_output():
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = LLMError("LLM output was truncated by the token limit")
+    with patch("summarizer.llm.time.sleep"), pytest.raises(LLMError, match="truncated"):
+        call_llm(mock_client, "prompt")
+    assert mock_client.complete.call_count == 1
+
+
+def test_call_llm_retries_on_timeout():
+    import openai
+
+    data = {"ok": True}
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = [
+        openai.APITimeoutError(request=MagicMock()),  # request type varies by SDK version
+        MagicMock(text=json.dumps(data)),
+    ]
+    with patch("summarizer.llm.time.sleep"):
+        assert call_llm(mock_client, "prompt") == data
+    assert mock_client.complete.call_count == 2
+
+
+def test_call_llm_does_not_retry_auth_errors():
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = Exception("Error code: 401 - invalid api key")
+    with patch("summarizer.llm.time.sleep") as mock_sleep, pytest.raises(LLMError):
+        call_llm(mock_client, "prompt")
+    mock_sleep.assert_not_called()
+
+
+def test_openrouter_headers_name_this_project():
+    config = Config(base_url="https://openrouter.ai/api/v1", model="m", api_key="k")
+    with (
+        patch("summarizer.llm._openai.OpenAI") as mock_openai,
+        patch("summarizer.llm.fetch_model_pricing", return_value=ModelPricing()),
+    ):
+        create_client(config)
+    headers = mock_openai.call_args.kwargs["default_headers"]
+    assert headers["X-Title"] == "paper-summarizer"
+    assert "jhuebotter/paper-summarizer" in headers["HTTP-Referer"]
+
+
+def test_fetch_openrouter_model_ids():
+    from summarizer.llm import fetch_openrouter_model_ids
+
+    body = json.dumps({"data": [{"id": "a/b"}, {"id": "c/d"}]}).encode()
+    resp = MagicMock()
+    resp.read.return_value = body
+    resp.__enter__ = lambda s: s
+    resp.__exit__ = MagicMock(return_value=False)
+    with patch("summarizer.llm.urllib.request.urlopen", return_value=resp):
+        assert fetch_openrouter_model_ids("https://openrouter.ai/api/v1") == {"a/b", "c/d"}
+
+
+def test_fetch_openrouter_model_ids_returns_none_when_unreachable():
+    from summarizer.llm import fetch_openrouter_model_ids
+
+    assert fetch_openrouter_model_ids("https://openrouter.ai/api/v1") is None

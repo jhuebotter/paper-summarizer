@@ -400,3 +400,111 @@ def test_process_pdf_accumulator_is_updated(fake_pdf, config, mock_part1_dict, m
     assert acc.total_input_tokens == 500
     assert acc.total_output_tokens == 200
     assert acc.total_cost > 0
+
+
+# ---------------------------------------------------------------------------
+# Regressions: schema repair context, unknown year
+# ---------------------------------------------------------------------------
+
+
+def test_schema_repair_without_missing_fields_does_not_resend_paper(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    """Regression: every repair resent ~50k tokens of paper text.
+
+    A wrong enum value (paper_type="survey") is fixable from the contract alone.
+    """
+    broken = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    broken["metadata"]["paper_type"] = "survey"
+    fixed = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = [
+        MagicMock(text=json.dumps(broken)),
+        MagicMock(text=json.dumps(fixed)),
+    ]
+    with (
+        _mock_parse("UNIQUE_PAPER_TEXT_XYZ"),
+        patch("summarizer.pipeline.create_client", return_value=mock_client),
+    ):
+        process_pdf(fake_pdf, config)
+
+    repair_prompt = mock_client.complete.call_args_list[1].args[0]
+    assert "UNIQUE_PAPER_TEXT_XYZ" not in repair_prompt
+    assert "Expected JSON contract" in repair_prompt
+    assert "metadata.paper_type" in repair_prompt
+
+
+def test_schema_repair_with_missing_fields_includes_paper(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    broken = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    broken["part1"].pop("results")
+    fixed = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = [
+        MagicMock(text=json.dumps(broken)),
+        MagicMock(text=json.dumps(fixed)),
+    ]
+    with (
+        _mock_parse("UNIQUE_PAPER_TEXT_XYZ"),
+        patch("summarizer.pipeline.create_client", return_value=mock_client),
+    ):
+        process_pdf(fake_pdf, config)
+
+    assert "UNIQUE_PAPER_TEXT_XYZ" in mock_client.complete.call_args_list[1].args[0]
+
+
+def test_schema_repair_for_missing_part2_includes_paper(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    """part2=None on a primary paper fails a model validator, not a 'missing' error."""
+    broken = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    broken["part2"] = None
+    fixed = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = [
+        MagicMock(text=json.dumps(broken)),
+        MagicMock(text=json.dumps(fixed)),
+    ]
+    with (
+        _mock_parse("UNIQUE_PAPER_TEXT_XYZ"),
+        patch("summarizer.pipeline.create_client", return_value=mock_client),
+    ):
+        process_pdf(fake_pdf, config)
+
+    assert "UNIQUE_PAPER_TEXT_XYZ" in mock_client.complete.call_args_list[1].args[0]
+
+
+def test_unknown_year_becomes_none_and_key_uses_nd(
+    tmp_path, config, mock_part1_dict, mock_part2_dict
+):
+    """Regression: an unresolvable year became 0 (keys like 'smith0spiking')."""
+    pdf = tmp_path / "no_year_here.pdf"
+    pdf.write_bytes(b"%PDF")
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    combined["metadata"]["year"] = "not reported"
+    combined["metadata"]["title"] = "Spiking Control"
+    combined["metadata"]["citation_key"] = "not reported"
+    client_patcher, _ = _mock_llm_combined(combined)
+
+    with _mock_parse("text"), client_patcher:
+        summary = process_pdf(pdf, config)
+
+    assert summary.metadata.year is None
+    assert summary.metadata.citation_key == "huebotterndspiking"
+
+
+def test_process_pdf_uses_provided_references(fake_pdf, config, mock_part1_dict, mock_part2_dict):
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    client_patcher, mock_client = _mock_llm_combined(combined)
+    with (
+        _mock_parse("text"),
+        client_patcher,
+        patch("summarizer.pipeline.load_references") as mock_load,
+    ):
+        process_pdf(fake_pdf, config, references="CUSTOM_REFERENCES_ABC")
+    mock_load.assert_not_called()
+    assert "CUSTOM_REFERENCES_ABC" in mock_client.complete.call_args[0][0]

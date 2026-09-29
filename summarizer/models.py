@@ -25,16 +25,18 @@ PaperType = Literal["primary", "synthesis"]
 
 
 class PaperMetadata(BaseModel):
-    """Bibliographic metadata extracted from the paper in LLM Call 1.
+    """Bibliographic metadata extracted from the paper.
 
     The ``citation_key`` follows the convention ``firstauthorYEARfirstword``
-    (all lowercase), e.g. ``huebotter2025spiking``.
+    (all lowercase), e.g. ``huebotter2025spiking``.  ``year`` is ``None`` only
+    when no year could be found anywhere (the key then uses ``nd``, BibTeX's
+    "no date" convention).
     """
 
     citation_key: str
     title: str
     authors: list[str]
-    year: int
+    year: int | None
     venue: str
     is_research_paper: bool
     paper_type: PaperType | None
@@ -162,7 +164,7 @@ SummaryPart1 = Annotated[
 
 
 class SummaryPart2(BaseModel):
-    """Structured extraction of SNN-specific technical fields (LLM Call 2).
+    """Structured extraction of SNN-specific technical fields.
 
     Field values should use ``"not reported"`` when a concept applies but the
     paper omits it, and ``"not applicable"`` only when the concept genuinely
@@ -193,12 +195,12 @@ class SummaryPart2(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Combined LLM response (v1.1 — single call returns all three sections)
+# Combined LLM response (single call returns all three sections)
 # ---------------------------------------------------------------------------
 
 
 class LLMResponse(BaseModel):
-    """The raw validated response from a single combined LLM call (v1.1).
+    """The validated response from the single combined LLM call.
 
     The LLM returns a JSON object with three top-level keys:
     ``metadata``, ``part1``, and ``part2``.
@@ -283,12 +285,25 @@ class BatchReport(BaseModel):
 # Config (dataclass — not pydantic; holds runtime settings)
 # ---------------------------------------------------------------------------
 
-#: Estimate: 1 token ≈ 4 characters for English text.  At 200 000 chars the
-#: paper text budget is ~50 000 tokens, which leaves headroom for the
-#: references context (~2 500 tokens) and LLM output (~2 500 tokens) inside a
-#: 55 000-token context window.  Increase with ``--max-chars`` for models with
-#: larger context windows, or decrease for small local models.
+#: Estimate: 1 token ≈ 4 characters for English text.  200 000 chars of paper
+#: text is ~50 000 tokens.  The fixed prompt (references + output rules) adds
+#: ~11 000 tokens and the response ~3 000-5 000, so a call needs a context
+#: window of roughly 70 000 tokens.  Lower ``--max-chars`` for small local
+#: models.
 _DEFAULT_MAX_CHARS = 200_000
+
+#: Default backend and model.  A free OpenRouter model (checked 2026-09-29):
+#: 262k context, supports structured outputs, served by NVIDIA.  Free models
+#: are rate-limited and may be retired; the CLI's preflight check reports a
+#: retired id.  Paid fallback within budget: ``meta/muse-spark-1.3-contributor``
+#: (~$0.007/paper).
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+
+#: Resolved from the source checkout (not the CWD) so the CLI works from any
+#: directory.  Assumes an editable/source install; packaging the references as
+#: package data is part of the domain-profiles work (docs/PLAN.md, Phase 6).
+DEFAULT_SKILL_DATA_DIR = Path(__file__).resolve().parent.parent / "skill_data" / "references"
+DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 
 
 @dataclass
@@ -321,8 +336,8 @@ class Config:
                         ``non_research/`` are created automatically.
         skill_data_dir: Path to the directory containing reference .md files
                         (output-template, extraction fields, learning paradigms).
-        verbose:        If True, print context size diagnostics (chars, estimated
-                        tokens) to stderr before each LLM call.
+        verbose:        If True, log at DEBUG level (prompt sizes, raw response
+                        excerpts on failures, full validation errors).
         api_key:        API key for the LLM backend.  ``None`` means the key is
                         read from the ``LLM_API_KEY`` environment variable; if
                         that is also unset the dummy ``"lm-studio"`` string is
@@ -338,15 +353,15 @@ class Config:
                            Each worker processes full PDFs end-to-end.
     """
 
-    base_url: str = "http://localhost:1234/v1"
-    model: str = "openai/gpt-oss-120b:free"
+    base_url: str = DEFAULT_BASE_URL
+    model: str = DEFAULT_MODEL
     max_chars: int = _DEFAULT_MAX_CHARS
     force_summary: bool = False
     reparse: bool = False
     extractor: Literal["auto", "docling", "pypdf"] = "auto"
     dry_run: bool = False
     output_dir: Path = Path("output_summaries")
-    skill_data_dir: Path = Path("skill_data/references")
+    skill_data_dir: Path = DEFAULT_SKILL_DATA_DIR
     verbose: bool = False
     api_key: str | None = None
     timeout_s: int = 120
@@ -360,7 +375,7 @@ class Config:
 
 
 class ParseError(Exception):
-    """Raised when docling fails to parse a PDF (corrupt, password-protected, etc.)."""
+    """Raised when PDF text extraction fails (corrupt, password-protected, etc.)."""
 
 
 class LLMError(Exception):

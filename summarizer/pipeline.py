@@ -12,7 +12,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from summarizer.llm import CostAccumulator, LMStudioClient, call_llm, create_client
+from summarizer.llm import CostAccumulator, LLMClient, call_llm, create_client
 from summarizer.models import (
     Config,
     LLMResponse,
@@ -25,19 +25,21 @@ from summarizer.prompts import build_combined_prompt, load_references
 logger = logging.getLogger(__name__)
 
 _MAX_SCHEMA_REPAIR_RETRIES = 2
+_CONTRACT_FILENAME = "json-output-contract.md"
 
 
 def process_pdf(
     pdf_path: Path,
     config: Config,
-    client: "LMStudioClient | None" = None,
+    client: "LLMClient | None" = None,
     accumulator: "CostAccumulator | None" = None,
+    references: str | None = None,
 ) -> PaperSummary:
     """Process a single PDF end-to-end and return a validated ``PaperSummary``.
 
     Steps
     -----
-    1. Parse the PDF via docling (reads cache if available; see ``parser.py``).
+    1. Extract the PDF text (reads cache if available; see ``parser.py``).
     2. Build a combined prompt requesting metadata + Part 1 + Part 2 in one call.
     3. Call the LLM once; validate the response into ``LLMResponse``.
     4. Return a fully validated ``PaperSummary``.
@@ -48,13 +50,17 @@ def process_pdf(
         client:      Optional pre-created LLM client.  When ``None`` a new
                      client is created from ``config`` (default behaviour).
         accumulator: Optional cost accumulator updated after each LLM call.
+        references:  Optional pre-loaded reference text (batch mode loads it
+                     once); read from ``config.skill_data_dir`` when ``None``.
 
     Raises:
         PipelineError: wraps any ``ParseError``, ``LLMError``,
             ``ValidationError``, or other exception that occurs.
     """
     try:
-        return _run_pipeline(pdf_path, config, client=client, accumulator=accumulator)
+        return _run_pipeline(
+            pdf_path, config, client=client, accumulator=accumulator, references=references
+        )
     except PipelineError:
         raise
     except Exception as e:
@@ -64,8 +70,9 @@ def process_pdf(
 def _run_pipeline(
     pdf_path: Path,
     config: Config,
-    client: "LMStudioClient | None" = None,
+    client: "LLMClient | None" = None,
     accumulator: "CostAccumulator | None" = None,
+    references: str | None = None,
 ) -> PaperSummary:
     # Step 1: parse PDF → markdown (uses cache if available)
     paper_text = parse_pdf(
@@ -76,7 +83,8 @@ def _run_pipeline(
     )
 
     # Step 2: load references and build combined prompt
-    references = load_references(config.skill_data_dir)
+    if references is None:
+        references = load_references(config.skill_data_dir)
     if client is None:
         client = create_client(config)
     prompt = build_combined_prompt(
@@ -98,9 +106,16 @@ def _run_pipeline(
         original_prompt=prompt,
         pdf_path=pdf_path,
         accumulator=accumulator,
+        contract=_load_contract(config.skill_data_dir),
     )
 
     return PaperSummary(metadata=response.metadata, part1=response.part1, part2=response.part2)
+
+
+def _load_contract(references_dir: Path) -> str:
+    """Return the JSON output contract reference, or ``""`` if absent."""
+    path = references_dir / _CONTRACT_FILENAME
+    return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
 def _validate_with_schema_repair(
@@ -109,8 +124,15 @@ def _validate_with_schema_repair(
     original_prompt: str,
     pdf_path: Path,
     accumulator: "CostAccumulator | None" = None,
+    contract: str = "",
 ) -> LLMResponse:
-    """Validate response and repair schema with bounded LLM retries."""
+    """Validate response and repair schema with bounded LLM retries.
+
+    The repair prompt only includes the full original prompt (and therefore
+    the paper text) when fields are *missing* — the model needs the paper to
+    fill them.  Type/enum/structure errors are fixed from the JSON contract
+    alone, which avoids resending ~50k tokens of paper per repair.
+    """
     current = raw
     attempts = _MAX_SCHEMA_REPAIR_RETRIES + 1
 
@@ -124,20 +146,34 @@ def _validate_with_schema_repair(
                 raise
 
             compact = _compact_validation_errors(exc)
+            needs_paper = _needs_paper_context(exc)
             logger.warning(
-                "Schema validation failed on attempt %d/%d; requesting repair (%s)",
+                "Schema validation failed on attempt %d/%d; requesting repair "
+                "(%d errors, %s paper text: %s)",
                 attempt,
                 attempts,
+                len(compact),
+                "with" if needs_paper else "without",
                 "; ".join(compact[:4]),
             )
+            logger.debug("All validation errors:\n%s", "\n".join(compact))
             repair_prompt = _build_schema_repair_prompt(
-                original_prompt=original_prompt,
+                original_prompt=original_prompt if needs_paper else "",
                 bad_response=current,
                 validation_errors=compact,
+                contract=contract,
             )
             current = call_llm(client, repair_prompt, accumulator=accumulator)
 
     raise RuntimeError("Schema validation retry loop exhausted unexpectedly")
+
+
+def _needs_paper_context(exc: ValidationError) -> bool:
+    """True when repair must *add content* (missing fields / a required part2)."""
+    for err in exc.errors():
+        if err.get("type") == "missing" or "is required" in str(err.get("msg", "")):
+            return True
+    return False
 
 
 def _compact_validation_errors(exc: ValidationError) -> list[str]:
@@ -170,8 +206,14 @@ def _build_schema_repair_prompt(
     original_prompt: str,
     bad_response: dict,
     validation_errors: list[str],
+    contract: str = "",
 ) -> str:
-    """Prompt asking the LLM to repair schema validation issues only."""
+    """Prompt asking the LLM to repair schema validation issues only.
+
+    ``original_prompt`` may be empty (no paper context needed); ``contract``
+    is the JSON output contract, included when there is no original prompt
+    (which would otherwise already contain it).
+    """
     rendered_errors = "\n".join(f"- {item}" for item in validation_errors)
     bad_json = json.dumps(bad_response, ensure_ascii=False)
 
@@ -191,6 +233,13 @@ def _build_schema_repair_prompt(
 
     field_hint_block = f"\nRequired fields hint:\n{field_hint}\n" if field_hint else ""
 
+    if original_prompt:
+        context_block = f"Original extraction prompt (for context):\n{original_prompt}\n\n"
+    elif contract:
+        context_block = f"Expected JSON contract:\n{contract}\n\n"
+    else:
+        context_block = ""
+
     return (
         "You are a JSON schema-repair assistant.\n"
         "Task: Fix the RESPONSE JSON so it satisfies the expected schema.\n"
@@ -203,8 +252,7 @@ def _build_schema_repair_prompt(
         f"{field_hint_block}\n"
         "Validation errors:\n"
         f"{rendered_errors}\n\n"
-        "Original extraction prompt (for context):\n"
-        f"{original_prompt}\n\n"
+        f"{context_block}"
         "Response JSON to repair:\n"
         f"{bad_json}"
     )
@@ -233,8 +281,12 @@ def _normalize_metadata_year(raw: dict, pdf_path: Path) -> dict:
         source = "citation_key"
 
     if normalized is None:
-        normalized = 0
-        source = "fallback=0"
+        logger.warning(
+            "No publication year found (LLM returned %r); leaving it unset (citation key uses 'nd')",
+            year,
+        )
+        metadata["year"] = None
+        return raw
 
     logger.warning(
         "LLM returned non-integer metadata.year=%r; normalized to %d using %s",
@@ -301,10 +353,13 @@ def _is_valid_citation_key(value: object) -> bool:
 
 
 def _build_citation_key(metadata: dict, pdf_path: Path) -> str:
-    """Synthesize a deterministic citation key: firstauthor+year+firstword."""
+    """Synthesize a deterministic citation key: firstauthor+year+firstword.
+
+    An unknown year becomes ``nd`` (BibTeX "no date").
+    """
     year = metadata.get("year")
     if not isinstance(year, int):
-        year = 0
+        year = "nd"
 
     authors = metadata.get("authors")
     first_author_token = "paper"
@@ -346,7 +401,7 @@ def _author_surname_token(author_name: str) -> str:
 
 
 def _extract_year_candidate(value: object) -> int | None:
-    """Extract a plausible 4-digit year from a string value."""
+    """Extract a plausible 4-digit year (1900-2099) from a string value."""
     if not isinstance(value, str):
         return None
     match = re.search(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)", value)

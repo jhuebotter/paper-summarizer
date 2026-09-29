@@ -3,7 +3,8 @@
 These tests make real HTTP calls to the OpenRouter API.
 They are skipped automatically when ``LLM_API_KEY`` is not set.
 
-The model used is the default OSS free-tier model from ``Config``.
+The model used is ``LLM_MODEL`` or ``summarizer.models.DEFAULT_MODEL``.
+Run with ``pytest -m integration``.
 """
 
 import os
@@ -12,6 +13,8 @@ import pytest
 from dotenv import load_dotenv
 
 load_dotenv()
+
+pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
@@ -24,7 +27,9 @@ def api_key():
 
 @pytest.fixture
 def model():
-    return os.environ.get("LLM_MODEL", "openai/gpt-oss-120b:free")
+    from summarizer.models import DEFAULT_MODEL
+
+    return os.environ.get("LLM_MODEL", DEFAULT_MODEL)
 
 
 @pytest.fixture
@@ -59,13 +64,12 @@ def test_fetch_model_pricing_returns_real_data(api_key, model, base_url):
 
 def test_real_completion_returns_usage(api_key, model, base_url):
     """A real completion returns token counts in response.usage."""
-    from summarizer.llm import CostAccumulator, create_client
+    from summarizer.llm import create_client
     from summarizer.models import Config
 
     config = Config(base_url=base_url, model=model, api_key=api_key)
     client = create_client(config)
 
-    acc = CostAccumulator()
     prompt = '{"greeting": "hello"}'
     response = client.complete(prompt)
 
