@@ -22,14 +22,14 @@ If unclear: describe the actual update rule/training loop rather than forcing a 
 - `Gradient-based (surrogate gradient BPTT)`
 - `Gradient-based (online approximation: e-prop/FPTT/OSTL)`
 - `ANN-to-SNN conversion`
-- `Predictive coding / prediction error learning`
+- `Predictive coding / prediction error learning` (explicit predictive-coding, free-energy or error-unit architectures only; a rule that merely uses an output prediction error, e.g. FOLLOW or a supervised forward model, is not predictive coding)
 - `Reinforcement learning (model-free)`
 - `Reinforcement learning (model-based)`
 - `Local plasticity (STDP / R-STDP / three-factor)`
 - `Homeostatic / intrinsic plasticity (auxiliary)`
 - `Evolutionary / black-box optimization`
 - `Analytical / closed-form (NEF / reservoir / control law)`
-- `Hybrid / multi-phase` (use in addition to phase labels above)
+- `Hybrid / multi-phase` (in addition to the labels above, when different components or phases use different paradigms, e.g. an evolved controller on a surrogate-gradient encoder, or ANN training then conversion; not for successive stages of the same paradigm)
 
 **Evidence labels (must match Notable findings tags):** `Measured` / `Reported` / `Claimed` / `Attributed`  
 **Credit assignment labels:** `Global` / `Semi-local` / `Local` / `Analytical` / `Hybrid` / `Not applicable`  

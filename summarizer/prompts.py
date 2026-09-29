@@ -69,7 +69,8 @@ Output rules:
 - If a required value is unavailable, use "not reported" (or "not applicable" if truly inapplicable).
 
 Year resolution priority (for metadata.year):
-1) explicit publication year in the paper metadata/header,
+1) explicit publication year in the paper metadata/header (an arXiv margin stamp such as
+   "arXiv:2303.08778v1 [cs.RO] 15 Mar 2023" dates a preprint version: prefer the filename year),
 2) source filename,
 3) best-supported inference from the paper text only if needed.
 - metadata.year must be an integer; use null only if no year can be determined at all (never "not reported").

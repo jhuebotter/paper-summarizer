@@ -8,7 +8,7 @@ Two-part summary, rendered from the JSON response to `output_summaries/<paper_ty
 
 Classify as: **primary research** or **synthesis**.
 
-- **Primary research** — new experiments, new method, empirical results. May include theoretical components, but experimental validation is central.
+- **Primary research** — new experiments, new method, empirical results. May include theoretical components, but experimental validation is central. A paper whose main contribution is new formal results (theorems, proofs) is primary even without experiments.
 - **Synthesis** — primary contribution is a novel framework, synthesis, argument, or aggregation of prior work. Covers: systematic reviews, surveys, perspectives, opinions, commentaries. If the paper reviews ≥10 prior studies, proposes a conceptual framework without new experiments, or is explicitly labeled "perspective / opinion / commentary / review", classify as synthesis.
 
 **Short perspective/focus/editorial pieces are always synthesis.** A 1–4 page article published in a high-impact journal (e.g., Science, Science Robotics, Nature, Current Biology) that comments on, contextualises, or highlights another group's paper — rather than reporting its own experiments — is **synthesis** regardless of its brevity. Signals: no Methods section, no Results section, no data figures from the authors' own experiments, text that says "in their study / in a recent paper / [Author et al.] show…" referring to others' work. Do not mistake the described work (from the paper being commented on) for the author's own contributions.
