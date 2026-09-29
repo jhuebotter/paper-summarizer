@@ -1,6 +1,8 @@
 # CLAUDE.md
 
-CLI that turns research PDFs into structured markdown summaries via an OpenAI-compatible LLM (OpenRouter by default). Target use case: a literature review on spiking neural networks for control. Goal: make the research field hot-swappable (see `docs/PLAN.md`).
+CLI that turns research PDFs into structured markdown summaries via an OpenAI-compatible LLM (OpenRouter by default). Target use case: a literature review on spiking neural networks for control. Goal: make the research field hot-swappable.
+
+**To-do list / plan / decisions: `notes/todo.md`**. This is the single source of truth. It's gitignored (local only); read it before starting work and update it when items change.
 
 ## Commands
 

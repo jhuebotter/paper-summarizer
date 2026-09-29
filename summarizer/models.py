@@ -301,7 +301,7 @@ DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
 #: Resolved from the source checkout (not the CWD) so the CLI works from any
 #: directory.  Assumes an editable/source install; packaging the references as
-#: package data is part of the domain-profiles work (docs/PLAN.md, Phase 6).
+#: package data is part of the planned domain-profiles work.
 DEFAULT_SKILL_DATA_DIR = Path(__file__).resolve().parent.parent / "skill_data" / "references"
 DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 

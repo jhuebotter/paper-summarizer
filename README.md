@@ -10,7 +10,7 @@ Built by **Justus Hübotter** (2026).
 
 `paper-summarizer` is a CLI that turns research PDFs into structured, critical markdown summaries using any OpenAI-compatible LLM backend (OpenRouter by default, or a local server such as LM Studio).
 
-The bundled prompt references target a literature review on **spiking neural networks (SNNs) for control**. Making the field hot-swappable is on the [plan](docs/PLAN.md) (Phase 6).
+The bundled prompt references target a literature review on **spiking neural networks (SNNs) for control**. Making the research field hot-swappable is on the roadmap.
 
 ## Quick start
 
@@ -118,7 +118,6 @@ The authors train a recurrent LIF controller with surrogate-gradient BPTT on a s
 ├── output_summaries/             # Summaries by paper type + processed.jsonl (gitignored)
 ├── skill_data/references/        # Prompt references: JSON contract, template, field guides
 ├── collect_pdfs.sh               # Flatten nested PDF libraries
-├── docs/PLAN.md                  # Roadmap / revival plan
 └── summarizer/                   # Package source (cli, batch, pipeline, llm, parser, prompts, renderer, models)
 ```
 
@@ -178,7 +177,12 @@ CI runs lint and tests on Python 3.12–3.14.
 
 ## Roadmap
 
-See [docs/PLAN.md](docs/PLAN.md): an evaluation harness, structured JSON outputs, decision models (Jev / Ollaya), domain profiles, and corpus-level tables and synthesis.
+- Evaluation harness: quote faithfulness, validity and repair rates, cost per paper, labelled accuracy, model comparison.
+- Structured JSON outputs next to each summary, content-hash paper identity, DOI-based metadata.
+- JSON-schema structured outputs and leaner, type-specific prompts.
+- Decision models (Jev / Ollaya) for screening, typed field extraction and cross-checks.
+- Domain profiles, so the research field is hot-swappable.
+- Corpus-level comparison tables, BibTeX export and staged synthesis.
 
 ## License
 
