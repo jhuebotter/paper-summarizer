@@ -172,7 +172,7 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 ## Skip and rerun behavior
 
 - Papers are identified by content (SHA-256): anything in `output_summaries/processed.jsonl` is skipped even after moving or renaming the PDF, and identical copies in one batch are processed once. A changed PDF counts as a new paper. Older index entries (path only, or a legacy `processed.txt`) are migrated when their PDF is next seen, unless the file changed after it was summarized, in which case it is summarized again.
-- Extraction caches are per content and extractor (`<sha256>.docling.md`, `<sha256>.pypdf.md`). Caches that earlier versions wrote next to the PDFs are still read unless they are older than the PDF.
+- Extraction caches are per content and extractor (`<sha256>.docling.md`, `<sha256>.pypdf.md`). Caches that earlier versions wrote next to the PDFs (`<stem>.docling.md`, `<stem>.pypdf.md`) are still read unless they are older than the PDF; the first version's bare `<stem>.md` is ignored because it may hold pypdf text under any extractor.
 - Failed papers are not recorded, so the next run retries them. The exit code is 1 if any paper failed.
 - Ctrl-C cancels queued papers (exit code 130). Finished papers are kept and skipped on the next run.
 - A run stopped by a quota or `--max-cost` exits with 1 and says why; rerunning continues where it stopped.

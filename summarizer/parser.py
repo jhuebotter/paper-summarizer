@@ -4,8 +4,10 @@ Extracted text is cached per PDF content and extractor in
 ``$XDG_CACHE_HOME/paper-summarizer`` (default ``~/.cache/paper-summarizer``) as
 ``{sha256}.{extractor}.md``, so moving or renaming a PDF keeps its cache and
 switching ``--extractor`` never reuses another backend's text.  Caches written
-next to the PDF by earlier versions (``{stem}.docling.md``, ``{stem}.pypdf.md``,
-and ``{stem}.md``, honoured only by ``auto``) are still read.
+next to the PDF by earlier versions (``{stem}.docling.md``, ``{stem}.pypdf.md``)
+are still read.  Bare ``{stem}.md`` files are not: the original version wrote
+whichever extractor last ran under that name, so ``auto`` would silently reuse
+pypdf text and never run docling.
 
 Zero-byte cache files are treated as a cache miss.  Cache writes are atomic and
 best-effort.
@@ -48,7 +50,7 @@ class ParsedText:
     """Extracted (optionally reference-stripped) text of one PDF, not yet truncated."""
 
     text: str
-    extractor: str  # "docling", "pypdf" or "unknown" (an old cache of unknown origin)
+    extractor: str  # "docling" or "pypdf"
     sha256: str
 
 
@@ -161,13 +163,12 @@ def _cache_candidates(pdf_path: Path, sha: str, extractor: str) -> list[tuple[Pa
 
     if extractor in ("docling", "pypdf"):
         return [(_cache_path(sha, extractor), extractor), (beside(extractor), extractor)]
-    # auto: prefer docling output, then a previous pypdf fallback, then an old cache.
+    # auto: prefer docling output, then a previous pypdf fallback.
     return [
         (_cache_path(sha, "docling"), "docling"),
         (_cache_path(sha, "pypdf"), "pypdf"),
         (beside("docling"), "docling"),
         (beside("pypdf"), "pypdf"),
-        (pdf_path.parent / f"{pdf_path.stem}.md", "unknown"),
     ]
 
 

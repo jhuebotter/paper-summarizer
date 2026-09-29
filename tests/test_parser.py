@@ -130,10 +130,10 @@ def test_parse_pdf_writes_cache_on_fresh_parse(tmp_path):
 
 
 def test_parse_pdf_reads_cache_when_present(tmp_path):
-    """When a legacy {pdf_stem}.md exists and is non-empty, docling is NOT called."""
+    """When an old {pdf_stem}.docling.md exists and is non-empty, docling is NOT called."""
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake content")
-    cache = tmp_path / "paper.md"
+    cache = tmp_path / "paper.docling.md"
     cache.write_text("cached content", encoding="utf-8")
 
     with patch("summarizer.parser.DocumentConverter") as MockConverter:
@@ -147,7 +147,7 @@ def test_parse_pdf_truncates_cached_content(tmp_path):
     """Cached content is still subject to max_chars truncation."""
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake content")
-    cache = tmp_path / "paper.md"
+    cache = tmp_path / "paper.docling.md"
     cache.write_text("x" * 1000, encoding="utf-8")
 
     with patch("summarizer.parser.DocumentConverter") as MockConverter:
@@ -161,7 +161,7 @@ def test_parse_pdf_zero_byte_cache_treated_as_miss(tmp_path):
     """An empty (zero-byte) cache file causes a fresh docling run."""
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake content")
-    cache = tmp_path / "paper.md"
+    cache = tmp_path / "paper.docling.md"
     cache.write_text("", encoding="utf-8")  # zero bytes
 
     mock_result = MagicMock()
@@ -179,7 +179,7 @@ def test_parse_pdf_reparse_ignores_cache(tmp_path):
     """When reparse=True, docling runs even if a cache file exists."""
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake content")
-    cache = tmp_path / "paper.md"
+    cache = tmp_path / "paper.docling.md"
     cache.write_text("stale cached content", encoding="utf-8")
 
     mock_result = MagicMock()
@@ -592,10 +592,22 @@ def test_old_caches_next_to_the_pdf_are_still_read(tmp_path):
     from summarizer.parser import load_text
 
     pdf = _fake_pdf(tmp_path)
-    (tmp_path / "paper.md").write_text("legacy text", encoding="utf-8")
+    (tmp_path / "paper.pypdf.md").write_text("old pypdf text", encoding="utf-8")
     parsed = load_text(pdf)
-    assert (parsed.text, parsed.extractor) == ("legacy text", "unknown")
+    assert (parsed.text, parsed.extractor) == ("old pypdf text", "pypdf")
     assert not list(tmp_path.glob("*.docling.md"))  # nothing new written next to the PDF
+
+
+def test_bare_stem_cache_is_not_reused(tmp_path):
+    """Regression: the original version's <stem>.md held pypdf text after any
+    --extractor pypdf run, so auto served it as-is and docling never ran."""
+    from summarizer.parser import load_text
+
+    pdf = _fake_pdf(tmp_path)
+    (tmp_path / "paper.md").write_text("glued pypdf text", encoding="utf-8")
+    with patch("summarizer.parser._run_docling", return_value="docling text"):
+        parsed = load_text(pdf)
+    assert (parsed.text, parsed.extractor) == ("docling text", "docling")
 
 
 def test_stale_cache_next_to_a_replaced_pdf_is_ignored(tmp_path):
