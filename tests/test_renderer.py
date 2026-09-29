@@ -1,6 +1,5 @@
 """Tests for summarizer/renderer.py — PaperSummary → markdown string."""
 
-
 from summarizer.models import (
     PaperMetadata,
     PaperSummary,
@@ -226,3 +225,32 @@ def test_render_warns_when_part1_exceeds_word_limit(mock_part1_dict, mock_part2_
         render_summary(_make_bloated_primary(mock_part1_dict, mock_part2_dict))
     assert any("word" in r.message.lower() for r in caplog.records)
     assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Regressions: header line breaks, unknown year, empty lists
+# ---------------------------------------------------------------------------
+
+
+def test_header_lines_use_markdown_hard_breaks(mock_part1_dict, mock_part2_dict):
+    """Regression: single newlines collapsed the header into one paragraph."""
+    md = render_summary(_make_summary(mock_part1_dict, mock_part2_dict))
+    header = md.split("\n\n---")[0]
+    for label in ("Citation key", "Authors", "Year", "Venue", "Paper Type"):
+        line = next(ln for ln in header.splitlines() if ln.startswith(f"**{label}:**"))
+        assert line.endswith("  "), f"{label} line lacks a hard line break"
+
+
+def test_unknown_year_renders_not_reported(mock_part1_dict, mock_part2_dict):
+    summary = _make_summary(mock_part1_dict, mock_part2_dict)
+    summary.metadata.year = None
+    assert "**Year:** not reported" in render_summary(summary)
+
+
+def test_empty_findings_and_snippets_render_not_reported(mock_part1_dict, mock_part2_dict):
+    summary = _make_summary(mock_part1_dict, mock_part2_dict)
+    summary.part1.notable_findings = []
+    summary.part1.citable_snippets = []
+    md = render_summary(summary)
+    assert "### Notable Findings\n\nnot reported" in md
+    assert "### Citable Snippets\n\nnot reported" in md
