@@ -32,7 +32,7 @@ uv run summarize-papers --source input_papers
 - Sends one combined prompt per paper (bibliographic metadata + Part 1 summary + Part 2 SNN-control extraction) and asks for a single JSON object.
 - Validates the JSON with pydantic. Syntax errors get one repair call; schema errors get up to two repair calls, which resend the paper text only when content is missing.
 - Sorts papers into `primary` (new experiments/methods), `synthesis` (reviews, surveys, perspectives, commentaries, …) or `non_research`.
-- Processes batches in parallel, skips papers it has already done, and reports token usage and cost (priced from OpenRouter's live model list).
+- Processes batches in parallel, skips papers it has already done, and reports token totals and cost (priced from OpenRouter's live model list).
 
 ## Typical workflow
 
@@ -147,14 +147,17 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 - `--max-chars N`: paper-text budget (default 200,000 ≈ 50k tokens). Longer text is truncated, and a warning is logged.
 - `--max-output-tokens N`: cap generated tokens (default: no cap). If the model hits the cap, the paper fails with a clear message instead of an unrepairable half-JSON.
 - `--workers N`: parallel papers (default 3). `--timeout S`: per-call timeout (default 120).
-- `--verbose`: DEBUG logging (raw response excerpts on parse failures, full validation errors).
+- `--verbose` / `--no-verbose`: DEBUG logging (raw response excerpts on parse failures, full validation errors); off by default.
 - `--log-file FILE`: log path (default `logs/run_<timestamp>.log`).
+- `--skill-data-dir DIR`: prompt reference files (default: `skill_data/references` of this checkout).
 
 ## Skip and rerun behavior
 
 - Papers listed in `output_summaries/processed.jsonl` (keyed by absolute PDF path) are skipped. A legacy `processed.txt` is still read and migrated on the next save.
 - Extraction caches are per extractor (`<stem>.docling.md`, `<stem>.pypdf.md`). A legacy `<stem>.md` is still honoured by `--extractor auto`.
 - Failed papers are not recorded, so the next run retries them. The exit code is 1 if any paper failed.
+- Ctrl-C cancels queued papers (exit code 130). Finished papers are kept and skipped on the next run.
+- Use one run at a time per output directory.
 
 ## Troubleshooting
 
@@ -180,7 +183,7 @@ CI runs lint and tests on Python 3.12–3.14.
 - Evaluation harness: quote faithfulness, validity and repair rates, cost per paper, labelled accuracy, model comparison.
 - Structured JSON outputs next to each summary, content-hash paper identity, DOI-based metadata.
 - JSON-schema structured outputs and leaner, type-specific prompts.
-- Decision models (Jev / Ollaya) for screening, typed field extraction and cross-checks.
+- Decision models, i.e. fast classifiers that return calibrated probabilities (e.g. TypeSafe's Jev, or local models via Ollaya), for screening, typed field extraction and cross-checks.
 - Domain profiles, so the research field is hot-swappable.
 - Corpus-level comparison tables, BibTeX export and staged synthesis.
 

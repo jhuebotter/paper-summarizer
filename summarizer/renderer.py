@@ -1,8 +1,7 @@
 """Render a validated PaperSummary to the final markdown string.
 
-The output format matches the ``output-template.md`` reference exactly.
-No file I/O is performed here — the caller (``batch.py`` / ``cli.py``) is
-responsible for writing the returned string to disk.
+The layout follows the ``output-template.md`` reference.  No file I/O is
+performed here; ``batch.py`` writes the returned string to disk.
 """
 
 import logging
@@ -99,7 +98,7 @@ def _check_word_limit(paper_type: str, word_count: int) -> None:
 
 
 def _render_header(meta: PaperMetadata) -> str:
-    """Render the YAML-style metadata header block."""
+    """Render the title and bold-label metadata lines."""
     if meta.paper_type == "primary":
         paper_type_label = "primary research"
     elif meta.paper_type == "synthesis":

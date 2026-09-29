@@ -18,8 +18,8 @@ def setup_logging(verbose: bool = False, log_file: Path | None = None) -> None:
     """Configure the ``summarizer`` logger for a CLI session.
 
     Args:
-        verbose:  If True, set level to DEBUG (shows prompt-size diagnostics
-                  and other fine-grained detail).  Default level is INFO.
+        verbose:  If True, set level to DEBUG (raw response excerpts on parse
+                  failures, full validation errors).  Default level is INFO.
         log_file: If provided, attach a ``FileHandler`` that writes to this
                   path in addition to stderr.  Parent directories are created
                   automatically.
