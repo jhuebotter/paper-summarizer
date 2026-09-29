@@ -277,8 +277,8 @@ def test_prompt_paper_types_match_schema():
 
 def test_prompt_budget_matches_renderer_word_limits():
     """Regression: the output budget said ≤600 words for every paper type."""
-    from summarizer.renderer import _WORD_LIMITS
+    from summarizer.renderer import WORD_LIMITS
 
     prompt = _prompt()
-    for paper_type, limit in _WORD_LIMITS.items():
+    for paper_type, limit in WORD_LIMITS.items():
         assert f"{paper_type}: ≤{limit} words" in prompt

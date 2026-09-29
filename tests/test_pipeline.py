@@ -9,8 +9,8 @@ import pytest
 from summarizer.llm import CostAccumulator, ModelPricing, UsageStats
 from summarizer.models import Config, PaperSummary, ParseError, PipelineError
 from summarizer.pipeline import (
-    _author_surname_token,
     _sanitize_citation_key,
+    author_surname_token,
     process_pdf,
 )
 
@@ -214,7 +214,7 @@ def test_sanitize_citation_key(value, expected):
     ],
 )
 def test_author_surname_token_unicode(author_name, expected):
-    assert _author_surname_token(author_name) == expected
+    assert author_surname_token(author_name) == expected
 
 
 # ---------------------------------------------------------------------------

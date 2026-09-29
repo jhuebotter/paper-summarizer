@@ -15,14 +15,15 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
+from functools import partial
 from pathlib import Path
 
-from summarizer.batch import _atomic_write_text, sha256_file
-from summarizer.llm import CostAccumulator, UsageStats, _CompletionResponse, create_client
+from summarizer.batch import atomic_write_text, sha256_file
+from summarizer.llm import CompletionResponse, CostAccumulator, UsageStats, create_client
 from summarizer.metrics import compute_metrics, duplicate_keys
 from summarizer.models import Config, PaperSummary, PipelineError
 from summarizer.parser import parse_pdf
-from summarizer.pipeline import _author_surname_token, process_pdf
+from summarizer.pipeline import author_surname_token, process_pdf
 from summarizer.prompts import load_references
 
 logger = logging.getLogger(__name__)
@@ -56,8 +57,10 @@ class CachingClient:
     """Wraps an LLM client with an on-disk response cache.
 
     One instance per paper, so ``hits`` / ``misses`` / ``llm_seconds`` describe
-    that paper.  Failed calls are never cached.  On a hit, the stored usage is
-    returned, so tokens (and cost at current pricing) match the original call.
+    that paper.  Failed calls are never cached.  On a hit, the stored usage and
+    the original call's duration are used, so tokens, cost (at current pricing)
+    and ``llm_seconds`` match the original call.  The key covers backend,
+    model, output cap and the full prompt (so a renamed PDF misses).
     """
 
     def __init__(self, inner, cache_dir: Path) -> None:
@@ -76,14 +79,14 @@ class CachingClient:
         )
         return self._cache_dir / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
 
-    def complete(self, prompt: str) -> _CompletionResponse:
+    def complete(self, prompt: str) -> CompletionResponse:
         path = self._path(prompt)
         if path.exists():
             entry = json.loads(path.read_text(encoding="utf-8"))
             self.hits += 1
             self.llm_seconds += entry.get("elapsed_s", 0.0)
             usage = UsageStats(**entry["usage"]) if entry.get("usage") else None
-            return _CompletionResponse(text=entry["text"], usage=usage)
+            return CompletionResponse(text=entry["text"], usage=usage)
 
         t0 = time.monotonic()
         response = self._inner.complete(prompt)
@@ -96,7 +99,7 @@ class CachingClient:
             "usage": asdict(response.usage) if response.usage else None,
             "elapsed_s": elapsed,
         }
-        _atomic_write_text(path, json.dumps(entry))
+        atomic_write_text(path, json.dumps(entry))
         return response
 
 
@@ -138,6 +141,17 @@ def _norm(value: object) -> str:
     return "".join(ch for ch in str(value).casefold() if ch.isalnum())
 
 
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
+
+
+def _surname(name: str) -> str:
+    """Surname token of "Given Surname" or "Surname, Given" (suffixes like Jr. ignored)."""
+    if "," in name:
+        name = name.split(",")[0]
+    words = [w for w in name.split() if _norm(w) not in _NAME_SUFFIXES]
+    return author_surname_token(" ".join(words))
+
+
 def score_gold(summary: PaperSummary, labels: dict) -> dict[str, bool]:
     """Compare predictions with the labelled (non-null) gold fields."""
     meta = summary.metadata
@@ -146,7 +160,7 @@ def score_gold(summary: PaperSummary, labels: dict) -> dict[str, bool]:
         "paper_type": meta.paper_type or "non_research",
         "synthesis_subtype": meta.synthesis_subtype,
         "year": meta.year,
-        "first_author": _author_surname_token(meta.authors[0]) if meta.authors else None,
+        "first_author": _surname(meta.authors[0]) if meta.authors else None,
         "title": meta.title,
     }
     scores = {}
@@ -156,7 +170,7 @@ def score_gold(summary: PaperSummary, labels: dict) -> dict[str, bool]:
             continue
         got = predicted[field]
         if field == "first_author":
-            expected = _author_surname_token(str(expected))
+            expected = _surname(str(expected))
         if isinstance(expected, str) and got is not None:
             scores[field] = _norm(got) == _norm(expected)
         else:
@@ -186,6 +200,7 @@ def _git_commit() -> str | None:
 def _eval_one(
     pdf: Path,
     sha: str,
+    *,
     config: Config,
     cfg: EvalConfig,
     client,
@@ -194,6 +209,8 @@ def _eval_one(
     gold: dict[str, dict],
     summaries_dir: Path,
 ) -> dict:
+    """Evaluate one paper; a failed paper counts as wrong on every labelled gold field."""
+    labelled = {f: False for f, v in gold.get(sha, {}).items() if v is not None}
     row = {
         "config": cfg.name,
         "model": cfg.model,
@@ -202,13 +219,12 @@ def _eval_one(
         "sha256": sha,
         "ok": False,
         "error": None,
+        "gold": labelled or None,
     }
-    t0 = time.monotonic()
     try:
         full_text = parse_pdf(pdf, max_chars=sys.maxsize, extractor=cfg.extractor)
     except Exception as exc:
         return row | {"error": f"parse failed: {exc}"}
-    parse_s = time.monotonic() - t0
     paper_text = full_text[: config.max_chars]
 
     accumulator = CostAccumulator()
@@ -237,14 +253,13 @@ def _eval_one(
         "cost_usd": accumulator.total_cost,
         "cache_hits": cached_client.hits,
         "cache_misses": cached_client.misses,
-        "parse_s": round(parse_s, 3),
         "llm_s": round(cached_client.llm_seconds, 3),
     }
     if summary is None:
         return row
 
     summaries_dir.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(summaries_dir / f"{sha}.json", summary.model_dump_json(indent=2))
+    atomic_write_text(summaries_dir / f"{sha}.json", summary.model_dump_json(indent=2))
     row |= {
         "paper_type": summary.metadata.paper_type or "non_research",
         "citation_key": summary.metadata.citation_key,
@@ -271,32 +286,34 @@ def run_eval(
         "references_sha256": hashlib.sha256(references.encode()).hexdigest()[:12],
         "max_chars": base_config.max_chars,
     }
-    shas = {pdf: sha256_file(pdf) for pdf in pdfs}
+    shas: dict[Path, str] = {}
+    for pdf in pdfs:
+        sha = sha256_file(pdf)
+        if sha in shas.values():
+            logger.warning("Skipping %s: same content as another PDF in the set", pdf.name)
+        else:
+            shas[pdf] = sha
     results_path = out_dir / "results.jsonl"
+    results_path.write_text("", encoding="utf-8")
     rows: list[dict] = []
 
     for cfg in configs:
         config = replace(base_config, model=cfg.model, extractor=cfg.extractor, dry_run=False)
         client = create_client(config)
-        summaries_dir = out_dir / "summaries" / cfg.name
-        logger.info("Evaluating %s on %d PDFs", cfg.name, len(pdfs))
+        evaluate = partial(
+            _eval_one,
+            config=config,
+            cfg=cfg,
+            client=client,
+            references=references,
+            cache_dir=cache_dir,
+            gold=gold,
+            summaries_dir=out_dir / "summaries" / cfg.name,
+        )
+        logger.info("Evaluating %s on %d PDFs", cfg.name, len(shas))
         executor = ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="eval")
         try:
-            futures = [
-                executor.submit(
-                    _eval_one,
-                    pdf,
-                    shas[pdf],
-                    config,
-                    cfg,
-                    client,
-                    references,
-                    cache_dir,
-                    gold,
-                    summaries_dir,
-                )
-                for pdf in pdfs
-            ]
+            futures = [executor.submit(evaluate, pdf, sha) for pdf, sha in shas.items()]
             for future in as_completed(futures):
                 row = future.result() | {"provenance": provenance}
                 with results_path.open("a", encoding="utf-8") as f:
@@ -311,7 +328,7 @@ def run_eval(
         executor.shutdown()
 
     report = render_report(rows, configs, provenance)
-    _atomic_write_text(out_dir / "report.md", report)
+    atomic_write_text(out_dir / "report.md", report)
     return rows
 
 
@@ -329,35 +346,48 @@ def _sum_rate(rows: list[dict], key: str) -> tuple[int, int]:
     return sum(x["n"] for x in rates), sum(x["of"] for x in rates)
 
 
-def _config_summary(rows: list[dict]) -> list[str]:
+def config_summary(rows: list[dict]) -> list[tuple[str, str]]:
+    """``(column, value)`` pairs for one configuration's summary row.
+
+    Quality columns use successful papers only; the ``ok`` column says how many.
+    """
     ok = [r for r in rows if r["ok"]]
-    quotes = [r["metrics"]["quotes"] for r in ok if r.get("metrics")]
+    scored = [r for r in ok if r.get("metrics")]
+    quotes = [r["metrics"]["quotes"] for r in scored]
     q_total = sum(q["total"] for q in quotes)
-    voice = [r["metrics"]["first_person"] for r in ok if r.get("metrics")]
+    voice = [r["metrics"]["first_person"] for r in scored]
     voice_words = sum(v["words"] for v in voice)
-    budgets = [r["metrics"]["word_budget"]["ratio"] for r in ok if r.get("metrics")]
-    gold = [s for r in ok if r.get("gold") for s in r["gold"].values()]
+    budgets = [r["metrics"]["word_budget"]["ratio"] for r in scored]
+    gold = [s for r in rows if r.get("gold") for s in r["gold"].values()]
     return [
-        _pct(len(ok), len(rows)),
-        _pct(sum(r.get("first_try_valid", False) for r in rows), len(rows)),
-        str(sum(r.get("json_repairs", 0) + r.get("schema_repairs", 0) for r in rows)),
-        f"{sum(r.get('input_tokens', 0) for r in rows):,} / "
-        f"{sum(r.get('output_tokens', 0) for r in rows):,}",
-        f"${sum(r.get('cost_usd', 0.0) for r in rows):.4f}",
-        _pct(sum(q["verbatim"] for q in quotes), q_total),
-        _pct(sum(q["near"] for q in quotes), q_total),
-        _pct(sum(q["not_found"] for q in quotes), q_total),
-        _pct(*_sum_rate(ok, "anchors")),
-        f"{1000 * sum(v['count'] for v in voice) / voice_words:.1f}" if voice_words else "n/a",
-        f"{statistics.median(budgets):.2f}" if budgets else "n/a",
-        _pct(*_sum_rate(ok, "evidence_tags")),
-        _pct(sum(gold), len(gold)),
+        ("ok", _pct(len(ok), len(rows))),
+        ("first-try valid", _pct(sum(r.get("first_try_valid", False) for r in rows), len(rows))),
+        ("repairs", str(sum(r.get("json_repairs", 0) + r.get("schema_repairs", 0) for r in rows))),
+        (
+            "tokens in / out",
+            f"{sum(r.get('input_tokens', 0) for r in rows):,} / "
+            f"{sum(r.get('output_tokens', 0) for r in rows):,}",
+        ),
+        ("cost", f"${sum(r.get('cost_usd', 0.0) for r in rows):.4f}"),
+        ("quotes verbatim", _pct(sum(q["verbatim"] for q in quotes), q_total)),
+        ("near", _pct(sum(q["near"] for q in quotes), q_total)),
+        ("not found", _pct(sum(q["not_found"] for q in quotes), q_total)),
+        ("anchor coverage", _pct(*_sum_rate(scored, "anchors"))),
+        (
+            "first person /1k words",
+            f"{1000 * sum(v['count'] for v in voice) / voice_words:.1f}" if voice_words else "n/a",
+        ),
+        ("word budget (median)", f"{statistics.median(budgets):.2f}" if budgets else "n/a"),
+        ("evidence tags", _pct(*_sum_rate(scored, "evidence_tags"))),
+        ("gold labels", _pct(sum(gold), len(gold))),
     ]
 
 
 def render_report(rows: list[dict], configs: list[EvalConfig], provenance: dict) -> str:
     """Markdown report: per-config summary, per-paper table, missing quotes, labels."""
     by_config = {c.name: [r for r in rows if r["config"] == c.name] for c in configs}
+    summaries = {name: config_summary(config_rows) for name, config_rows in by_config.items()}
+    columns = [column for column, _ in next(iter(summaries.values()), [])]
     lines = [
         "# Evaluation report",
         "",
@@ -366,13 +396,14 @@ def render_report(rows: list[dict], configs: list[EvalConfig], provenance: dict)
         "",
         "## Per configuration",
         "",
-        "| config | ok | first-try valid | repairs | tokens in / out | cost | quotes verbatim "
-        "| near | not found | anchor coverage | first person /1k words | word budget (median) "
-        "| evidence tags | gold labels |",
-        "|" + "---|" * 14,
+        "Quality columns cover successful papers only; failed papers count as wrong for gold "
+        "labels.",
+        "",
+        "| config | " + " | ".join(columns) + " |",
+        "|" + "---|" * (len(columns) + 1),
     ]
-    for name, config_rows in by_config.items():
-        lines.append("| " + " | ".join([f"`{name}`", *_config_summary(config_rows)]) + " |")
+    for name, summary in summaries.items():
+        lines.append(f"| `{name}` | " + " | ".join(value for _, value in summary) + " |")
 
     lines += ["", "## Per paper", "", "| paper | " + " | ".join(by_config) + " |"]
     lines.append("|" + "---|" * (len(by_config) + 1))

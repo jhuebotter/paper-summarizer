@@ -562,7 +562,7 @@ def test_create_client_does_not_fetch_pricing_for_local(monkeypatch):
 
 
 def test_complete_returns_usage_when_sdk_provides_it():
-    """complete() populates _CompletionResponse.usage from response.usage."""
+    """complete() populates CompletionResponse.usage from response.usage."""
     config = Config()
     with patch("summarizer.llm._openai.OpenAI") as mock_openai:
         mock_chat = MagicMock()

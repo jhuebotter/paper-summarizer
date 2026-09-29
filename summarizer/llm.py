@@ -77,13 +77,13 @@ class CostAccumulator:
             self.total_output_tokens += usage.output_tokens
             self.total_reasoning_tokens += usage.reasoning_tokens
 
-    def note_repair(self, kind: str) -> None:
-        """Count a repair attempt; ``kind`` is ``"json"`` or ``"schema"``."""
+    def note_json_repair(self) -> None:
         with self._lock:
-            if kind == "json":
-                self.json_repairs += 1
-            else:
-                self.schema_repairs += 1
+            self.json_repairs += 1
+
+    def note_schema_repair(self) -> None:
+        with self._lock:
+            self.schema_repairs += 1
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +99,7 @@ class RejectedCompletion(LLMError):
         self.usage = usage
 
 
-class _CompletionResponse:
+class CompletionResponse:
     """Thin wrapper presenting an openai chat response as ``response.text``."""
 
     __slots__ = ("text", "usage")
@@ -142,7 +142,7 @@ class LLMClient:
             max_retries=0,  # retries are handled by _complete_with_retries
         )
 
-    def complete(self, prompt: str) -> _CompletionResponse:
+    def complete(self, prompt: str) -> CompletionResponse:
         """Send a chat completion request and return the model's reply.
 
         Raises:
@@ -174,7 +174,7 @@ class LLMClient:
             raise RejectedCompletion(
                 f"LLM returned no content (finish_reason={choice.finish_reason!r})", usage
             )
-        return _CompletionResponse(text=text, usage=usage)
+        return CompletionResponse(text=text, usage=usage)
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +409,7 @@ def call_llm(
     except LLMError as parse_exc:
         logger.warning("Initial JSON parse failed; running one syntax-repair retry")
         if accumulator is not None:
-            accumulator.note_repair("json")
+            accumulator.note_json_repair()
         logger.debug("Unparseable response (first 500 chars): %r", completion.text[:500])
         try:
             repaired = _repair_json_once(client, completion.text, accumulator=accumulator)
@@ -486,7 +486,7 @@ def _record(accumulator: "CostAccumulator | None", usage: "UsageStats | None", c
         accumulator.add(usage if usage is not None else UsageStats(), cost)
 
 
-def _complete_with_retries(client: LLMClient, prompt: str) -> _CompletionResponse:
+def _complete_with_retries(client: LLMClient, prompt: str) -> CompletionResponse:
     """Run one completion with retry/backoff on transient errors.
 
     Retried: HTTP 429, 5xx, timeouts and connection errors.

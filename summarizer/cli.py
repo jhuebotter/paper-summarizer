@@ -69,7 +69,7 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     args = _build_parser().parse_args(argv)
-    setup_logging(verbose=args.verbose, log_file=_log_file(args.log_file, "run"))
+    setup_logging(verbose=args.verbose, log_file=_log_file(args.log_file))
 
     # --reparse implies --force-summary
     force_summary = args.force_summary or args.reparse
@@ -108,10 +108,10 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(130)
 
 
-def _log_file(log_file: str | None, prefix: str) -> Path:
+def _log_file(log_file: str | None) -> Path:
     if log_file:
         return Path(log_file)
-    return Path("logs") / f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    return Path("logs") / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
 
 # ---------------------------------------------------------------------------
@@ -126,10 +126,7 @@ def _eval_main(argv: list[str]) -> None:
     gold_path = Path(args.gold)
     source = Path(args.source)
 
-    if args.init_gold:
-        setup_logging(verbose=args.verbose, log_file=None)
-    else:
-        setup_logging(verbose=args.verbose, log_file=Path(args.log_file or out_dir / "eval.log"))
+    setup_logging(verbose=args.verbose, log_file=None)  # file logging once inputs are valid
     if not source.is_dir():
         logger.error("Not a directory: %s", source)
         sys.exit(1)
@@ -145,9 +142,17 @@ def _eval_main(argv: list[str]) -> None:
 
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     extractors = [e.strip() for e in args.extractors.split(",") if e.strip()]
-    unknown = set(extractors) - {"docling", "pypdf"}
+    unknown = sorted(set(extractors) - {"docling", "pypdf"})
     if not models or not extractors or unknown:
-        logger.error("Need at least one model and extractors from: docling, pypdf")
+        logger.error(
+            "Need at least one model and extractors from docling, pypdf (got %s)",
+            ", ".join(unknown) or "none",
+        )
+        sys.exit(1)
+    if "docling" in extractors and not importlib.util.find_spec("docling"):
+        logger.error(
+            "docling is not installed (uv sync --extra docling), or use --extractors pypdf"
+        )
         sys.exit(1)
 
     config = Config(
@@ -163,6 +168,7 @@ def _eval_main(argv: list[str]) -> None:
     _check_backend(config.base_url)
     for model in models:
         _check_openrouter_config(replace(config, model=model))
+    setup_logging(verbose=args.verbose, log_file=Path(args.log_file or out_dir / "eval.log"))
 
     configs = [EvalConfig(model=m, extractor=e) for m in models for e in extractors]
     try:
@@ -225,7 +231,8 @@ def _build_eval_parser() -> argparse.ArgumentParser:
         default="eval/cache",
         help="LLM response cache shared across runs (default: eval/cache).",
     )
-    _add_backend_args(parser)
+    _add_backend_args(parser, log_default="OUT/eval.log")
+    parser.set_defaults(workers=1)  # free models allow 20 requests/min and 50-1000/day
     return parser
 
 
@@ -398,11 +405,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_default_model,
         help=f"LLM model identifier (default: LLM_MODEL env var, currently {_default_model!r}).",
     )
-    _add_backend_args(parser)
+    _add_backend_args(parser, log_default="logs/run_TIMESTAMP.log")
     return parser
 
 
-def _add_backend_args(parser: argparse.ArgumentParser) -> None:
+def _add_backend_args(parser: argparse.ArgumentParser, log_default: str) -> None:
     """Flags shared by the run and eval commands."""
     parser.add_argument(
         "--base-url",
@@ -443,7 +450,7 @@ def _add_backend_args(parser: argparse.ArgumentParser) -> None:
         "--log-file",
         metavar="FILE",
         default=None,
-        help="Write log output to FILE (default: logs/run_TIMESTAMP.log; eval: OUT/eval.log).",
+        help=f"Write log output to FILE (default: {log_default}).",
     )
     parser.add_argument(
         "--timeout",
@@ -457,7 +464,7 @@ def _add_backend_args(parser: argparse.ArgumentParser) -> None:
         metavar="N",
         type=_positive_int,
         default=3,
-        help="Number of papers processed in parallel (default: 3).",
+        help="Number of papers processed in parallel (default: %(default)s).",
     )
     parser.add_argument(
         "--max-output-tokens",
