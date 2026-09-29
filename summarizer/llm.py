@@ -31,7 +31,7 @@ from summarizer.models import Config, LLMError, LLMResponse
 
 logger = logging.getLogger(__name__)
 
-_MAX_TRANSIENT_RETRIES = 2
+_MAX_TRANSIENT_RETRIES = 3
 
 # ---------------------------------------------------------------------------
 # Cost & usage data structures
@@ -119,6 +119,29 @@ class RejectedCompletion(LLMError):
         self.usage = usage
 
 
+class ProviderError(LLMError):
+    """The request was accepted but the provider failed; OpenRouter reports this
+    as an ``error`` object in a 200 response (no choices, or ``finish_reason="error"``)."""
+
+    def __init__(self, message: str, code: int | None) -> None:
+        super().__init__(message)
+        self.code = code
+
+    @property
+    def retryable(self) -> bool:
+        return self.code is None or self.code == 429 or 500 <= self.code <= 599
+
+
+def _provider_error(obj: object, fallback: str) -> ProviderError:
+    extra = getattr(obj, "model_extra", None)
+    error = extra.get("error") if isinstance(extra, dict) else None
+    if not isinstance(error, dict):
+        return ProviderError(fallback, None)
+    code = error.get("code")
+    code = code if isinstance(code, int) else None
+    return ProviderError(f"{fallback}: {error.get('message') or error} (code {code})", code)
+
+
 class CompletionResponse:
     """Thin wrapper presenting an openai chat response as ``response.text``."""
 
@@ -170,7 +193,7 @@ class LLMClient:
         """Send a chat completion request and return the model's reply.
 
         Raises:
-            LLMError: if the response has no choices.
+            ProviderError: if the provider failed (no choices, or a mid-response error).
             RejectedCompletion: if the reply is empty or was cut off by the
                 output-token limit (``finish_reason == "length"``); a truncated
                 JSON object cannot be repaired, so fail fast.
@@ -189,8 +212,10 @@ class LLMClient:
         response = self._client.chat.completions.create(**kwargs)
         usage = _extract_usage(response)
         if not getattr(response, "choices", None):
-            raise LLMError("LLM response contains no choices")
+            raise _provider_error(response, "LLM response contains no choices")
         choice = response.choices[0]
+        if choice.finish_reason == "error":
+            raise _provider_error(choice, "LLM generation failed mid-response")
         if choice.finish_reason == "length":
             raise RejectedCompletion(
                 "LLM output was truncated by the token limit (finish_reason=length); "
@@ -584,14 +609,18 @@ def _record(accumulator: "CostAccumulator | None", usage: "UsageStats | None", c
 def _complete_with_retries(client: LLMClient, prompt: str) -> CompletionResponse:
     """Run one completion with retry/backoff on transient errors.
 
-    Retried: HTTP 429 (per-minute limits), 5xx, timeouts and connection errors.
-    Exhausted quotas (daily free-model cap, credits, key limit) raise
-    ``QuotaExhausted`` without retrying.
+    Retried: HTTP 429 (per-minute limits), 5xx, timeouts, connection errors and
+    transient provider errors reported inside a 200 response.  Exhausted quotas
+    (daily free-model cap, credits, key limit) raise ``QuotaExhausted`` without
+    retrying.
     """
     attempts = _MAX_TRANSIENT_RETRIES + 1
     for attempt in range(1, attempts + 1):
         try:
             return client.complete(prompt)
+        except ProviderError as exc:
+            if attempt >= attempts or not exc.retryable:
+                raise
         except LLMError:
             raise
         except Exception as exc:
@@ -615,14 +644,24 @@ def _complete_with_retries(client: LLMClient, prompt: str) -> CompletionResponse
 
 
 def _retry_delay_seconds(attempt: int, exc: Exception | None = None) -> float:
-    """``Retry-After`` if the server sent a short one, else jittered exponential backoff."""
+    """Wait for a short ``Retry-After`` or rate-limit reset, else jittered exponential backoff.
+
+    OpenRouter's per-minute 429s carry the reset time (epoch ms) in the error body.
+    """
     response = getattr(exc, "response", None)
     try:
         retry_after = float(response.headers.get("retry-after"))
     except (AttributeError, TypeError, ValueError):
         retry_after = None
+    if retry_after is None and exc is not None:
+        try:
+            retry_after = (
+                float(_error_details(exc)[1].get("X-RateLimit-Reset")) / 1000 - time.time()
+            )
+        except (TypeError, ValueError):
+            pass
     if retry_after is not None and 0 < retry_after <= 60:
-        return retry_after
+        return retry_after + random.uniform(0, 1)  # spread workers waiting for the same reset
     return 2 ** (attempt - 1) * random.uniform(0.5, 1.5)
 
 

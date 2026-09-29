@@ -846,6 +846,35 @@ def test_complete_raises_when_response_has_no_choices():
             client.complete("hello")
 
 
+def _provider_failure(code, finish_reason=None):
+    """A 200 response carrying OpenRouter's ``error`` object instead of a reply."""
+    error = {"error": {"code": code, "message": "Upstream error"}}
+    if finish_reason is None:
+        return MagicMock(choices=[], model_extra=error, usage=None)
+    choice = MagicMock(finish_reason=finish_reason, model_extra=error)
+    return MagicMock(choices=[choice], usage=None)
+
+
+@pytest.mark.parametrize("finish_reason", [None, "error"])
+def test_provider_error_in_a_200_response_is_retried(finish_reason):
+    """Regression: 2 of 17 real papers failed on 'no choices' without a retry or a reason."""
+    with _client_returning(_provider_failure(502, finish_reason)) as (client, mock_openai):
+        create = mock_openai.return_value.chat.completions.create
+        create.side_effect = [_provider_failure(502, finish_reason), _sdk_response('{"ok": 1}')]
+        with patch("summarizer.llm.time.sleep"):
+            assert call_llm(client, "prompt") == {"ok": 1}
+    assert create.call_count == 2
+
+
+def test_non_transient_provider_error_is_not_retried_and_reports_the_reason():
+    with _client_returning(_provider_failure(400)) as (client, mock_openai):
+        with patch("summarizer.llm.time.sleep") as sleep:
+            with pytest.raises(LLMError, match="Upstream error"):
+                call_llm(client, "prompt")
+    sleep.assert_not_called()
+    assert mock_openai.return_value.chat.completions.create.call_count == 1
+
+
 def test_complete_raises_on_length_truncation():
     """Regression: truncated JSON was sent to a repair call that cannot recover it."""
     with _client_returning(_sdk_response(content='{"a": ', finish_reason="length")) as (client, _):
@@ -1001,9 +1030,29 @@ def test_per_minute_rate_limit_is_retried_with_retry_after():
     exc = _api_error(429, "Rate limit exceeded: 20 per minute")
     exc.response = MagicMock(headers={"retry-after": "7"})
     mock_client.complete.side_effect = [exc, MagicMock(text='{"ok": true}', usage=None)]
-    with patch("summarizer.llm.time.sleep") as sleep:
+    with (
+        patch("summarizer.llm.time.sleep") as sleep,
+        patch("summarizer.llm.random.uniform", return_value=0.5),
+    ):
         assert call_llm(mock_client, "prompt") == {"ok": True}
-    sleep.assert_called_once_with(7.0)
+    sleep.assert_called_once_with(7.5)
+
+
+def test_per_minute_rate_limit_waits_for_the_reset_in_the_error_body():
+    """Regression: a 20/min burst failed papers after ~3 s of backoff while the
+    reset (in OpenRouter's error metadata) was ~40 s away."""
+    exc = _api_error(
+        429, "Rate limit exceeded: free-models-per-min", {"X-RateLimit-Reset": "1000040000"}
+    )
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = [exc, MagicMock(text='{"ok": true}', usage=None)]
+    with (
+        patch("summarizer.llm.time.time", return_value=1_000_000.0),
+        patch("summarizer.llm.time.sleep") as sleep,
+        patch("summarizer.llm.random.uniform", return_value=0.5),
+    ):
+        assert call_llm(mock_client, "prompt") == {"ok": True}
+    sleep.assert_called_once_with(40.5)
 
 
 def test_quota_message_includes_reset_time():
