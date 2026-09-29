@@ -4,8 +4,10 @@ Extracted text is cached per PDF content and extractor in
 ``$XDG_CACHE_HOME/paper-summarizer`` (default ``~/.cache/paper-summarizer``) as
 ``{sha256}.{extractor}.md``, so moving or renaming a PDF keeps its cache and
 switching ``--extractor`` never reuses another backend's text.  Caches written
-next to the PDF by earlier versions (``{stem}.docling.md``, ``{stem}.pypdf.md``,
-and ``{stem}.md``, honoured only by ``auto``) are still read.
+next to the PDF by earlier versions (``{stem}.docling.md``, ``{stem}.pypdf.md``)
+are still read.  Bare ``{stem}.md`` files are not: the original version wrote
+whichever extractor last ran under that name, so ``auto`` would silently reuse
+pypdf text and never run docling.
 
 Zero-byte cache files are treated as a cache miss.  Cache writes are atomic and
 best-effort.
@@ -48,7 +50,7 @@ class ParsedText:
     """Extracted (optionally reference-stripped) text of one PDF, not yet truncated."""
 
     text: str
-    extractor: str  # "docling", "pypdf" or "unknown" (an old cache of unknown origin)
+    extractor: str  # "docling" or "pypdf"
     sha256: str
 
 
@@ -161,13 +163,12 @@ def _cache_candidates(pdf_path: Path, sha: str, extractor: str) -> list[tuple[Pa
 
     if extractor in ("docling", "pypdf"):
         return [(_cache_path(sha, extractor), extractor), (beside(extractor), extractor)]
-    # auto: prefer docling output, then a previous pypdf fallback, then an old cache.
+    # auto: prefer docling output, then a previous pypdf fallback.
     return [
         (_cache_path(sha, "docling"), "docling"),
         (_cache_path(sha, "pypdf"), "pypdf"),
         (beside("docling"), "docling"),
         (beside("pypdf"), "pypdf"),
-        (pdf_path.parent / f"{pdf_path.stem}.md", "unknown"),
     ]
 
 
@@ -274,7 +275,16 @@ def _docling_converter_class():
     return DocumentConverter
 
 
-def _get_converter():
+def _pdf_format_options(ocr: bool) -> dict:
+    """docling PDF options; OCR is ~10x slower and adds little on born-digital PDFs."""
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.document_converter import PdfFormatOption
+
+    return {InputFormat.PDF: PdfFormatOption(pipeline_options=PdfPipelineOptions(do_ocr=ocr))}
+
+
+def _get_converter(ocr: bool = False):
     """Return a process-wide converter; building one loads docling's models.
 
     Raises:
@@ -282,13 +292,13 @@ def _get_converter():
             (the failure is remembered, so later papers skip straight to pypdf).
     """
     cls = _docling_converter_class()
-    converter = _CONVERTERS.get(cls)
+    converter = _CONVERTERS.get((cls, ocr))
     if converter is None:
         try:
-            converter = cls()
+            converter = cls(format_options=_pdf_format_options(ocr))
         except Exception as exc:
             converter = DoclingUnavailable(f"docling failed to start: {exc}")
-        _CONVERTERS[cls] = converter
+        _CONVERTERS[(cls, ocr)] = converter
     if isinstance(converter, DoclingUnavailable):
         raise converter
     return converter
@@ -297,20 +307,35 @@ def _get_converter():
 def _run_docling(pdf_path: Path) -> str:
     """Run docling on *pdf_path* and return the full markdown string.
 
-    Calls are serialized: docling is not reliably thread-safe under parallel
-    batch runs, while LLM calls stay parallel.
+    OCR runs only when the PDF has no text layer (a scan).  Calls are
+    serialized: docling is not reliably thread-safe under parallel batch runs,
+    while LLM calls stay parallel.
 
     Raises:
         DoclingUnavailable: if docling is not installed.
         ParseError: wrapping any exception raised by docling.
     """
     with _DOCLING_LOCK:
-        converter = _get_converter()
-        try:
-            result = converter.convert(str(pdf_path))
-            return result.document.export_to_markdown()
-        except Exception as e:
-            raise ParseError(f"Failed to parse {pdf_path}: {e}") from e
+        text, pages = _convert(pdf_path, ocr=False)
+        chars = len(re.findall(r"\w", text.replace("<!-- image -->", "")))
+        if chars < _MIN_CHARS_PER_PAGE * pages or not chars:
+            logger.info("No text layer in %s; retrying with OCR", pdf_path.name)
+            text, _ = _convert(pdf_path, ocr=True)
+        return text
+
+
+_MIN_CHARS_PER_PAGE = 100  # below this the PDF is (mostly) a scan, e.g. with a text cover page
+
+
+def _convert(pdf_path: Path, ocr: bool) -> tuple[str, int]:
+    """Return the markdown and the page count (0 if unknown)."""
+    converter = _get_converter(ocr)
+    try:
+        document = converter.convert(str(pdf_path)).document
+        pages = document.num_pages()
+        return document.export_to_markdown(), pages if isinstance(pages, int) else 0
+    except Exception as e:
+        raise ParseError(f"Failed to parse {pdf_path}: {e}") from e
 
 
 def _extract_text_with_pypdf(pdf_path: Path) -> str:

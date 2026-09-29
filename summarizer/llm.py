@@ -31,7 +31,7 @@ from summarizer.models import Config, LLMError, LLMResponse
 
 logger = logging.getLogger(__name__)
 
-_MAX_TRANSIENT_RETRIES = 2
+_MAX_TRANSIENT_RETRIES = 3
 
 # ---------------------------------------------------------------------------
 # Cost & usage data structures
@@ -119,6 +119,29 @@ class RejectedCompletion(LLMError):
         self.usage = usage
 
 
+class ProviderError(RejectedCompletion):
+    """The request was accepted but the provider failed; OpenRouter reports this
+    as an ``error`` object in a 200 response (no choices, or ``finish_reason="error"``)."""
+
+    def __init__(self, message: str, usage: "UsageStats | None", code: int | None) -> None:
+        super().__init__(message, usage)
+        self.code = code
+
+    @property
+    def retryable(self) -> bool:
+        return self.code is None or self.code in (408, 429) or 500 <= self.code <= 599
+
+
+def _provider_error(obj: object, fallback: str, usage: "UsageStats | None") -> ProviderError:
+    extra = getattr(obj, "model_extra", None)
+    error = extra.get("error") if isinstance(extra, dict) else None
+    if not isinstance(error, dict):
+        return ProviderError(fallback, usage, None)
+    code = str(error.get("code"))
+    code = int(code) if code.isdigit() else None
+    return ProviderError(f"{fallback}: {error.get('message') or error} (code {code})", usage, code)
+
+
 class CompletionResponse:
     """Thin wrapper presenting an openai chat response as ``response.text``."""
 
@@ -170,7 +193,7 @@ class LLMClient:
         """Send a chat completion request and return the model's reply.
 
         Raises:
-            LLMError: if the response has no choices.
+            ProviderError: if the provider failed (no choices, or a mid-response error).
             RejectedCompletion: if the reply is empty or was cut off by the
                 output-token limit (``finish_reason == "length"``); a truncated
                 JSON object cannot be repaired, so fail fast.
@@ -189,8 +212,10 @@ class LLMClient:
         response = self._client.chat.completions.create(**kwargs)
         usage = _extract_usage(response)
         if not getattr(response, "choices", None):
-            raise LLMError("LLM response contains no choices")
+            raise _provider_error(response, "LLM response contains no choices", usage)
         choice = response.choices[0]
+        if choice.finish_reason == "error":
+            raise _provider_error(choice, "LLM generation failed mid-response", usage)
         if choice.finish_reason == "length":
             raise RejectedCompletion(
                 "LLM output was truncated by the token limit (finish_reason=length); "
@@ -466,7 +491,7 @@ def call_llm(
     logger.info("Awaiting response...")
     t0 = time.monotonic()
     try:
-        completion = _complete_with_retries(client, prompt)
+        completion = _complete_with_retries(client, prompt, accumulator)
     except RejectedCompletion as exc:
         _record(accumulator, exc.usage, _calculate_cost(exc.usage, client.pricing))
         raise
@@ -558,7 +583,7 @@ def _repair_json_once(
         f"{bad_text}"
     )
     try:
-        response = _complete_with_retries(client, repair_prompt)
+        response = _complete_with_retries(client, repair_prompt, accumulator)
     except RejectedCompletion as exc:
         _record(accumulator, exc.usage, _calculate_cost(exc.usage, client.pricing))
         raise
@@ -581,17 +606,28 @@ def _record(accumulator: "CostAccumulator | None", usage: "UsageStats | None", c
         accumulator.add(usage if usage is not None else UsageStats(), cost)
 
 
-def _complete_with_retries(client: LLMClient, prompt: str) -> CompletionResponse:
+def _complete_with_retries(
+    client: LLMClient, prompt: str, accumulator: "CostAccumulator | None" = None
+) -> CompletionResponse:
     """Run one completion with retry/backoff on transient errors.
 
-    Retried: HTTP 429 (per-minute limits), 5xx, timeouts and connection errors.
-    Exhausted quotas (daily free-model cap, credits, key limit) raise
-    ``QuotaExhausted`` without retrying.
+    Retried: HTTP 429 (per-minute limits), 5xx, timeouts, connection errors and
+    transient provider errors reported inside a 200 response (whose usage, if
+    billed, is recorded).  Exhausted quotas (daily free-model cap, credits, key
+    limit) raise ``QuotaExhausted`` without retrying.
     """
     attempts = _MAX_TRANSIENT_RETRIES + 1
     for attempt in range(1, attempts + 1):
         try:
             return client.complete(prompt)
+        except ProviderError as exc:
+            if exc.code == 402:
+                raise QuotaExhausted(f"Credits exhausted: {exc}") from exc
+            if attempt >= attempts or not exc.retryable:
+                raise
+            if exc.usage is not None:
+                _record(accumulator, exc.usage, _calculate_cost(exc.usage, client.pricing))
+            error = exc
         except LLMError:
             raise
         except Exception as exc:
@@ -600,30 +636,43 @@ def _complete_with_retries(client: LLMClient, prompt: str) -> CompletionResponse
                 raise QuotaExhausted(quota) from exc
             if attempt >= attempts or not _is_retryable_status_error(exc):
                 raise LLMError(f"LLM call failed: {exc}") from exc
+            error = exc
 
-            delay_s = _retry_delay_seconds(attempt, exc)
-            logger.warning(
-                "Transient LLM error on attempt %d/%d (%s); retrying in %.1fs",
-                attempt,
-                attempts,
-                exc,
-                delay_s,
-            )
-            time.sleep(delay_s)
+        delay_s = _retry_delay_seconds(attempt, error)
+        logger.warning(
+            "Transient LLM error on attempt %d/%d (%s); retrying in %.1fs",
+            attempt,
+            attempts,
+            error,
+            delay_s,
+        )
+        time.sleep(delay_s)
 
     raise LLMError("LLM call failed after retries")
 
 
 def _retry_delay_seconds(attempt: int, exc: Exception | None = None) -> float:
-    """``Retry-After`` if the server sent a short one, else jittered exponential backoff."""
+    """Wait for a short ``Retry-After`` or rate-limit reset, else jittered exponential backoff.
+
+    OpenRouter's per-minute 429s carry the reset time (epoch ms) in the error body;
+    other 429s (free models throttled upstream) back off from 5 s rather than 1 s.
+    """
     response = getattr(exc, "response", None)
     try:
         retry_after = float(response.headers.get("retry-after"))
     except (AttributeError, TypeError, ValueError):
         retry_after = None
+    if retry_after is None and exc is not None:
+        try:
+            retry_after = (
+                float(_error_details(exc)[1].get("X-RateLimit-Reset")) / 1000 - time.time()
+            )
+        except (TypeError, ValueError):
+            pass
     if retry_after is not None and 0 < retry_after <= 60:
-        return retry_after
-    return 2 ** (attempt - 1) * random.uniform(0.5, 1.5)
+        return retry_after + random.uniform(0, 1)  # spread workers waiting for the same reset
+    base = 5 if exc is not None and _extract_status_code(exc) == 429 else 1
+    return base * 2 ** (attempt - 1) * random.uniform(0.5, 1.5)
 
 
 def _error_details(exc: Exception) -> tuple[str, dict]:

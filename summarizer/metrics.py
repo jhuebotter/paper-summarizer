@@ -39,6 +39,7 @@ _SPACED_DASHES = dict.fromkeys(map(ord, "‒–—―−"), " ")
 _NUMERIC_CITATION = re.compile(r"\[\s*\d+(?:\s*[,;–-]\s*\d+)*\s*\]")
 _ELLIPSIS = re.compile(r"\[\s*(?:\.\.\.|…)\s*\]|\.\.\.|…")
 _WORD = re.compile(r"\w+")
+_MIN_UNSPACED_CHARS = 20  # shorter matches without spaces could start or end mid-word
 
 
 def normalize_text(text: str) -> str:
@@ -67,15 +68,31 @@ class _PaperText:
     def __init__(self, text: str) -> None:
         tokens = _tokens(text)
         self.joined = " " + " ".join(tokens) + " "
+        self.squashed = "".join(tokens)  # for extractions that glue words together
         self.ngrams = _ngrams(tokens, _NGRAM)
+
+
+def _spaced(words: list[str]) -> str:
+    return " " + " ".join(words) + " "
+
+
+def _in_order(fragments: list[list[str]], haystack: str, join) -> bool:
+    position = 0
+    for fragment in fragments:
+        found = haystack.find(join(fragment), position)
+        if found < 0:
+            return False
+        position = found + 1
+    return True
 
 
 def quote_status(quote: str, paper: _PaperText) -> str:
     """Classify one quote as ``verbatim``, ``near`` or ``not_found``.
 
-    Words are compared after normalization (punctuation ignored).  Ellipses split
-    a quote into fragments that must appear in order; fragments shorter than
-    three words can't be checked, so a quote with any of them is at best
+    Words are compared after normalization (punctuation ignored), and also with
+    spaces removed, since some PDFs extract with words glued together.  Ellipses
+    split a quote into fragments that must appear in order; fragments shorter
+    than three words can't be checked, so a quote with any of them is at best
     ``near``.
     """
     fragments = [f for f in (_tokens(part) for part in _ELLIPSIS.split(quote)) if f]
@@ -83,16 +100,13 @@ def quote_status(quote: str, paper: _PaperText) -> str:
     if not checkable:
         return "not_found"
 
-    position = 0
-    for fragment in checkable:
-        found = paper.joined.find(" " + " ".join(fragment) + " ", position)
-        if found < 0:
-            break
-        position = found + 1
-    else:
+    unspaced_ok = all(len("".join(f)) >= _MIN_UNSPACED_CHARS for f in checkable)
+    if _in_order(checkable, paper.joined, _spaced) or (
+        unspaced_ok and _in_order(checkable, paper.squashed, "".join)
+    ):
         return "verbatim" if len(checkable) == len(fragments) else "near"
 
-    if all(" " + " ".join(f) + " " in paper.joined for f in checkable):
+    if all(_spaced(f) in paper.joined for f in checkable):
         return "not_found"  # every fragment is verbatim but they're stitched out of order
     for fragment in checkable:
         grams = _ngrams(fragment, _NGRAM)

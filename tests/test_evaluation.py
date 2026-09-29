@@ -155,6 +155,19 @@ def test_score_gold_first_author_forms(mock_part1_dict, mock_part2_dict, gold_au
     assert score_gold(summary, {"first_author": gold_author}) == {"first_author": expected}
 
 
+@pytest.mark.parametrize(
+    "predicted, gold", [("Jan de Groot", "Groot"), ("F. Vallés", "Federico Paredes-Vallés")]
+)
+def test_score_gold_first_author_accepts_a_partial_surname(
+    mock_part1_dict, mock_part2_dict, predicted, gold
+):
+    """Particles and double surnames are written either way in papers and gold files."""
+    combined = _combined(mock_part1_dict, mock_part2_dict)
+    combined["metadata"]["authors"] = [predicted]
+    summary = PaperSummary(**combined)
+    assert score_gold(summary, {"first_author": gold}) == {"first_author": True}
+
+
 def test_score_gold_non_research_label(mock_part1_dict, mock_part2_dict):
     summary = PaperSummary(**_combined(mock_part1_dict, mock_part2_dict))
     assert score_gold(summary, {"paper_type": "non_research"}) == {"paper_type": False}

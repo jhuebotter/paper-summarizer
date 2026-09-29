@@ -465,3 +465,60 @@ def test_classification_contract_lists_exactly_the_allowed_labels():
             continue  # defined in learning-paradigms.md, checked separately
         line = re.search(rf'"{name}": "([^"]+)"', contract).group(1)
         assert set(line.split(" | ")) == set(labels(field.annotation)), name
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (
+            [{"finding": "SNN matches ANN", "source": "Fig. 2"}],
+            ["SNN matches ANN (Source: Fig. 2)"],
+        ),
+        (
+            [{"finding": "27 uJ per inference", "evidence": "Measured", "source": "Tbl. 2"}],
+            ["27 uJ per inference (Measured) (Source: Tbl. 2)"],
+        ),
+        ("one finding (Claimed) (Source: Sec. 1)", ["one finding (Claimed) (Source: Sec. 1)"]),
+        (  # the word "Measured" in the text is not the evidence tag
+            [{"text": "Measured energy drops", "evidence": "Measured", "source": "Fig. 3"}],
+            ["Measured energy drops (Measured) (Source: Fig. 3)"],
+        ),
+        (  # tags already written into the text are not repeated
+            [
+                {
+                    "finding": "x (Reported) (Source: Tbl. 1)",
+                    "evidence": "Reported",
+                    "source": "Tbl. 1",
+                }
+            ],
+            ["x (Reported) (Source: Tbl. 1)"],
+        ),
+        (None, []),
+    ],
+)
+def test_notable_findings_accept_objects_and_bare_strings(mock_part1_dict, value, expected):
+    """Regression: models returned {finding, source} objects or a bare string, each
+    costing a schema-repair call."""
+    part1 = SummaryPart1Primary(**{**_part1_fields(mock_part1_dict), "notable_findings": value})
+    assert part1.notable_findings == expected
+
+
+def test_synthesis_notable_findings_accept_objects():
+    text_fields = [
+        name
+        for name, field in SummaryPart1Synthesis.model_fields.items()
+        if field.annotation is str
+    ]
+    part1 = SummaryPart1Synthesis(
+        paper_type="synthesis",
+        notable_findings=[{"finding": "72 papers surveyed", "source": "Sec. 2"}],
+        **dict.fromkeys(text_fields, "x"),
+    )
+    assert part1.notable_findings == ["72 papers surveyed (Source: Sec. 2)"]
+
+
+def test_notable_findings_reject_unrecognized_objects(mock_part1_dict):
+    with pytest.raises(ValidationError):
+        SummaryPart1Primary(
+            **{**_part1_fields(mock_part1_dict), "notable_findings": [{"note": "x"}]}
+        )

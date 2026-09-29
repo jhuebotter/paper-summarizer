@@ -41,7 +41,7 @@ uv run summarize-papers --source input_papers
 1. Discover PDFs under `--source` (recursive, `.pdf` in any case) or take one `--file`.
 2. Extract text, or reuse the cache `<sha256>.<extractor>.md`; drop the reference section (`--strip-references`, on by default).
 3. Build the prompt from `skill_data/references/*.md` (~11k tokens) plus the paper text (up to `--max-chars`).
-4. Call the backend; validate and repair the JSON; render markdown.
+4. Call the backend; validate and repair the JSON (a citation key that doesn't start with part of the first author's name plus the year is rebuilt, e.g. `ckl2024local` → `stockl2024local`); render markdown.
 5. Write `output_summaries/<paper_type>/<citation_key>_summary.md` and `.json` (versioned `_v2`, `_v3`, … instead of overwriting) and record the paper in `output_summaries/processed.jsonl`.
 
 `summarize-papers render [--output-dir DIR]` rebuilds every markdown file from its JSON sidecar without any LLM calls, e.g. after changing the template.
@@ -145,7 +145,7 @@ Environment variables (a `.env` file in the working directory is loaded automati
 
 Defaults: `--base-url https://openrouter.ai/api/v1`, `--model nvidia/nemotron-3-super-120b-a12b:free` (free, 262k context, checked 2026-09-29).
 
-- Free (`:free`) models allow 20 requests per minute, and 50 per day until you've bought $10 of credits (then 1,000 per day). The preflight shows your key's spend and limits. When the daily cap or your credits run out, the run stops cleanly: queued papers are skipped, not failed, so rerun later to continue. Per-minute 429s are retried, honouring `Retry-After`.
+- Free (`:free`) models allow 20 requests per minute, and 50 per day until you've bought $10 of credits (then 1,000 per day). The preflight shows your key's spend and limits. When the daily cap or your credits run out, the run stops cleanly: queued papers are skipped, not failed, so rerun later to continue. Transient errors are retried up to 3 times: per-minute 429s wait for `Retry-After` or the reset time OpenRouter reports (up to 60 s), other 429s (free models throttled upstream) back off from 5 s, and provider errors that OpenRouter returns inside a 200 response are retried too.
 - Free endpoints may log prompts. That's fine for published papers; don't send unpublished work.
 - A paid fallback within a few-cents budget is `--model meta/muse-spark-1.3-contributor` (~$0.10 / $0.20 per million input/output tokens, about **$0.007** per paper).
 
@@ -156,7 +156,7 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 - `--source DIR` / `--file PDF`: batch or single-file mode.
 - `--force-summary`: re-summarize papers already in the processed index (keeps the extraction cache).
 - `--reparse`: also re-run extraction (implies `--force-summary`).
-- `--extractor {auto,docling,pypdf}`: `auto` uses docling if installed, falling back to pypdf.
+- `--extractor {auto,docling,pypdf}`: `auto` uses docling if installed, falling back to pypdf. docling runs without OCR (about 1–5 s per paper) and uses OCR only for PDFs with no text layer (scans). pypdf can glue words together on some PDFs; prefer docling.
 - `--output-dir DIR`: output root (default `output_summaries`).
 - `--model`, `--base-url`: backend selection.
 - `--max-chars N`: paper-text budget (default 200,000 ≈ 50k tokens). Longer text is truncated, and a warning is logged. For models with a smaller context window (known from OpenRouter), the text is cut further so the prompt and reply fit.
@@ -172,7 +172,7 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 ## Skip and rerun behavior
 
 - Papers are identified by content (SHA-256): anything in `output_summaries/processed.jsonl` is skipped even after moving or renaming the PDF, and identical copies in one batch are processed once. A changed PDF counts as a new paper. Older index entries (path only, or a legacy `processed.txt`) are migrated when their PDF is next seen, unless the file changed after it was summarized, in which case it is summarized again.
-- Extraction caches are per content and extractor (`<sha256>.docling.md`, `<sha256>.pypdf.md`). Caches that earlier versions wrote next to the PDFs are still read unless they are older than the PDF.
+- Extraction caches are per content and extractor (`<sha256>.docling.md`, `<sha256>.pypdf.md`). Caches that earlier versions wrote next to the PDFs (`<stem>.docling.md`, `<stem>.pypdf.md`) are still read unless they are older than the PDF; the first version's bare `<stem>.md` is ignored because it may hold pypdf text under any extractor.
 - Failed papers are not recorded, so the next run retries them. The exit code is 1 if any paper failed.
 - Ctrl-C cancels queued papers (exit code 130). Finished papers are kept and skipped on the next run.
 - A run stopped by a quota or `--max-cost` exits with 1 and says why; rerunning continues where it stopped.
@@ -204,7 +204,7 @@ Duplicate PDFs (same content) are evaluated once. Successful LLM responses are c
 **Gold labels:** `eval/gold.jsonl` holds one `{"sha256", "file", "labels"}` object per paper. The labels are `is_research_paper`, `paper_type` (`primary`/`synthesis`/`non_research`), `synthesis_subtype`, `year`, `first_author` (surname), `title`, and the typed Part 2 labels `classification.inference_hardware`, `.architecture`, `.credit_assignment`, `.learning_regime` and `.paradigm_families` (a list; compared as a set). Use the exact labels from `skill_data/references/json-output-contract.md`. `null` means not labelled, and the field is skipped.
 
 **Metrics** (a rate with nothing to count is reported as n/a):
-- **Quotes:** each `citable_snippets` quote is checked against the exact text the model saw, word by word, ignoring punctuation, hyphenation, ligatures and `[12]`-style citations. It counts as verbatim, near (≥70% of its word 3-grams found), or not found. Parts separated by an ellipsis must appear in order, and parts shorter than three words make a quote at best near.
+- **Quotes:** each `citable_snippets` quote is checked against the exact text the model saw, word by word, ignoring punctuation, hyphenation, ligatures and `[12]`-style citations. It counts as verbatim, near (≥70% of its word 3-grams found), or not found. Parts separated by an ellipsis must appear in order, and parts shorter than three words make a quote at best near. For PDFs whose extraction glues words together, parts of 20+ letters also match with spaces ignored.
 - **Anchor coverage:** the share of sentences with a number that carry a `Source:` anchor in the same or the next sentence. Years in date context, references such as "Table 3", chip names such as "Loihi 2", and identifiers such as "CIFAR-10" don't count as numbers.
 - **First person:** uses of "we/our/us" outside quoted text, per 1k words.
 - Quality columns cover successful papers only; a failed paper counts as wrong for each of its gold labels.

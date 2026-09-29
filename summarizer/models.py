@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal, get_args, get_origin
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # Type alias
@@ -96,6 +96,30 @@ class OpenProblemsSynthesis(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _findings_as_strings(value: object) -> object:
+    """Accept a bare string or ``{finding, evidence, source}`` objects for
+    ``notable_findings``; some models return these instead of strings, and a
+    schema repair for it costs a full extra call."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, list):
+        return value
+    out = []
+    for item in value:
+        text = (item.get("finding") or item.get("text")) if isinstance(item, dict) else None
+        if not isinstance(text, str):
+            out.append(item)
+            continue
+        for key, template in (("evidence", " ({})"), ("source", " (Source: {})")):
+            if isinstance(item.get(key), str) and item[key]:
+                tag = template.format(item[key])
+                text += "" if tag.strip() in text else tag
+        out.append(text)
+    return out
+
+
 class SummaryPart1Primary(BaseModel):
     """Part 1 summary fields for a primary research paper (≤600 words total)."""
 
@@ -114,6 +138,8 @@ class SummaryPart1Primary(BaseModel):
     notable_findings: list[str] = Field(default_factory=list)
     citable_snippets: list[CitableSnippet] = Field(default_factory=list)
     relevance: str
+
+    _findings = field_validator("notable_findings", mode="before")(_findings_as_strings)
 
 
 class SummaryPart1Synthesis(BaseModel):
@@ -140,6 +166,8 @@ class SummaryPart1Synthesis(BaseModel):
     notable_findings: list[str] = Field(default_factory=list)
     citable_snippets: list[CitableSnippet] = Field(default_factory=list)
     relevance: str
+
+    _findings = field_validator("notable_findings", mode="before")(_findings_as_strings)
 
 
 class SummaryPart1NonResearch(BaseModel):
