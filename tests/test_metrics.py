@@ -134,6 +134,14 @@ def test_quote_status(quote, status):
     assert _status(quote) == status
 
 
+def test_quote_matches_text_extracted_with_glued_words():
+    """Regression: pypdf glued the words of some PDFs ("Thedevelopmentprocess..."), so
+    correctly spaced quotes of them were reported as not found."""
+    paper = "oftheendeffector.Thedevelopmentprocessinvolvedfourstages:(1)Designing"
+    assert _status("The development process involved four stages", paper) == "verbatim"
+    assert _status("The design process involved four stages", paper) == "not_found"
+
+
 def test_quote_ignores_punctuation_and_numeric_citations():
     paper = "As shown in prior work [12], spiking networks can control robot arms."
     assert _status("As shown in prior work, spiking networks can control robot arms", paper) == (
