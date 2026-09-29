@@ -13,9 +13,7 @@ from summarizer.batch import (
     save_processed_index,
     should_skip,
 )
-from summarizer.models import BatchReport, Config, PipelineError
-from summarizer.llm import CostAccumulator
-
+from summarizer.models import Config, PipelineError
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -223,7 +221,6 @@ def test_run_batch_processes_all_pdfs(tmp_path, config):
     assert report.skipped == 0
     assert report.failed == 0
     assert mock_process.call_count == 2
-
 
 
 def test_run_batch_uses_version_suffix_when_output_exists(tmp_path, config):
@@ -457,5 +454,3 @@ def test_run_batch_report_has_total_cost(tmp_path, config):
 
     assert hasattr(report, "total_cost")
     assert isinstance(report.total_cost, float)
-
-

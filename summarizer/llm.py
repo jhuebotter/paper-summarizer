@@ -37,11 +37,11 @@ _MAX_TRANSIENT_RETRIES = 2
 class ModelPricing:
     """USD cost per token / per request (0.0 = free or unknown)."""
 
-    prompt: float = 0.0            # per input token
-    completion: float = 0.0        # per output token
-    reasoning: float = 0.0         # per reasoning token
-    request: float = 0.0           # flat per-request fee
-    context_length: int = 0        # max context in tokens (informational)
+    prompt: float = 0.0  # per input token
+    completion: float = 0.0  # per output token
+    reasoning: float = 0.0  # per reasoning token
+    request: float = 0.0  # flat per-request fee
+    context_length: int = 0  # max context in tokens (informational)
 
 
 @dataclass

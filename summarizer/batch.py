@@ -31,7 +31,6 @@ from summarizer.models import BatchReport, Config, FailedPaper, PipelineError
 from summarizer.pipeline import process_pdf
 from summarizer.renderer import render_summary
 
-
 # ---------------------------------------------------------------------------
 # PDF discovery
 # ---------------------------------------------------------------------------
@@ -197,9 +196,7 @@ def run_batch(source_dir: Path, config: Config) -> BatchReport:
     logger.info("Discovered PDFs: %d", total)
     logger.info("Processed-index entries loaded: %d", len(processed_set))
     if config.force_summary:
-        logger.info(
-            "force-summary enabled: processed index is ignored for skip filtering"
-        )
+        logger.info("force-summary enabled: processed index is ignored for skip filtering")
 
     n_processed = 0
     n_skipped = 0
@@ -285,22 +282,16 @@ def run_batch(source_dir: Path, config: Config) -> BatchReport:
                         processed_set[abs_path] = []
                     processed_set[abs_path].append(str(output_path))
                     save_processed_index(config.output_dir, processed_set)
-                    logger.info(
-                        "  [%d/%d] Written: %s", run_idx, run_total, output_path
-                    )
+                    logger.info("  [%d/%d] Written: %s", run_idx, run_total, output_path)
                     n_processed += 1
                 except PipelineError as exc:
                     logger.error("  [%d/%d] Failed: %s", run_idx, run_total, exc)
                     n_failed += 1
-                    failed_papers.append(
-                        FailedPaper(pdf_path=str(pdf_path), error=str(exc))
-                    )
+                    failed_papers.append(FailedPaper(pdf_path=str(pdf_path), error=str(exc)))
                 except Exception as exc:
                     logger.error("  [%d/%d] Failed: %s", run_idx, run_total, exc)
                     n_failed += 1
-                    failed_papers.append(
-                        FailedPaper(pdf_path=str(pdf_path), error=str(exc))
-                    )
+                    failed_papers.append(FailedPaper(pdf_path=str(pdf_path), error=str(exc)))
                 finally:
                     progress.update(1)
                     progress.set_postfix(

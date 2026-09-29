@@ -1,32 +1,29 @@
 """Tests for summarizer/models.py — pydantic models, dataclass Config, exceptions."""
 
-import pytest
 from pathlib import Path
+
+import pytest
 from pydantic import ValidationError
 
 from summarizer.models import (
-    LLMResponse,
-    PaperMetadata,
-    SummaryPart1Primary,
-    SummaryPart1Synthesis,
-    SummaryPart1NonResearch,
-    SummaryPart2,
-    PaperSummary,
+    BatchReport,
     Config,
     FailedPaper,
-    BatchReport,
-    ParseError,
-    LLMError,
+    LLMResponse,
+    PaperMetadata,
+    PaperSummary,
     PipelineError,
+    SummaryPart1NonResearch,
+    SummaryPart1Primary,
+    SummaryPart1Synthesis,
+    SummaryPart2,
 )
 
 # ---------------------------------------------------------------------------
 # Helpers — split the flat conftest mock dict into metadata vs. part1 keys
 # ---------------------------------------------------------------------------
 
-_METADATA_ONLY_KEYS = frozenset(
-    {"citation_key", "title", "authors", "year", "venue", "tags"}
-)
+_METADATA_ONLY_KEYS = frozenset({"citation_key", "title", "authors", "year", "venue", "tags"})
 
 
 def _meta_fields(d: dict) -> dict:
@@ -325,9 +322,7 @@ def test_llm_response_primary_paper(mock_part1_dict, mock_part2_dict):
     metadata["is_research_paper"] = True
     metadata["rejection_reason"] = None
     part1 = {
-        k: mock_part1_dict[k]
-        for k in mock_part1_dict
-        if k not in (meta_keys - {"paper_type"})
+        k: mock_part1_dict[k] for k in mock_part1_dict if k not in (meta_keys - {"paper_type"})
     }
     response = LLMResponse(
         metadata=metadata,

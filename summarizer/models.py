@@ -8,7 +8,7 @@ reporting, and runtime configuration.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal, Union
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -48,18 +48,14 @@ class PaperMetadata(BaseModel):
             if self.paper_type is None:
                 raise ValueError("paper_type is required when is_research_paper=true")
             if self.rejection_reason is not None:
-                raise ValueError(
-                    "rejection_reason must be null when is_research_paper=true"
-                )
+                raise ValueError("rejection_reason must be null when is_research_paper=true")
             return self
 
         # Non-research document path
         if self.paper_type is not None:
             raise ValueError("paper_type must be null when is_research_paper=false")
         if not self.rejection_reason:
-            raise ValueError(
-                "rejection_reason is required when is_research_paper=false"
-            )
+            raise ValueError("rejection_reason is required when is_research_paper=false")
         return self
 
 
@@ -155,11 +151,7 @@ class SummaryPart1NonResearch(BaseModel):
 
 
 SummaryPart1 = Annotated[
-    Union[
-        SummaryPart1Primary,
-        SummaryPart1Synthesis,
-        SummaryPart1NonResearch,
-    ],
+    SummaryPart1Primary | SummaryPart1Synthesis | SummaryPart1NonResearch,
     Field(discriminator="paper_type"),
 ]
 """Discriminated union: pydantic selects the correct variant by ``paper_type``."""

@@ -40,7 +40,7 @@ from summarizer.batch import (
     should_skip,
 )
 from summarizer.log import setup_logging
-from summarizer.models import Config, PipelineError, _DEFAULT_MAX_CHARS
+from summarizer.models import _DEFAULT_MAX_CHARS, Config, PipelineError
 from summarizer.pipeline import process_pdf
 from summarizer.renderer import render_summary
 

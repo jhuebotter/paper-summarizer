@@ -1,7 +1,5 @@
 """Tests for summarizer/renderer.py — PaperSummary → markdown string."""
 
-import pytest
-from pathlib import Path
 
 from summarizer.models import (
     PaperMetadata,
@@ -17,9 +15,7 @@ from summarizer.renderer import render_summary
 # Helpers — reuse conftest mock data split logic
 # ---------------------------------------------------------------------------
 
-_METADATA_ONLY_KEYS = frozenset(
-    {"citation_key", "title", "authors", "year", "venue", "tags"}
-)
+_METADATA_ONLY_KEYS = frozenset({"citation_key", "title", "authors", "year", "venue", "tags"})
 
 
 def _make_summary(mock_part1_dict, mock_part2_dict) -> PaperSummary:
@@ -28,9 +24,7 @@ def _make_summary(mock_part1_dict, mock_part2_dict) -> PaperSummary:
     meta_data["is_research_paper"] = True
     meta_data["rejection_reason"] = None
     meta = PaperMetadata(**meta_data)
-    part1_data = {
-        k: v for k, v in mock_part1_dict.items() if k not in _METADATA_ONLY_KEYS
-    }
+    part1_data = {k: v for k, v in mock_part1_dict.items() if k not in _METADATA_ONLY_KEYS}
     part1 = SummaryPart1Primary(**part1_data)
     part2 = SummaryPart2(**mock_part2_dict)
     return PaperSummary(metadata=meta, part1=part1, part2=part2)
@@ -213,25 +207,19 @@ def test_render_non_research_has_no_part2():
 
 def _make_bloated_primary(mock_part1_dict, mock_part2_dict) -> PaperSummary:
     """Return a primary PaperSummary whose Part 1 prose is far over the 600-word limit."""
-    bloated = (
-        "word " * 1000
-    )  # 1000 words — exceeds 150% of the 600-word limit (threshold: 900)
+    bloated = "word " * 1000  # 1000 words — exceeds 150% of the 600-word limit (threshold: 900)
     meta_data = {k: mock_part1_dict[k] for k in (*_METADATA_ONLY_KEYS, "paper_type")}
     meta_data["is_research_paper"] = True
     meta_data["rejection_reason"] = None
     meta = PaperMetadata(**meta_data)
-    part1_data = {
-        k: v for k, v in mock_part1_dict.items() if k not in _METADATA_ONLY_KEYS
-    }
+    part1_data = {k: v for k, v in mock_part1_dict.items() if k not in _METADATA_ONLY_KEYS}
     part1_data["problem_motivation"] = bloated
     part1 = SummaryPart1Primary(**part1_data)
     part2 = SummaryPart2(**mock_part2_dict)
     return PaperSummary(metadata=meta, part1=part1, part2=part2)
 
 
-def test_render_warns_when_part1_exceeds_word_limit(
-    mock_part1_dict, mock_part2_dict, caplog
-):
+def test_render_warns_when_part1_exceeds_word_limit(mock_part1_dict, mock_part2_dict, caplog):
     import logging
 
     with caplog.at_level(logging.WARNING, logger="summarizer.renderer"):

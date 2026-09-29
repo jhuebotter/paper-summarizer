@@ -1,9 +1,10 @@
 """Tests for summarizer/prompts.py — reference loading and prompt building."""
 
-import pytest
 from pathlib import Path
 
-from summarizer.prompts import load_references, build_combined_prompt
+import pytest
+
+from summarizer.prompts import build_combined_prompt, load_references
 
 PROJECT_ROOT = Path(__file__).parent.parent
 REFERENCES_DIR = PROJECT_ROOT / "skill_data" / "references"
@@ -175,15 +176,34 @@ def test_load_references_alphabetical_order(tmp_path):
 _PROMPT = build_combined_prompt("text", "refs", "paper.pdf")
 
 _PRIMARY_PART1_KEYS = [
-    "tldr", "problem_motivation", "core_contribution", "methods", "results",
-    "key_takeaways", "limitations", "open_problems_future_directions",
-    "critical_assessment", "notable_findings", "citable_snippets", "relevance",
+    "tldr",
+    "problem_motivation",
+    "core_contribution",
+    "methods",
+    "results",
+    "key_takeaways",
+    "limitations",
+    "open_problems_future_directions",
+    "critical_assessment",
+    "notable_findings",
+    "citable_snippets",
+    "relevance",
 ]
 _SYNTHESIS_PART1_KEYS = [
-    "tldr", "target_papers_field", "scope_coverage", "taxonomy_organization",
-    "core_argument", "synthesis_contribution", "key_claims_narrative",
-    "key_takeaways", "limitations", "open_problems_future_directions",
-    "critical_assessment", "notable_findings", "citable_snippets", "relevance",
+    "tldr",
+    "target_papers_field",
+    "scope_coverage",
+    "taxonomy_organization",
+    "core_argument",
+    "synthesis_contribution",
+    "key_claims_narrative",
+    "key_takeaways",
+    "limitations",
+    "open_problems_future_directions",
+    "critical_assessment",
+    "notable_findings",
+    "citable_snippets",
+    "relevance",
 ]
 _NON_RESEARCH_PART1_KEYS = ["paper_type", "note"]
 

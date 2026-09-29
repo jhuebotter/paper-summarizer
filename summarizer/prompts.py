@@ -23,9 +23,7 @@ def load_references(references_dir: Path) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def build_combined_prompt(
-    paper_text: str, references: str, source_filename: str
-) -> str:
+def build_combined_prompt(paper_text: str, references: str, source_filename: str) -> str:
     """Build the combined prompt for a single LLM call.
 
     The LLM must return one JSON object with exactly three top-level keys:

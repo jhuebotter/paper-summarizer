@@ -4,23 +4,23 @@ import json
 import logging
 import os
 import threading
-import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
-from summarizer.models import Config, LLMError
+import pytest
+
 from summarizer.llm import (
+    CostAccumulator,
     LMStudioClient,
     ModelPricing,
     UsageStats,
-    CostAccumulator,
-    create_client,
-    call_llm,
-    fetch_model_pricing,
+    _calculate_cost,
     _extract_json,
     _extract_usage,
-    _calculate_cost,
+    call_llm,
+    create_client,
+    fetch_model_pricing,
 )
-
+from summarizer.models import Config, LLMError
 
 # ---------------------------------------------------------------------------
 # create_client
@@ -486,7 +486,6 @@ _FAKE_PRICING_RESPONSE = {
 
 def _make_urlopen_mock(response_body: bytes):
     """Helper: mock urllib.request.urlopen to return a readable response."""
-    import io
 
     class _FakeResponse:
         def __enter__(self):
@@ -693,7 +692,7 @@ def test_call_llm_json_repair_tokens_added_to_accumulator():
     repair_usage = UsageStats(input_tokens=80, output_tokens=40)
 
     mock_client.complete.side_effect = [
-        MagicMock(text='{"k": "v"', usage=first_usage),   # malformed
+        MagicMock(text='{"k": "v"', usage=first_usage),  # malformed
         MagicMock(text='{"k": "v"}', usage=repair_usage),  # repaired
     ]
 
@@ -706,10 +705,8 @@ def test_call_llm_json_repair_tokens_added_to_accumulator():
 
 def test_pipeline_schema_repair_tokens_added_to_accumulator():
     """Tokens from a schema-validation repair call are added to the accumulator."""
-    from pydantic import ValidationError
-    from summarizer.llm import CostAccumulator, UsageStats, ModelPricing
+    from summarizer.llm import CostAccumulator, ModelPricing, UsageStats
     from summarizer.pipeline import _validate_with_schema_repair
-    from summarizer.models import LLMResponse
 
     pricing = ModelPricing()
     mock_client = MagicMock()
@@ -767,6 +764,7 @@ def test_pipeline_schema_repair_tokens_added_to_accumulator():
         # Instead, directly test that when call_llm is invoked in the repair loop,
         # the accumulator is forwarded.
         from pathlib import Path
+
         _validate_with_schema_repair(
             raw=good_raw,
             client=mock_client,
@@ -784,6 +782,7 @@ def test_pipeline_schema_repair_tokens_added_to_accumulator():
     with patch("summarizer.pipeline.call_llm", return_value=good_raw) as mock_repair:
         acc2 = CostAccumulator()
         from pathlib import Path
+
         try:
             _validate_with_schema_repair(
                 raw=bad_raw,
@@ -796,6 +795,4 @@ def test_pipeline_schema_repair_tokens_added_to_accumulator():
             pass
         # The repair call_llm must have been called with accumulator=acc2
         for c in mock_repair.call_args_list:
-            assert c.kwargs.get("accumulator") is acc2 or (
-                len(c.args) >= 3 and c.args[2] is acc2
-            )
+            assert c.kwargs.get("accumulator") is acc2 or (len(c.args) >= 3 and c.args[2] is acc2)

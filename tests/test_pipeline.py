@@ -1,16 +1,17 @@
 """Tests for summarizer/pipeline.py — end-to-end per-paper orchestration (mocked LLM)."""
 
 import json
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from summarizer.llm import CostAccumulator, ModelPricing, UsageStats
-from summarizer.models import Config, LLMError, ParseError, PipelineError, PaperSummary
+from summarizer.models import Config, PaperSummary, ParseError, PipelineError
 from summarizer.pipeline import (
-    process_pdf,
-    _sanitize_citation_key,
     _author_surname_token,
+    _sanitize_citation_key,
+    process_pdf,
 )
 
 # ---------------------------------------------------------------------------
@@ -51,9 +52,7 @@ def _make_combined_dict(part1_dict: dict, part2_dict: dict) -> dict:
     metadata = {k: part1_dict[k] for k in meta_keys}
     metadata["is_research_paper"] = True
     metadata["rejection_reason"] = None
-    part1 = {
-        k: part1_dict[k] for k in part1_dict if k not in (meta_keys - {"paper_type"})
-    }
+    part1 = {k: part1_dict[k] for k in part1_dict if k not in (meta_keys - {"paper_type"})}
     return {"metadata": metadata, "part1": part1, "part2": part2_dict}
 
 
@@ -61,9 +60,7 @@ def _mock_llm_combined(combined_dict: dict):
     """Return a patcher that makes call_llm return the combined dict once."""
     mock_client = MagicMock()
     mock_client.complete.return_value = MagicMock(text=json.dumps(combined_dict))
-    return patch(
-        "summarizer.pipeline.create_client", return_value=mock_client
-    ), mock_client
+    return patch("summarizer.pipeline.create_client", return_value=mock_client), mock_client
 
 
 # ---------------------------------------------------------------------------
@@ -71,9 +68,7 @@ def _mock_llm_combined(combined_dict: dict):
 # ---------------------------------------------------------------------------
 
 
-def test_process_pdf_returns_paper_summary(
-    fake_pdf, config, mock_part1_dict, mock_part2_dict
-):
+def test_process_pdf_returns_paper_summary(fake_pdf, config, mock_part1_dict, mock_part2_dict):
     """Full pipeline run returns a validated PaperSummary for a primary paper."""
     combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
     client_patcher, mock_client = _mock_llm_combined(combined)
@@ -88,9 +83,7 @@ def test_process_pdf_returns_paper_summary(
     assert summary.part2.neuron_model == mock_part2_dict["neuron_model"]
 
 
-def test_process_pdf_makes_exactly_one_llm_call(
-    fake_pdf, config, mock_part1_dict, mock_part2_dict
-):
+def test_process_pdf_makes_exactly_one_llm_call(fake_pdf, config, mock_part1_dict, mock_part2_dict):
     """Exactly one LLM call is made per paper (combined call)."""
     combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
     client_patcher, mock_client = _mock_llm_combined(combined)
@@ -101,9 +94,7 @@ def test_process_pdf_makes_exactly_one_llm_call(
     assert mock_client.complete.call_count == 1
 
 
-def test_process_pdf_prompt_contains_paper_text(
-    fake_pdf, config, mock_part1_dict, mock_part2_dict
-):
+def test_process_pdf_prompt_contains_paper_text(fake_pdf, config, mock_part1_dict, mock_part2_dict):
     """The single prompt contains the paper text."""
     combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
     client_patcher, mock_client = _mock_llm_combined(combined)
@@ -215,9 +206,9 @@ def test_sanitize_citation_key(value, expected):
 @pytest.mark.parametrize(
     "author_name, expected",
     [
-        ("F. Paredes-Vallés", "valles"),   # "First. Surname" → last token is surname
-        ("Müller J.", "j"),                # "Surname I." → last token is initial (by design)
-        ("J. Müller", "muller"),           # "I. Surname" → last token is surname
+        ("F. Paredes-Vallés", "valles"),  # "First. Surname" → last token is surname
+        ("Müller J.", "j"),  # "Surname I." → last token is initial (by design)
+        ("J. Müller", "muller"),  # "I. Surname" → last token is surname
         ("Travis DeWolf", "dewolf"),
         ("Smith", "smith"),
     ],
@@ -268,12 +259,22 @@ def test_process_pdf_non_research(fake_pdf, config):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("config_attr,config_value,kwarg_name,expected", [
-    ("reparse", True, "reparse", True),
-    ("extractor", "pypdf", "extractor", "pypdf"),
-])
+@pytest.mark.parametrize(
+    "config_attr,config_value,kwarg_name,expected",
+    [
+        ("reparse", True, "reparse", True),
+        ("extractor", "pypdf", "extractor", "pypdf"),
+    ],
+)
 def test_process_pdf_forwards_parser_config(
-    fake_pdf, config, mock_part1_dict, mock_part2_dict, config_attr, config_value, kwarg_name, expected
+    fake_pdf,
+    config,
+    mock_part1_dict,
+    mock_part2_dict,
+    config_attr,
+    config_value,
+    kwarg_name,
+    expected,
 ):
     """Config parser flags are forwarded to parse_pdf as keyword arguments."""
     setattr(config, config_attr, config_value)
@@ -307,10 +308,13 @@ def test_process_pdf_parse_error_raises_pipeline_error(fake_pdf, config):
 _BAD_RESPONSE_JSON = json.dumps({"metadata": {"paper_type": "primary"}, "part1": {}, "part2": {}})
 
 
-@pytest.mark.parametrize("side_effect,return_text,expected_calls", [
-    (Exception("connection refused"), None, 1),
-    (None, _BAD_RESPONSE_JSON, 3),
-])
+@pytest.mark.parametrize(
+    "side_effect,return_text,expected_calls",
+    [
+        (Exception("connection refused"), None, 1),
+        (None, _BAD_RESPONSE_JSON, 3),
+    ],
+)
 def test_process_pdf_llm_errors_raise_pipeline_error(
     fake_pdf, config, side_effect, return_text, expected_calls
 ):
@@ -380,9 +384,7 @@ def test_process_pdf_creates_client_when_none_provided(
     mock_create.assert_called_once_with(config)
 
 
-def test_process_pdf_accumulator_is_updated(
-    fake_pdf, config, mock_part1_dict, mock_part2_dict
-):
+def test_process_pdf_accumulator_is_updated(fake_pdf, config, mock_part1_dict, mock_part2_dict):
     """When accumulator is provided, it is updated after the LLM call."""
     combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
     mock_client = _make_mock_client_for_combined(combined)

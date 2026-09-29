@@ -6,7 +6,7 @@ responsible for writing the returned string to disk.
 """
 
 import logging
-from typing import Sequence
+from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
 

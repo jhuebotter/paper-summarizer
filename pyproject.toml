@@ -32,3 +32,14 @@ pythonpath = ["."]
 markers = [
     "integration: marks tests that require real external resources (PDFs, LM Studio)",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"

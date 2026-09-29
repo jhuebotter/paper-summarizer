@@ -4,8 +4,8 @@ Single LLM call per paper: metadata + Part 1 + Part 2 are requested
 in one combined JSON response.
 """
 
-import logging
 import json
+import logging
 import re
 import unicodedata
 from pathlib import Path
@@ -17,7 +17,6 @@ from summarizer.models import (
     Config,
     LLMResponse,
     PaperSummary,
-    ParseError,
     PipelineError,
 )
 from summarizer.parser import parse_pdf
@@ -101,9 +100,7 @@ def _run_pipeline(
         accumulator=accumulator,
     )
 
-    return PaperSummary(
-        metadata=response.metadata, part1=response.part1, part2=response.part2
-    )
+    return PaperSummary(metadata=response.metadata, part1=response.part1, part2=response.part2)
 
 
 def _validate_with_schema_repair(
@@ -312,9 +309,7 @@ def _build_citation_key(metadata: dict, pdf_path: Path) -> str:
     authors = metadata.get("authors")
     first_author_token = "paper"
     if isinstance(authors, list) and authors:
-        first_author_token = (
-            _author_surname_token(str(authors[0])) or first_author_token
-        )
+        first_author_token = _author_surname_token(str(authors[0])) or first_author_token
 
     title = metadata.get("title")
     title_token = _first_alnum_token(str(title)) if title else "paper"
@@ -343,9 +338,7 @@ def _author_surname_token(author_name: str) -> str:
         unicodedata.normalize("NFKD", author_name).encode("ascii", "ignore").decode("ascii")
     )
     tokens = [
-        t.lower()
-        for t in re.split(r"[^A-Za-z0-9]+", ascii_name)
-        if t and re.search(r"[a-zA-Z]", t)
+        t.lower() for t in re.split(r"[^A-Za-z0-9]+", ascii_name) if t and re.search(r"[a-zA-Z]", t)
     ]
     if not tokens:
         return ""

@@ -1,10 +1,8 @@
 """Tests for summarizer/log.py — logging setup."""
 
 import logging
-import pytest
 
 from summarizer.log import setup_logging
-
 
 # ---------------------------------------------------------------------------
 # setup_logging  (logger state reset handled by conftest._reset_summarizer_logger)
@@ -63,5 +61,3 @@ def test_setup_logging_is_idempotent():
     logger = logging.getLogger("summarizer")
     stream_handlers = [h for h in logger.handlers if type(h) is logging.StreamHandler]
     assert len(stream_handlers) == 1
-
-

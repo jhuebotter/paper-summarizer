@@ -1,15 +1,12 @@
 """Tests for summarizer/cli.py — argument parsing and high-level CLI behaviour."""
 
-import sys
 import urllib.error
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from summarizer.cli import _build_parser, _check_lm_studio, main
-from summarizer.models import Config, PaperSummary
-
+from summarizer.models import Config
 
 # ---------------------------------------------------------------------------
 # Argument parser
@@ -72,11 +69,14 @@ def test_parser_model_cli_overrides_env():
     assert args.model == "my-cli-model"
 
 
-@pytest.mark.parametrize("cli_flag,cli_value,config_attr,expected", [
-    ("--timeout", "300", "timeout_s", 300),
-    ("--workers", "6", "workers", 6),
-    ("--extractor", "pypdf", "extractor", "pypdf"),
-])
+@pytest.mark.parametrize(
+    "cli_flag,cli_value,config_attr,expected",
+    [
+        ("--timeout", "300", "timeout_s", 300),
+        ("--workers", "6", "workers", 6),
+        ("--extractor", "pypdf", "extractor", "pypdf"),
+    ],
+)
 def test_main_cli_flag_propagates_to_config(tmp_path, cli_flag, cli_value, config_attr, expected):
     """CLI flags are forwarded as the corresponding Config fields."""
     (tmp_path / "paper.pdf").write_bytes(b"%PDF")
@@ -159,9 +159,7 @@ def test_check_backend_strips_to_root_for_openrouter():
 
 def test_check_backend_http_error_is_treated_as_reachable():
     """A 403/404 HTTP response means the server is up (cloud backends need auth)."""
-    http_err = urllib.error.HTTPError(
-        url=None, code=403, msg="Forbidden", hdrs=None, fp=None
-    )
+    http_err = urllib.error.HTTPError(url=None, code=403, msg="Forbidden", hdrs=None, fp=None)
     with patch("urllib.request.urlopen", side_effect=http_err):
         _check_lm_studio("https://openrouter.ai/api/v1")  # should not raise
 
@@ -204,6 +202,7 @@ def test_main_dry_run_batch(tmp_path, capsys):
 def test_run_single_force_summary_creates_versioned_file(tmp_path):
     """--force-summary on a single file creates _v2.md instead of overwriting."""
     from unittest.mock import MagicMock
+
     from summarizer.cli import _run_single
 
     output_dir = tmp_path / "output_summaries"
@@ -212,9 +211,7 @@ def test_run_single_force_summary_creates_versioned_file(tmp_path):
     existing.write_text("# original", encoding="utf-8")
 
     abs_pdf = str((tmp_path / "paper.pdf").resolve())
-    (output_dir / "processed.txt").write_text(
-        f"{abs_pdf}, {existing}\n", encoding="utf-8"
-    )
+    (output_dir / "processed.txt").write_text(f"{abs_pdf}, {existing}\n", encoding="utf-8")
 
     config = Config(
         base_url="http://localhost:1234/v1",
@@ -249,9 +246,7 @@ def test_main_single_file_skips_when_in_processed_index(tmp_path, capsys):
     # Create output_dir and populate processed.txt
     output_dir = tmp_path / "output_summaries"
     output_dir.mkdir()
-    (output_dir / "processed.txt").write_text(
-        str(pdf.resolve()) + "\n", encoding="utf-8"
-    )
+    (output_dir / "processed.txt").write_text(str(pdf.resolve()) + "\n", encoding="utf-8")
 
     with (
         patch(
@@ -300,8 +295,9 @@ def test_parser_log_file_default_is_none():
 def test_run_batch_done_log_includes_cost(tmp_path, caplog):
     """_run_batch logs 'cost=' in the Done summary line."""
     import logging
+
     from summarizer.cli import _run_batch
-    from summarizer.models import Config, BatchReport
+    from summarizer.models import BatchReport, Config
 
     config = Config(
         base_url="http://localhost:1234/v1",

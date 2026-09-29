@@ -1,13 +1,13 @@
 """Tests for summarizer/parser.py — docling PDF-to-markdown wrapper with cache."""
 
 import logging
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from summarizer.models import ParseError
 from summarizer.parser import parse_pdf
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -64,9 +64,7 @@ def test_parse_pdf_raises_parse_error_on_docling_failure(tmp_path):
     pdf.write_bytes(b"not a real pdf")
 
     with patch("summarizer.parser.DocumentConverter") as MockConverter:
-        MockConverter.return_value.convert.side_effect = Exception(
-            "docling internal error"
-        )
+        MockConverter.return_value.convert.side_effect = Exception("docling internal error")
         with pytest.raises(ParseError, match="bad.pdf"):
             parse_pdf(pdf, max_chars=40_000)
 
@@ -221,13 +219,9 @@ def test_parse_pdf_falls_back_to_pypdf_on_docling_failure(tmp_path):
 
     with (
         patch("summarizer.parser.DocumentConverter") as MockConverter,
-        patch(
-            "summarizer.parser._extract_text_with_pypdf", return_value="fallback text"
-        ),
+        patch("summarizer.parser._extract_text_with_pypdf", return_value="fallback text"),
     ):
-        MockConverter.return_value.convert.side_effect = Exception(
-            "PdfHyperlink url_parsing"
-        )
+        MockConverter.return_value.convert.side_effect = Exception("PdfHyperlink url_parsing")
         result = parse_pdf(pdf, max_chars=10_000)
 
     assert result == "fallback text"

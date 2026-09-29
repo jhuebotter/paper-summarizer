@@ -46,9 +46,7 @@ def parse_pdf(
 
     if not reparse and cache_path.exists() and cache_path.stat().st_size > 0:
         cached = cache_path.read_text(encoding="utf-8")
-        logger.info(
-            "Docling cache found: %s (%s chars)", cache_path.name, f"{len(cached):,}"
-        )
+        logger.info("Docling cache found: %s (%s chars)", cache_path.name, f"{len(cached):,}")
         return cached[:max_chars]
 
     logger.info("Running %s extraction on: %s", extractor, pdf_path.name)
@@ -124,6 +122,4 @@ def _extract_text_with_pypdf(pdf_path: Path) -> str:
     except ParseError:
         raise
     except Exception as e:
-        raise ParseError(
-            f"Failed to parse {pdf_path}: pypdf fallback error: {e}"
-        ) from e
+        raise ParseError(f"Failed to parse {pdf_path}: pypdf fallback error: {e}") from e
