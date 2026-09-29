@@ -5,6 +5,7 @@ Entry point: ``summarize-papers`` (configured in ``pyproject.toml``).
 Usage:
     summarize-papers --source DIR [options]   # batch mode
     summarize-papers --file PDF [options]     # single-file mode
+    summarize-papers eval --source DIR ...    # evaluation (see evaluation.py)
 
 ``--source`` and ``--file`` are mutually exclusive; exactly one must be supplied.
 ``--reparse`` implies ``--force-summary``.
@@ -18,18 +19,21 @@ input/backend is unavailable, 130 when interrupted.
 """
 
 import argparse
+import importlib.util
 import logging
 import os
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-from summarizer.batch import load_processed_index, run_batch, run_pdfs, should_skip
+from summarizer.batch import find_pdfs, load_processed_index, run_batch, run_pdfs, should_skip
+from summarizer.evaluation import EvalConfig, init_gold, run_eval
 from summarizer.llm import fetch_openrouter_model_ids, openrouter_listed_id
 from summarizer.log import setup_logging
 from summarizer.models import (
@@ -56,20 +60,16 @@ def _positive_int(value: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """Parse CLI arguments, validate environment, and run the summarizer."""
     load_dotenv()
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["eval"]:
+        _eval_main(argv[1:])
+        return
 
-    parser = _build_parser()
-    args = parser.parse_args()
-
-    # Configure logging before any other output
-    if args.log_file:
-        log_file = Path(args.log_file)
-    else:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = Path("logs") / f"run_{ts}.log"
-    setup_logging(verbose=args.verbose, log_file=log_file)
+    args = _build_parser().parse_args(argv)
+    setup_logging(verbose=args.verbose, log_file=_log_file(args.log_file, "run"))
 
     # --reparse implies --force-summary
     force_summary = args.force_summary or args.reparse
@@ -106,6 +106,127 @@ def main() -> None:
             "skipped on the next run (in-flight calls may take a moment to end)."
         )
         sys.exit(130)
+
+
+def _log_file(log_file: str | None, prefix: str) -> Path:
+    if log_file:
+        return Path(log_file)
+    return Path("logs") / f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+
+# ---------------------------------------------------------------------------
+# Evaluation mode
+# ---------------------------------------------------------------------------
+
+
+def _eval_main(argv: list[str]) -> None:
+    """``summarize-papers eval``: score model × extractor configurations on a PDF set."""
+    args = _build_eval_parser().parse_args(argv)
+    out_dir = Path(args.out or Path("eval/runs") / datetime.now().strftime("%Y%m%d_%H%M%S"))
+    gold_path = Path(args.gold)
+    source = Path(args.source)
+
+    if args.init_gold:
+        setup_logging(verbose=args.verbose, log_file=None)
+    else:
+        setup_logging(verbose=args.verbose, log_file=Path(args.log_file or out_dir / "eval.log"))
+    if not source.is_dir():
+        logger.error("Not a directory: %s", source)
+        sys.exit(1)
+    pdfs = find_pdfs(source)
+    if not pdfs:
+        logger.error("No PDFs found under %s", source)
+        sys.exit(1)
+
+    if args.init_gold:
+        added = init_gold(gold_path, pdfs)
+        logger.info("Added %d unlabelled entries to %s", added, gold_path)
+        return
+
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+    extractors = [e.strip() for e in args.extractors.split(",") if e.strip()]
+    unknown = set(extractors) - {"docling", "pypdf"}
+    if not models or not extractors or unknown:
+        logger.error("Need at least one model and extractors from: docling, pypdf")
+        sys.exit(1)
+
+    config = Config(
+        base_url=args.base_url,
+        model=models[0],
+        max_chars=args.max_chars,
+        skill_data_dir=Path(args.skill_data_dir),
+        verbose=args.verbose,
+        timeout_s=args.timeout,
+        max_output_tokens=args.max_output_tokens,
+        workers=args.workers,
+    )
+    _check_backend(config.base_url)
+    for model in models:
+        _check_openrouter_config(replace(config, model=model))
+
+    configs = [EvalConfig(model=m, extractor=e) for m in models for e in extractors]
+    try:
+        run_eval(
+            pdfs,
+            config,
+            configs,
+            out_dir=out_dir,
+            cache_dir=Path(args.cache_dir),
+            gold_path=gold_path,
+        )
+    except KeyboardInterrupt:
+        logger.warning("Interrupted; rerun with the same --cache-dir to resume cheaply.")
+        sys.exit(130)
+    logger.info("Report: %s", out_dir / "report.md")
+
+
+def _build_eval_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="summarize-papers eval",
+        description=(
+            "Run model × extractor configurations over a set of PDFs and write "
+            "results.jsonl and report.md (quality, reliability, cost, gold-label "
+            "accuracy). Never touches output_summaries/ or the processed index."
+        ),
+    )
+    parser.add_argument("--source", metavar="DIR", required=True, help="Directory of PDFs.")
+    parser.add_argument(
+        "--gold",
+        metavar="FILE",
+        default="eval/gold.jsonl",
+        help="Gold labels, one JSON object per paper (default: eval/gold.jsonl).",
+    )
+    parser.add_argument(
+        "--init-gold",
+        action="store_true",
+        help="Append unlabelled entries for PDFs missing from --gold, then exit.",
+    )
+    parser.add_argument(
+        "--models",
+        metavar="A,B",
+        default=os.environ.get("LLM_MODEL", DEFAULT_MODEL),
+        help="Comma-separated model ids (default: LLM_MODEL or the default model).",
+    )
+    parser.add_argument(
+        "--extractors",
+        metavar="X,Y",
+        default="docling" if importlib.util.find_spec("docling") else "pypdf",
+        help="Comma-separated extractors from docling, pypdf (default: docling if installed).",
+    )
+    parser.add_argument(
+        "--out",
+        metavar="DIR",
+        default=None,
+        help="Run directory (default: eval/runs/TIMESTAMP).",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        metavar="DIR",
+        default="eval/cache",
+        help="LLM response cache shared across runs (default: eval/cache).",
+    )
+    _add_backend_args(parser)
+    return parser
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +346,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "server such as LM Studio). Processes a directory of PDFs (--source) "
             "or a single PDF (--file)."
         ),
+        epilog="Evaluate models/extractors on a set of PDFs: summarize-papers eval --help",
     )
 
     source_group = parser.add_mutually_exclusive_group(required=True)
@@ -276,6 +398,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_default_model,
         help=f"LLM model identifier (default: LLM_MODEL env var, currently {_default_model!r}).",
     )
+    _add_backend_args(parser)
+    return parser
+
+
+def _add_backend_args(parser: argparse.ArgumentParser) -> None:
+    """Flags shared by the run and eval commands."""
     parser.add_argument(
         "--base-url",
         metavar="URL",
@@ -315,7 +443,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--log-file",
         metavar="FILE",
         default=None,
-        help="Write log output to FILE (default: logs/run_TIMESTAMP.log).",
+        help="Write log output to FILE (default: logs/run_TIMESTAMP.log; eval: OUT/eval.log).",
     )
     parser.add_argument(
         "--timeout",
@@ -329,7 +457,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="N",
         type=_positive_int,
         default=3,
-        help="Number of parallel workers for batch mode (default: 3).",
+        help="Number of papers processed in parallel (default: 3).",
     )
     parser.add_argument(
         "--max-output-tokens",
@@ -342,8 +470,6 @@ def _build_parser() -> argparse.ArgumentParser:
             "Set when the backend enforces a cap or to bound cost."
         ),
     )
-
-    return parser
 
 
 if __name__ == "__main__":

@@ -1,0 +1,430 @@
+"""Evaluation harness: run model × extractor configurations over PDFs and report metrics.
+
+Outputs go to a run directory (``results.jsonl``, ``report.md``, one JSON per
+summary) and never touch ``output_summaries/`` or the processed index.  LLM
+responses are cached on disk, so re-running (to re-score, or to resume an
+interrupted free-tier run) costs nothing for calls that already succeeded.
+"""
+
+import hashlib
+import json
+import logging
+import statistics
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+
+from summarizer.batch import _atomic_write_text, sha256_file
+from summarizer.llm import CostAccumulator, UsageStats, _CompletionResponse, create_client
+from summarizer.metrics import compute_metrics, duplicate_keys
+from summarizer.models import Config, PaperSummary, PipelineError
+from summarizer.parser import parse_pdf
+from summarizer.pipeline import _author_surname_token, process_pdf
+from summarizer.prompts import load_references
+
+logger = logging.getLogger(__name__)
+
+GOLD_FIELDS = (
+    "is_research_paper",
+    "paper_type",
+    "synthesis_subtype",
+    "year",
+    "first_author",
+    "title",
+)
+
+
+@dataclass(frozen=True)
+class EvalConfig:
+    model: str
+    extractor: str
+
+    @property
+    def name(self) -> str:
+        return f"{self.model.replace('/', '_').replace(':', '_')}__{self.extractor}"
+
+
+# ---------------------------------------------------------------------------
+# Response cache
+# ---------------------------------------------------------------------------
+
+
+class CachingClient:
+    """Wraps an LLM client with an on-disk response cache.
+
+    One instance per paper, so ``hits`` / ``misses`` / ``llm_seconds`` describe
+    that paper.  Failed calls are never cached.  On a hit, the stored usage is
+    returned, so tokens (and cost at current pricing) match the original call.
+    """
+
+    def __init__(self, inner, cache_dir: Path) -> None:
+        self._inner = inner
+        self._cache_dir = cache_dir
+        self.model = inner.model
+        self.base_url = inner.base_url
+        self.pricing = inner.pricing
+        self.hits = 0
+        self.misses = 0
+        self.llm_seconds = 0.0
+
+    def _path(self, prompt: str) -> Path:
+        key = json.dumps(
+            [self.base_url, self.model, getattr(self._inner, "max_output_tokens", None), prompt]
+        )
+        return self._cache_dir / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
+
+    def complete(self, prompt: str) -> _CompletionResponse:
+        path = self._path(prompt)
+        if path.exists():
+            entry = json.loads(path.read_text(encoding="utf-8"))
+            self.hits += 1
+            self.llm_seconds += entry.get("elapsed_s", 0.0)
+            usage = UsageStats(**entry["usage"]) if entry.get("usage") else None
+            return _CompletionResponse(text=entry["text"], usage=usage)
+
+        t0 = time.monotonic()
+        response = self._inner.complete(prompt)
+        elapsed = time.monotonic() - t0
+        self.misses += 1
+        self.llm_seconds += elapsed
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "text": response.text,
+            "usage": asdict(response.usage) if response.usage else None,
+            "elapsed_s": elapsed,
+        }
+        _atomic_write_text(path, json.dumps(entry))
+        return response
+
+
+# ---------------------------------------------------------------------------
+# Gold labels
+# ---------------------------------------------------------------------------
+
+
+def load_gold(path: Path) -> dict[str, dict]:
+    """Return ``sha256 -> labels`` from a gold JSONL file (missing file → empty)."""
+    if not path.exists():
+        return {}
+    gold = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            record = json.loads(line)
+            gold[record["sha256"]] = record.get("labels") or {}
+    return gold
+
+
+def init_gold(path: Path, pdfs: list[Path]) -> int:
+    """Append an unlabelled stub for every PDF not yet in ``path``; return how many."""
+    known = set(load_gold(path))
+    stubs = []
+    for pdf in pdfs:
+        sha = sha256_file(pdf)
+        if sha not in known:
+            known.add(sha)
+            labels = dict.fromkeys(GOLD_FIELDS)
+            stubs.append(json.dumps({"sha256": sha, "file": pdf.name, "labels": labels}))
+    if stubs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write("\n".join(stubs) + "\n")
+    return len(stubs)
+
+
+def _norm(value: object) -> str:
+    return "".join(ch for ch in str(value).casefold() if ch.isalnum())
+
+
+def score_gold(summary: PaperSummary, labels: dict) -> dict[str, bool]:
+    """Compare predictions with the labelled (non-null) gold fields."""
+    meta = summary.metadata
+    predicted = {
+        "is_research_paper": meta.is_research_paper,
+        "paper_type": meta.paper_type or "non_research",
+        "synthesis_subtype": meta.synthesis_subtype,
+        "year": meta.year,
+        "first_author": _author_surname_token(meta.authors[0]) if meta.authors else None,
+        "title": meta.title,
+    }
+    scores = {}
+    for field in GOLD_FIELDS:
+        expected = labels.get(field)
+        if expected is None:
+            continue
+        got = predicted[field]
+        if field == "first_author":
+            expected = _author_surname_token(str(expected))
+        if isinstance(expected, str) and got is not None:
+            scores[field] = _norm(got) == _norm(expected)
+        else:
+            scores[field] = got == expected
+    return scores
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+
+def _git_commit() -> str | None:
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return out.stdout.strip() or None
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _eval_one(
+    pdf: Path,
+    sha: str,
+    config: Config,
+    cfg: EvalConfig,
+    client,
+    references: str,
+    cache_dir: Path,
+    gold: dict[str, dict],
+    summaries_dir: Path,
+) -> dict:
+    row = {
+        "config": cfg.name,
+        "model": cfg.model,
+        "extractor": cfg.extractor,
+        "file": pdf.name,
+        "sha256": sha,
+        "ok": False,
+        "error": None,
+    }
+    t0 = time.monotonic()
+    try:
+        full_text = parse_pdf(pdf, max_chars=sys.maxsize, extractor=cfg.extractor)
+    except Exception as exc:
+        return row | {"error": f"parse failed: {exc}"}
+    parse_s = time.monotonic() - t0
+    paper_text = full_text[: config.max_chars]
+
+    accumulator = CostAccumulator()
+    cached_client = CachingClient(client, cache_dir)
+    summary = None
+    try:
+        summary = process_pdf(
+            pdf, config, client=cached_client, accumulator=accumulator, references=references
+        )
+    except PipelineError as exc:
+        row["error"] = str(exc.cause)
+
+    row |= {
+        "ok": summary is not None,
+        "chars_full": len(full_text),
+        "chars_sent": len(paper_text),
+        "truncated": len(full_text) > len(paper_text),
+        "calls": accumulator.calls,
+        "json_repairs": accumulator.json_repairs,
+        "schema_repairs": accumulator.schema_repairs,
+        "first_try_valid": summary is not None
+        and accumulator.json_repairs == 0
+        and accumulator.schema_repairs == 0,
+        "input_tokens": accumulator.total_input_tokens,
+        "output_tokens": accumulator.total_output_tokens,
+        "cost_usd": accumulator.total_cost,
+        "cache_hits": cached_client.hits,
+        "cache_misses": cached_client.misses,
+        "parse_s": round(parse_s, 3),
+        "llm_s": round(cached_client.llm_seconds, 3),
+    }
+    if summary is None:
+        return row
+
+    summaries_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(summaries_dir / f"{sha}.json", summary.model_dump_json(indent=2))
+    row |= {
+        "paper_type": summary.metadata.paper_type or "non_research",
+        "citation_key": summary.metadata.citation_key,
+        "metrics": compute_metrics(summary, paper_text),
+        "gold": score_gold(summary, gold[sha]) if sha in gold else None,
+    }
+    return row
+
+
+def run_eval(
+    pdfs: list[Path],
+    base_config: Config,
+    configs: list[EvalConfig],
+    out_dir: Path,
+    cache_dir: Path,
+    gold_path: Path | None = None,
+) -> list[dict]:
+    """Evaluate every configuration on every PDF; write results and a report."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    gold = load_gold(gold_path) if gold_path else {}
+    references = load_references(base_config.skill_data_dir)
+    provenance = {
+        "git_commit": _git_commit(),
+        "references_sha256": hashlib.sha256(references.encode()).hexdigest()[:12],
+        "max_chars": base_config.max_chars,
+    }
+    shas = {pdf: sha256_file(pdf) for pdf in pdfs}
+    results_path = out_dir / "results.jsonl"
+    rows: list[dict] = []
+
+    for cfg in configs:
+        config = replace(base_config, model=cfg.model, extractor=cfg.extractor, dry_run=False)
+        client = create_client(config)
+        summaries_dir = out_dir / "summaries" / cfg.name
+        logger.info("Evaluating %s on %d PDFs", cfg.name, len(pdfs))
+        executor = ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="eval")
+        try:
+            futures = [
+                executor.submit(
+                    _eval_one,
+                    pdf,
+                    shas[pdf],
+                    config,
+                    cfg,
+                    client,
+                    references,
+                    cache_dir,
+                    gold,
+                    summaries_dir,
+                )
+                for pdf in pdfs
+            ]
+            for future in as_completed(futures):
+                row = future.result() | {"provenance": provenance}
+                with results_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(row) + "\n")
+                rows.append(row)
+                logger.info(
+                    "  %s %s: %s", cfg.name, row["file"], "ok" if row["ok"] else row["error"]
+                )
+        except BaseException:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        executor.shutdown()
+
+    report = render_report(rows, configs, provenance)
+    _atomic_write_text(out_dir / "report.md", report)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+
+def _pct(n: int, of: int) -> str:
+    return f"{n / of:.0%} ({n}/{of})" if of else "n/a"
+
+
+def _sum_rate(rows: list[dict], key: str) -> tuple[int, int]:
+    rates = [r["metrics"][key] for r in rows if r.get("metrics")]
+    return sum(x["n"] for x in rates), sum(x["of"] for x in rates)
+
+
+def _config_summary(rows: list[dict]) -> list[str]:
+    ok = [r for r in rows if r["ok"]]
+    quotes = [r["metrics"]["quotes"] for r in ok if r.get("metrics")]
+    q_total = sum(q["total"] for q in quotes)
+    voice = [r["metrics"]["first_person"] for r in ok if r.get("metrics")]
+    voice_words = sum(v["words"] for v in voice)
+    budgets = [r["metrics"]["word_budget"]["ratio"] for r in ok if r.get("metrics")]
+    gold = [s for r in ok if r.get("gold") for s in r["gold"].values()]
+    return [
+        _pct(len(ok), len(rows)),
+        _pct(sum(r.get("first_try_valid", False) for r in rows), len(rows)),
+        str(sum(r.get("json_repairs", 0) + r.get("schema_repairs", 0) for r in rows)),
+        f"{sum(r.get('input_tokens', 0) for r in rows):,} / "
+        f"{sum(r.get('output_tokens', 0) for r in rows):,}",
+        f"${sum(r.get('cost_usd', 0.0) for r in rows):.4f}",
+        _pct(sum(q["verbatim"] for q in quotes), q_total),
+        _pct(sum(q["near"] for q in quotes), q_total),
+        _pct(sum(q["not_found"] for q in quotes), q_total),
+        _pct(*_sum_rate(ok, "anchors")),
+        f"{1000 * sum(v['count'] for v in voice) / voice_words:.1f}" if voice_words else "n/a",
+        f"{statistics.median(budgets):.2f}" if budgets else "n/a",
+        _pct(*_sum_rate(ok, "evidence_tags")),
+        _pct(sum(gold), len(gold)),
+    ]
+
+
+def render_report(rows: list[dict], configs: list[EvalConfig], provenance: dict) -> str:
+    """Markdown report: per-config summary, per-paper table, missing quotes, labels."""
+    by_config = {c.name: [r for r in rows if r["config"] == c.name] for c in configs}
+    lines = [
+        "# Evaluation report",
+        "",
+        f"Commit `{provenance['git_commit']}` · references `{provenance['references_sha256']}` · "
+        f"max_chars {provenance['max_chars']:,} · {len({r['sha256'] for r in rows})} PDFs",
+        "",
+        "## Per configuration",
+        "",
+        "| config | ok | first-try valid | repairs | tokens in / out | cost | quotes verbatim "
+        "| near | not found | anchor coverage | first person /1k words | word budget (median) "
+        "| evidence tags | gold labels |",
+        "|" + "---|" * 14,
+    ]
+    for name, config_rows in by_config.items():
+        lines.append("| " + " | ".join([f"`{name}`", *_config_summary(config_rows)]) + " |")
+
+    lines += ["", "## Per paper", "", "| paper | " + " | ".join(by_config) + " |"]
+    lines.append("|" + "---|" * (len(by_config) + 1))
+    for sha in dict.fromkeys(r["sha256"] for r in rows):
+        cells = []
+        for config_rows in by_config.values():
+            row = next((r for r in config_rows if r["sha256"] == sha), None)
+            cells.append(_paper_cell(row))
+        file = next(r["file"] for r in rows if r["sha256"] == sha)
+        lines.append(f"| {file} | " + " | ".join(cells) + " |")
+
+    missing = [
+        (r["file"], r["config"], q)
+        for r in rows
+        if r.get("metrics")
+        for q in r["metrics"]["quotes"]["not_found_quotes"]
+    ]
+    lines += ["", "## Quotes not found in the paper text", ""]
+    lines += [f"- {f} (`{c}`): “{q}”" for f, c, q in missing] or ["None."]
+
+    lines += ["", "## Gold label accuracy by field", ""]
+    labelled = [r for r in rows if r.get("gold")]
+    if labelled:
+        lines += ["| field | " + " | ".join(by_config) + " |", "|" + "---|" * (len(by_config) + 1)]
+        for field in GOLD_FIELDS:
+            cells = []
+            for config_rows in by_config.values():
+                scores = [r["gold"][field] for r in config_rows if field in (r.get("gold") or {})]
+                cells.append(_pct(sum(scores), len(scores)))
+            lines.append(f"| {field} | " + " | ".join(cells) + " |")
+    else:
+        lines.append("No labelled papers.")
+
+    lines += ["", "## Duplicate citation keys", ""]
+    dupes = {
+        name: duplicate_keys([r["citation_key"] for r in config_rows if r["ok"]])
+        for name, config_rows in by_config.items()
+    }
+    lines += [f"- `{n}`: {', '.join(d)}" for n, d in dupes.items() if d] or ["None."]
+    return "\n".join(lines) + "\n"
+
+
+def _paper_cell(row: dict | None) -> str:
+    if row is None:
+        return "—"
+    if not row["ok"]:
+        return "FAILED"
+    cell = [row["paper_type"]]
+    quotes = row["metrics"].get("quotes") if row.get("metrics") else None
+    if quotes and quotes["total"]:
+        cell.append(f"quotes {quotes['verbatim']}/{quotes['near']}/{quotes['not_found']}")
+    repairs = row["json_repairs"] + row["schema_repairs"]
+    if repairs:
+        cell.append(f"{repairs} repair(s)")
+    return ", ".join(cell)

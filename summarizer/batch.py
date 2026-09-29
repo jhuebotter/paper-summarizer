@@ -22,6 +22,7 @@ Summaries are written to ``{output_dir}/{paper_type}/{citekey}_summary.md``.
 If that path already exists, a version suffix is appended (``_v2``, ``_v3``, ...).
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -61,6 +62,15 @@ def find_pdfs(source_dir: Path) -> list[Path]:
         for p in source_dir.rglob("*")
         if p.suffix.lower() == ".pdf" and not p.name.startswith("._") and p.is_file()
     )
+
+
+def sha256_file(path: Path) -> str:
+    """Hex SHA-256 of a file's contents."""
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 # ---------------------------------------------------------------------------
