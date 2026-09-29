@@ -39,7 +39,7 @@ uv run summarize-papers --source input_papers
 ## Typical workflow
 
 1. Discover PDFs under `--source` (recursive, `.pdf` in any case) or take one `--file`.
-2. Extract text, or reuse the cache `<sha256>.<extractor>.md`; drop the reference section.
+2. Extract text, or reuse the cache `<sha256>.<extractor>.md`; drop the reference section (`--strip-references`, on by default).
 3. Build the prompt from `skill_data/references/*.md` (~11k tokens) plus the paper text (up to `--max-chars`).
 4. Call the backend; validate and repair the JSON; render markdown.
 5. Write `output_summaries/<paper_type>/<citation_key>_summary.md` and `.json` (versioned `_v2`, `_v3`, … instead of overwriting) and record the paper in `output_summaries/processed.jsonl`.
@@ -171,12 +171,13 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 
 ## Skip and rerun behavior
 
-- Papers are identified by content (SHA-256): anything in `output_summaries/processed.jsonl` is skipped even after moving or renaming the PDF, and identical copies in one batch are processed once. A changed PDF counts as a new paper. Older index entries (path only, or a legacy `processed.txt`) still match by path and are migrated on the next run.
-- Extraction caches are per content and extractor (`<sha256>.docling.md`, `<sha256>.pypdf.md`). Caches that earlier versions wrote next to the PDFs are still read.
+- Papers are identified by content (SHA-256): anything in `output_summaries/processed.jsonl` is skipped even after moving or renaming the PDF, and identical copies in one batch are processed once. A changed PDF counts as a new paper. Older index entries (path only, or a legacy `processed.txt`) are migrated when their PDF is next seen, unless the file changed after it was summarized, in which case it is summarized again.
+- Extraction caches are per content and extractor (`<sha256>.docling.md`, `<sha256>.pypdf.md`). Caches that earlier versions wrote next to the PDFs are still read unless they are older than the PDF.
 - Failed papers are not recorded, so the next run retries them. The exit code is 1 if any paper failed.
 - Ctrl-C cancels queued papers (exit code 130). Finished papers are kept and skipped on the next run.
 - A run stopped by a quota or `--max-cost` exits with 1 and says why; rerunning continues where it stopped.
-- One run at a time per output directory: a second run (or `render`) on the same directory exits with an error while the first is running.
+- One run at a time per output directory: a second run (or `render`) on the same directory exits with an error while the first is running (POSIX; on Windows, don't overlap runs).
+- `render` overwrites the markdown files, including any hand edits; invalid sidecars are reported and skipped.
 
 ## Evaluation
 

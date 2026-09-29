@@ -11,6 +11,7 @@ CLI that turns research PDFs into structured markdown summaries via an OpenAI-co
 - Lint/format: `uv run ruff check . && uv run ruff format .`
 - Run: `uv run summarize-papers --source DIR | --file PDF [--dry-run]`
 - Evaluate: `uv run summarize-papers eval --source DIR [--models A,B] [--extractors pypdf,docling]` (outputs in `eval/runs/`)
+- Re-render markdown from JSON sidecars: `uv run summarize-papers render [--output-dir DIR]`
 
 Python >=3.12, developed on 3.14 (`.python-version`). Use uv, not pip/conda; commit `uv.lock` changes.
 
