@@ -50,7 +50,7 @@ def test_load_references_uses_only_md_files(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# build_combined_prompt (v1.1 — single call)
+# build_combined_prompt (single call)
 # ---------------------------------------------------------------------------
 
 
@@ -249,3 +249,32 @@ def test_build_combined_prompt_mentions_output_budget_warning():
 def test_build_combined_prompt_part2_requires_full_object_for_primary():
     """Prompt requires a full Part 2 object for primary papers (not just null rules)."""
     assert "part2 must be a full Part 2 object" in _PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Regressions: taxonomy and word budgets must match the schema/templates
+# ---------------------------------------------------------------------------
+
+
+def _prompt() -> str:
+    from pathlib import Path
+
+    refs = load_references(Path(__file__).parent.parent / "skill_data" / "references")
+    return build_combined_prompt(paper_text="TEXT", references=refs, source_filename="x.pdf")
+
+
+def test_prompt_paper_types_match_schema():
+    """Regression: the prompt tail listed "survey"/"commentary" as paper types."""
+    from typing import get_args
+
+    from summarizer.models import PaperType
+
+    prompt = _prompt()
+    assert 'one of "primary", "survey", "commentary"' not in prompt
+    for paper_type in get_args(PaperType):
+        assert f'"{paper_type}"' in prompt
+
+
+def test_prompt_budget_mentions_synthesis_limit():
+    """Regression: the output budget said ≤600 words for every paper type."""
+    assert "synthesis: ≤1000 words" in _prompt()

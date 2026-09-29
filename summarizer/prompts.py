@@ -71,7 +71,7 @@ Year resolution priority (for metadata.year):
 Research gate rules:
 - If the document is a research paper:
   - metadata.is_research_paper = true
-  - metadata.paper_type is one of "primary", "survey", "commentary"
+  - metadata.paper_type is exactly "primary" or "synthesis" (reviews, surveys, perspectives, commentaries, opinions, tutorials are all "synthesis"; put the specific kind in metadata.synthesis_subtype)
   - metadata.rejection_reason = null
   - part1.paper_type must match metadata.paper_type
 - If the document is not a research paper:
@@ -89,8 +89,8 @@ Part 2 rules:
 
 Output budget (CRITICAL — incomplete JSON is worthless):
 - Your entire JSON response, including all fields of metadata, part1, and part2, must be present and the closing brace must appear.
-- Strictly respect the word/sentence limits in Part 1 (≤600 words total, ≤3 sentences per section). If you are running short on space, trim Part 1 prose — never leave Part 2 fields absent.
-- Part 2: keep every field to exactly 1 sentence. Do not elaborate.
+- Strictly respect the word/sentence limits in Part 1 (primary: ≤600 words total; synthesis: ≤1000 words total; ≤3 sentences per section unless the template says otherwise). If you are running short on space, trim Part 1 prose — never leave Part 2 fields absent.
+- Part 2: keep every field to 1 sentence (Learning mechanism: at most 2). Do not elaborate.
 
 Variant-specific part1 required keys:
 - primary: paper_type, tldr, problem_motivation, core_contribution, methods, results, key_takeaways, limitations, open_problems_future_directions, critical_assessment, notable_findings, citable_snippets, relevance
