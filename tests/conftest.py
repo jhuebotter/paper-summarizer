@@ -63,6 +63,12 @@ def _isolated_env(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _extraction_cache_in_tmp(tmp_path, monkeypatch):
+    """Extraction caches go to $XDG_CACHE_HOME; keep them per test, out of $HOME."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
+
+
+@pytest.fixture(autouse=True)
 def _default_log_dir_in_tmp(tmp_path, monkeypatch):
     """``main()`` writes ``logs/run_<ts>.log`` relative to the CWD by default.
 
@@ -157,6 +163,13 @@ MOCK_PART2_DICT = {
     "data_collection": "Simulated rollouts in MuJoCo",
     "key_training_details": "BPTT with surrogate gradients; 500 training episodes",
     "comparison_to_baselines": "Compared against ANN with same architecture; SNN achieves comparable reward",
+    "classification": {
+        "inference_hardware": "CPU/GPU",
+        "architecture": "fully spiking",
+        "credit_assignment": "Global",
+        "learning_regime": "Offline",
+        "paradigm_families": ["Gradient-based (surrogate gradient BPTT)"],
+    },
 }
 
 

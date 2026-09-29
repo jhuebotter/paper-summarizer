@@ -9,6 +9,7 @@ from collections.abc import Sequence
 
 from summarizer.models import (
     CitableSnippet,
+    Classification,
     OpenProblemsPrimary,
     OpenProblemsSynthesis,
     PaperMetadata,
@@ -201,10 +202,21 @@ def _render_open_problems_synthesis(op: OpenProblemsSynthesis) -> str:
     )
 
 
+def _render_classification(classification: Classification) -> str:
+    """One line per typed label, e.g. ``**Inference hardware:** CPU/GPU``."""
+    lines = []
+    for name, value in classification.model_dump().items():
+        shown = "; ".join(value) or "none" if isinstance(value, list) else value
+        lines.append(f"**{name.replace('_', ' ').capitalize()}:** {shown}  ")
+    return "\n".join(lines)
+
+
 def _render_part2(part2: SummaryPart2) -> str:
     """Render the Part 2 SNN extraction section."""
     return (
         "## Part 2: SNN Control Extraction\n\n"
+        f"### Classification\n\n{_render_classification(part2.classification)}\n\n"
+        "### Details\n\n"
         f"**Neuron model:** {part2.neuron_model}\n\n"
         f"**Network architecture:** {part2.network_architecture}\n\n"
         f"**Model scale:** {part2.model_scale}\n\n"

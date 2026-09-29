@@ -1,5 +1,6 @@
 """Tests for summarizer/cli.py — argument parsing and high-level CLI behaviour."""
 
+import itertools
 import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -8,6 +9,15 @@ import pytest
 
 from summarizer.cli import _build_parser, _check_backend, main
 from summarizer.models import DEFAULT_MODEL, DEFAULT_SKILL_DATA_DIR, Config
+from summarizer.parser import ParsedText
+
+_PDF_COUNTER = itertools.count()
+
+
+def _pdf_bytes() -> bytes:
+    """Distinct content per test PDF (identical PDFs are de-duplicated by sha256)."""
+    return f"%PDF {next(_PDF_COUNTER)}".encode()
+
 
 # ---------------------------------------------------------------------------
 # Argument parser
@@ -82,7 +92,7 @@ def test_parser_model_cli_overrides_env():
 )
 def test_main_cli_flag_propagates_to_config(tmp_path, cli_flag, cli_value, config_attr, expected):
     """CLI flags are forwarded as the corresponding Config fields."""
-    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper.pdf").write_bytes(_pdf_bytes())
     with (
         patch(
             "sys.argv",
@@ -184,7 +194,7 @@ def test_check_backend_exits_when_unreachable():
 
 def test_main_dry_run_batch(tmp_path, capsys):
     """main() with --dry-run --source does not call process_pdf."""
-    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper.pdf").write_bytes(_pdf_bytes())
 
     with (
         patch("sys.argv", ["summarize-papers", "--source", str(tmp_path), "--dry-run"]),
@@ -223,11 +233,12 @@ def test_run_single_force_summary_creates_versioned_file(tmp_path):
         force_summary=True,
     )
     pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
+    pdf.write_bytes(_pdf_bytes())
 
     mock_summary = MagicMock()
     mock_summary.metadata.paper_type = "synthesis"
     mock_summary.metadata.citation_key = "dewolf2021spiking"
+    mock_summary.model_dump_json.return_value = "{}"
 
     with (
         patch("summarizer.batch.create_client"),
@@ -242,34 +253,25 @@ def test_run_single_force_summary_creates_versioned_file(tmp_path):
     assert versioned.read_text(encoding="utf-8") == "# new"
 
 
-def test_main_single_file_skips_when_in_processed_index(tmp_path, capsys):
-    """main() --file skips and exits 0 when the PDF is in the (legacy) processed.txt."""
+def test_main_single_file_skips_when_in_processed_index(tmp_path):
+    """main() --file skips a PDF that is in the (legacy) processed.txt."""
     pdf = tmp_path / "huebotter2025spiking.pdf"
-    pdf.write_bytes(b"%PDF")
-
-    # Create output_dir and populate processed.txt
+    pdf.write_bytes(_pdf_bytes())
     output_dir = tmp_path / "output_summaries"
     output_dir.mkdir()
     (output_dir / "processed.txt").write_text(str(pdf.resolve()) + "\n", encoding="utf-8")
 
     with (
         patch(
-            "sys.argv",
-            [
-                "summarize-papers",
-                "--file",
-                str(pdf),
-                "--output-dir",
-                str(output_dir),
-            ],
+            "sys.argv", ["summarize-papers", "--file", str(pdf), "--output-dir", str(output_dir)]
         ),
         patch("summarizer.cli._check_backend"),
         patch("summarizer.cli._check_openrouter_config"),
-        pytest.raises(SystemExit) as exc_info,
+        patch("summarizer.cli._log_key_info"),
+        patch("summarizer.batch.process_pdf") as process,
     ):
         main()
-
-    assert exc_info.value.code == 0
+    process.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +389,7 @@ def test_run_single_reports_cost_and_exits_1_on_failure(tmp_path, caplog):
     from summarizer.models import PipelineError
 
     pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
+    pdf.write_bytes(_pdf_bytes())
     config = Config(base_url="http://localhost:1234/v1", model="m", output_dir=tmp_path / "out")
     with (
         caplog.at_level(logging.INFO, logger="summarizer.cli"),
@@ -429,14 +431,14 @@ def test_openrouter_model_listed(model, listed):
 
 def test_main_works_from_another_directory(tmp_path, monkeypatch):
     """Regression: the default references path was relative to the CWD."""
-    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper.pdf").write_bytes(_pdf_bytes())
     monkeypatch.chdir(tmp_path)
     with (
         patch("sys.argv", ["summarize-papers", "--file", "paper.pdf"]),
         patch("summarizer.cli._check_backend"),
         patch("summarizer.cli._check_openrouter_config"),
         patch("summarizer.batch.create_client"),
-        patch("summarizer.pipeline.parse_pdf", return_value="text"),
+        patch("summarizer.pipeline.load_text", return_value=ParsedText("text", "pypdf", "0" * 64)),
         patch("summarizer.pipeline.call_llm", side_effect=RuntimeError("stop after prompt")),
         pytest.raises(SystemExit) as exc_info,
     ):
@@ -452,14 +454,14 @@ def test_source_must_be_a_directory(tmp_path):
     from summarizer.cli import _run_batch
 
     pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
+    pdf.write_bytes(_pdf_bytes())
     with pytest.raises(SystemExit) as exc_info:
         _run_batch(pdf, Config(output_dir=tmp_path / "out"))
     assert exc_info.value.code == 1
 
 
 def test_keyboard_interrupt_exits_130(tmp_path):
-    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper.pdf").write_bytes(_pdf_bytes())
     with (
         patch("sys.argv", ["summarize-papers", "--source", str(tmp_path)]),
         patch("summarizer.cli._check_backend"),
@@ -517,7 +519,7 @@ def test_structured_output_preflight_with_routing_suffix(monkeypatch):
 
 
 def test_eval_flags_propagate(tmp_path):
-    (tmp_path / "p.pdf").write_bytes(b"%PDF")
+    (tmp_path / "p.pdf").write_bytes(_pdf_bytes())
     with (
         patch("summarizer.cli._check_backend"),
         patch("summarizer.cli._check_openrouter_config"),
@@ -542,7 +544,7 @@ def test_eval_flags_propagate(tmp_path):
 
 
 def test_stopped_eval_exits_1(tmp_path):
-    (tmp_path / "p.pdf").write_bytes(b"%PDF")
+    (tmp_path / "p.pdf").write_bytes(_pdf_bytes())
     with (
         patch("summarizer.cli._check_backend"),
         patch("summarizer.cli._check_openrouter_config"),
@@ -583,7 +585,7 @@ def test_stopped_run_exits_1(caplog):
     ],
 )
 def test_boolean_flags_propagate_to_config(tmp_path, flag, attr, expected):
-    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper.pdf").write_bytes(_pdf_bytes())
     with (
         patch("sys.argv", ["summarize-papers", "--source", str(tmp_path), "--dry-run", flag]),
         patch("summarizer.cli.run_batch") as mock_run_batch,
@@ -598,3 +600,39 @@ def test_boolean_flags_propagate_to_config(tmp_path, flag, attr, expected):
 def test_new_flag_defaults():
     args = _build_parser().parse_args(["--source", "/tmp"])
     assert (args.strip_references, args.structured_output, args.max_cost) == (True, False, None)
+
+
+def test_render_subcommand(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    with patch("summarizer.cli.render_all", return_value=3) as render:
+        main(["render", "--output-dir", str(out)])
+    render.assert_called_once_with(out)
+
+
+def test_render_reports_a_locked_output_dir(tmp_path):
+    from summarizer.batch import OutputDirLocked
+
+    out = tmp_path / "out"
+    out.mkdir()
+    with (
+        patch("summarizer.cli.render_all", side_effect=OutputDirLocked("busy")),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main(["render", "--output-dir", str(out)])
+    assert exc_info.value.code == 1
+
+
+def test_locked_output_dir_exits_1(tmp_path):
+    from summarizer.batch import OutputDirLocked
+
+    (tmp_path / "p.pdf").write_bytes(_pdf_bytes())
+    with (
+        patch("summarizer.cli._check_backend"),
+        patch("summarizer.cli._check_openrouter_config"),
+        patch("summarizer.cli._log_key_info"),
+        patch("summarizer.cli.run_batch", side_effect=OutputDirLocked("busy")),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main(["--source", str(tmp_path)])
+    assert exc_info.value.code == 1

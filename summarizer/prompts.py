@@ -83,6 +83,7 @@ Research gate rules:
 Part 2 rules:
 - For metadata.paper_type == "primary": part2 must be a full Part 2 object.
 - For primary papers, do NOT omit Part 2 keys even if no control task or no learning setup is present; use "not applicable" (or "not reported") for those fields.
+- part2.classification uses only the labels listed in the JSON Output Contract.
 - For metadata.paper_type == "synthesis": part2 must be null.
 - For non-research documents: part2 must be null.
 - For synthesis papers, do NOT omit any part1 keys. All fields listed below must be present; use "not applicable" as the string value where genuinely inapplicable — never omit the key.

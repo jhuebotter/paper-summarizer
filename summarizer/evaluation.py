@@ -10,15 +10,13 @@ import hashlib
 import json
 import logging
 import statistics
-import subprocess
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from functools import partial
 from pathlib import Path
 
-from summarizer.batch import StopSignal, atomic_write_text, sha256_file
+from summarizer.batch import StopSignal, atomic_write_text
 from summarizer.llm import (
     CompletionResponse,
     CostAccumulator,
@@ -27,9 +25,9 @@ from summarizer.llm import (
     create_client,
 )
 from summarizer.metrics import compute_metrics, duplicate_keys
-from summarizer.models import Config, PaperSummary, PipelineError
-from summarizer.parser import parse_pdf
-from summarizer.pipeline import author_surname_token, fit_to_context, process_pdf
+from summarizer.models import Classification, Config, PaperSummary, PipelineError
+from summarizer.parser import load_text, sha256_file
+from summarizer.pipeline import author_surname_token, git_commit, process_pdf
 from summarizer.prompts import load_references
 
 logger = logging.getLogger(__name__)
@@ -41,6 +39,7 @@ GOLD_FIELDS = (
     "year",
     "first_author",
     "title",
+    *(f"classification.{name}" for name in Classification.model_fields),
 )
 
 
@@ -177,6 +176,9 @@ def score_gold(summary: PaperSummary, labels: dict) -> dict[str, bool]:
         "first_author": _surname(meta.authors[0]) if meta.authors else None,
         "title": meta.title,
     }
+    classification = summary.part2.classification if summary.part2 else None
+    for name in Classification.model_fields:
+        predicted[f"classification.{name}"] = getattr(classification, name, None)
     scores = {}
     for field in GOLD_FIELDS:
         expected = labels.get(field)
@@ -185,7 +187,9 @@ def score_gold(summary: PaperSummary, labels: dict) -> dict[str, bool]:
         got = predicted[field]
         if field == "first_author":
             expected = _surname(str(expected))
-        if isinstance(expected, str) and got is not None:
+        if isinstance(expected, list):
+            scores[field] = {_norm(v) for v in got or []} == {_norm(v) for v in expected}
+        elif isinstance(expected, str) and got is not None:
             scores[field] = _norm(got) == _norm(expected)
         else:
             scores[field] = got == expected
@@ -195,20 +199,6 @@ def score_gold(summary: PaperSummary, labels: dict) -> dict[str, bool]:
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
-
-
-def _git_commit() -> str | None:
-    try:
-        out = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=Path(__file__).resolve().parent,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return out.stdout.strip() or None
-    except (OSError, subprocess.CalledProcessError):
-        return None
 
 
 def _eval_one(
@@ -243,24 +233,6 @@ def _eval_one(
         "error": None,
         "gold": labelled or None,
     }
-    try:
-        full_text = parse_pdf(
-            pdf,
-            max_chars=sys.maxsize,
-            extractor=cfg.extractor,
-            strip_references=config.strip_references,
-        )
-        # The exact text the model is shown (same truncation as the pipeline).
-        paper_text = fit_to_context(
-            full_text[: config.max_chars],
-            references,
-            pdf.name,
-            client.pricing.context_length,
-            config,
-        )
-    except Exception as exc:
-        return row | {"error": f"text preparation failed: {exc}"}
-
     accumulator = CostAccumulator(parent=total)
     cached_client = CachingClient(client, cache_dir)
     summary = None
@@ -276,9 +248,6 @@ def _eval_one(
 
     row |= {
         "ok": summary is not None,
-        "chars_full": len(full_text),
-        "chars_sent": len(paper_text),
-        "truncated": len(full_text) > len(paper_text),
         "calls": accumulator.calls,
         "json_repairs": accumulator.json_repairs,
         "schema_repairs": accumulator.schema_repairs,
@@ -295,9 +264,17 @@ def _eval_one(
     if summary is None:
         return row
 
+    # Score against exactly the text the model was shown (a prefix of the stripped text).
+    provenance = summary.provenance
+    paper_text = load_text(pdf, cfg.extractor, strip_references=config.strip_references).text[
+        : provenance.chars_sent
+    ]
     summaries_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(summaries_dir / f"{sha}.json", summary.model_dump_json(indent=2))
     row |= {
+        "chars_full": provenance.chars_full,
+        "chars_sent": provenance.chars_sent,
+        "truncated": provenance.chars_full > provenance.chars_sent,
         "paper_type": summary.metadata.paper_type or "non_research",
         "citation_key": summary.metadata.citation_key,
         "metrics": compute_metrics(summary, paper_text),
@@ -323,7 +300,7 @@ def run_eval(
     gold = load_gold(gold_path) if gold_path else {}
     references = load_references(base_config.skill_data_dir)
     provenance = {
-        "git_commit": _git_commit(),
+        "git_commit": git_commit(),
         "references_sha256": hashlib.sha256(references.encode()).hexdigest()[:12],
         "max_chars": base_config.max_chars,
         "strip_references": base_config.strip_references,

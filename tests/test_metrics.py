@@ -29,6 +29,17 @@ PAPER = (
 )
 
 
+_PART2 = dict.fromkeys(SummaryPart2.model_fields, "not reported") | {
+    "classification": {
+        "inference_hardware": "not reported",
+        "architecture": "not reported",
+        "credit_assignment": "not reported",
+        "learning_regime": "not reported",
+        "paradigm_families": [],
+    }
+}
+
+
 def _primary(**part1_overrides) -> PaperSummary:
     part1 = dict(
         paper_type="primary",
@@ -59,7 +70,7 @@ def _primary(**part1_overrides) -> PaperSummary:
             tags=[],
         ),
         part1=SummaryPart1Primary(**part1),
-        part2=SummaryPart2(**dict.fromkeys(SummaryPart2.model_fields, "not reported")),
+        part2=SummaryPart2(**_PART2),
     )
 
 

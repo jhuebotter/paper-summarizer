@@ -1,5 +1,8 @@
 """Tests for summarizer/batch.py — directory scanning, processed index, and batch execution."""
 
+import itertools
+import json
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +17,14 @@ from summarizer.batch import (
     should_skip,
 )
 from summarizer.models import Config, PipelineError
+
+_PDF_COUNTER = itertools.count()
+
+
+def _pdf_bytes() -> bytes:
+    """Distinct content per test PDF (identical PDFs are de-duplicated by sha256)."""
+    return f"%PDF {next(_PDF_COUNTER)}".encode()
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -35,9 +46,9 @@ def config(tmp_path):
 @pytest.fixture
 def pdf_dir(tmp_path):
     """Directory with three PDFs."""
-    (tmp_path / "paper_a.pdf").write_bytes(b"%PDF")
-    (tmp_path / "paper_b.pdf").write_bytes(b"%PDF")
-    (tmp_path / "paper_c.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper_a.pdf").write_bytes(_pdf_bytes())
+    (tmp_path / "paper_b.pdf").write_bytes(_pdf_bytes())
+    (tmp_path / "paper_c.pdf").write_bytes(_pdf_bytes())
     return tmp_path
 
 
@@ -55,8 +66,8 @@ def test_find_pdfs_returns_all_pdfs(pdf_dir):
 def test_find_pdfs_recursive(tmp_path):
     sub = tmp_path / "sub"
     sub.mkdir()
-    (tmp_path / "root.pdf").write_bytes(b"%PDF")
-    (sub / "nested.pdf").write_bytes(b"%PDF")
+    (tmp_path / "root.pdf").write_bytes(_pdf_bytes())
+    (sub / "nested.pdf").write_bytes(_pdf_bytes())
     pdfs = find_pdfs(tmp_path)
     assert len(pdfs) == 2
 
@@ -66,7 +77,7 @@ def test_find_pdfs_empty_dir(tmp_path):
 
 
 def test_find_pdfs_matches_uppercase_extension_and_skips_appledouble(tmp_path):
-    (tmp_path / "upper.PDF").write_bytes(b"%PDF")
+    (tmp_path / "upper.PDF").write_bytes(_pdf_bytes())
     (tmp_path / "._upper.pdf").write_bytes(b"junk")
     (tmp_path / "notes.md").write_text("x")
     assert [p.name for p in find_pdfs(tmp_path)] == ["upper.PDF"]
@@ -77,89 +88,43 @@ def test_find_pdfs_matches_uppercase_extension_and_skips_appledouble(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _outputs(index: dict) -> dict[str, list[str]]:
+    """Index as ``pdf_path -> outputs`` for compact assertions."""
+    return {record["pdf_path"]: record["outputs"] for record in index.values()}
+
+
 def test_load_processed_index_returns_empty_dict_when_file_missing(tmp_path):
-    output_dir = tmp_path / "output_summaries"
-    output_dir.mkdir()
-    result = load_processed_index(output_dir)
-    assert result == {}
+    assert load_processed_index(tmp_path) == {}
 
 
-def test_load_processed_index_reads_paths(tmp_path):
-    output_dir = tmp_path / "output_summaries"
-    output_dir.mkdir()
-    index = output_dir / "processed.txt"
-    index.write_text("/path/a.pdf\n/path/b.pdf\n", encoding="utf-8")
-    result = load_processed_index(output_dir)
-    assert "/path/a.pdf" in result
-    assert "/path/b.pdf" in result
-    assert len(result) == 2
-
-
-def test_load_processed_index_reads_summary_paths(tmp_path):
-    output_dir = tmp_path / "output_summaries"
-    output_dir.mkdir()
-    (output_dir / "processed.txt").write_text(
-        "/path/a.pdf, /out/a_summary.md, /out/a_summary_v2.md\n/path/b.pdf, /out/b_summary.md\n",
+def test_legacy_index_paths_and_summaries_are_read(tmp_path):
+    (tmp_path / "processed.txt").write_text(
+        "/path/a.pdf, /out/a_summary.md, /out/a_summary_v2.md\n\n/path/b.pdf\n",
         encoding="utf-8",
     )
-    result = load_processed_index(output_dir)
-    assert result["/path/a.pdf"] == ["/out/a_summary.md", "/out/a_summary_v2.md"]
-    assert result["/path/b.pdf"] == ["/out/b_summary.md"]
-
-
-def test_load_processed_index_ignores_blank_lines(tmp_path):
-    output_dir = tmp_path / "output_summaries"
-    output_dir.mkdir()
-    (output_dir / "processed.txt").write_text("/a.pdf\n\n/b.pdf\n\n", encoding="utf-8")
-    result = load_processed_index(output_dir)
-    assert len(result) == 2
-
-
-# ---------------------------------------------------------------------------
-# save_processed_index
-# ---------------------------------------------------------------------------
-
-
-def test_save_processed_index_writes_file(tmp_path):
-    output_dir = tmp_path / "output_summaries"
-    output_dir.mkdir()
-    index = {"/path/a.pdf": ["/out/a_summary.md"], "/path/b.pdf": []}
-    save_processed_index(output_dir, index)
-    content = (output_dir / "processed.jsonl").read_text(encoding="utf-8")
-    assert "/path/a.pdf" in content
-    assert "/path/b.pdf" in content
-    assert "/out/a_summary.md" in content
-
-
-def test_save_processed_index_creates_output_dir(tmp_path):
-    output_dir = tmp_path / "new_output"
-    save_processed_index(output_dir, {"/some/path.pdf": []})
-    assert output_dir.exists()
-    assert (output_dir / "processed.jsonl").exists()
-
-
-def test_load_save_roundtrip(tmp_path):
-    output_dir = tmp_path / "output_summaries"
-    output_dir.mkdir()
-    index = {
-        "/a.pdf": ["/out/a_summary.md"],
-        "/b.pdf": ["/out/b_summary.md", "/out/b_summary_v2.md"],
-        "/c.pdf": [],
+    assert _outputs(load_processed_index(tmp_path)) == {
+        "/path/a.pdf": ["/out/a_summary.md", "/out/a_summary_v2.md"],
+        "/path/b.pdf": [],
     }
-    save_processed_index(output_dir, index)
-    loaded = load_processed_index(output_dir)
-    assert loaded == index
+
+
+def test_index_roundtrip_keeps_sha_and_path_keys(tmp_path):
+    index = {
+        "abc": {"pdf_path": "/a.pdf", "outputs": ["/out/a_summary.md"], "sha256": "abc"},
+        "/legacy.pdf": {"pdf_path": "/legacy.pdf", "outputs": [], "sha256": None},
+    }
+    save_processed_index(tmp_path, index)
+    assert load_processed_index(tmp_path) == index
+    lines = (tmp_path / "processed.jsonl").read_text().splitlines()
+    assert json.loads(lines[1]) == {"pdf_path": "/legacy.pdf", "outputs": []}  # no null sha
 
 
 def test_roundtrip_preserves_paths_with_commas(tmp_path):
     """Regression: the old comma-separated format truncated such paths."""
-    pdf = tmp_path / "Smith et al. - 2024 - Spikes, Robots, and Control.pdf"
-    pdf.write_bytes(b"%PDF")
-    index = {str(pdf.resolve()): [str(tmp_path / "a, b_summary.md")]}
+    path = str(tmp_path / "Smith et al. - 2024 - Spikes, Robots, and Control.pdf")
+    index = {"s": {"pdf_path": path, "outputs": [str(tmp_path / "a, b_summary.md")], "sha256": "s"}}
     save_processed_index(tmp_path, index)
-    loaded = load_processed_index(tmp_path)
-    assert loaded == index
-    assert should_skip(pdf, loaded, force_summary=False) is True
+    assert load_processed_index(tmp_path) == index
 
 
 def test_legacy_index_with_commas_in_paths_is_parsed(tmp_path):
@@ -168,7 +133,7 @@ def test_legacy_index_with_commas_in_paths_is_parsed(tmp_path):
         "/out/smith2024spikes_summary_v2.md\n",
         encoding="utf-8",
     )
-    assert load_processed_index(tmp_path) == {
+    assert _outputs(load_processed_index(tmp_path)) == {
         "/lib/Smith - 2024 - Spikes, Robots.pdf": [
             "/out/smith2024spikes_summary.md",
             "/out/smith2024spikes_summary_v2.md",
@@ -178,19 +143,19 @@ def test_legacy_index_with_commas_in_paths_is_parsed(tmp_path):
 
 def test_jsonl_index_takes_precedence_over_legacy(tmp_path):
     (tmp_path / "processed.txt").write_text("/old.pdf\n", encoding="utf-8")
-    save_processed_index(tmp_path, {"/new.pdf": []})
-    assert load_processed_index(tmp_path) == {"/new.pdf": []}
+    save_processed_index(tmp_path, {"n": {"pdf_path": "/new.pdf", "outputs": [], "sha256": "n"}})
+    assert _outputs(load_processed_index(tmp_path)) == {"/new.pdf": []}
 
 
 def test_malformed_jsonl_line_is_ignored(tmp_path):
     (tmp_path / "processed.jsonl").write_text(
         '{"pdf_path": "/a.pdf", "outputs": []}\nnot json\n', encoding="utf-8"
     )
-    assert load_processed_index(tmp_path) == {"/a.pdf": []}
+    assert _outputs(load_processed_index(tmp_path)) == {"/a.pdf": []}
 
 
 def test_save_processed_index_leaves_no_temp_files(tmp_path):
-    save_processed_index(tmp_path, {"/a.pdf": []})
+    save_processed_index(tmp_path, {"a": {"pdf_path": "/a.pdf", "outputs": [], "sha256": "a"}})
     assert sorted(p.name for p in tmp_path.iterdir()) == ["processed.jsonl"]
 
 
@@ -199,24 +164,15 @@ def test_save_processed_index_leaves_no_temp_files(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_should_skip_returns_true_when_in_processed(tmp_path):
+def test_should_skip_by_sha_or_path(tmp_path):
     pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
-    processed = {str(pdf.resolve()): ["/out/summary.md"]}
-    assert should_skip(pdf, processed, force_summary=False) is True
-
-
-def test_should_skip_returns_false_when_not_in_processed(tmp_path):
-    pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
-    assert should_skip(pdf, {}, force_summary=False) is False
-
-
-def test_should_skip_force_summary_overrides(tmp_path):
-    pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
-    processed = {str(pdf.resolve()): ["/out/summary.md"]}
-    assert should_skip(pdf, processed, force_summary=True) is False
+    pdf.write_bytes(_pdf_bytes())
+    by_sha = {"abc": {"pdf_path": "/elsewhere.pdf", "outputs": [], "sha256": "abc"}}
+    by_path = {str(pdf.resolve()): {"pdf_path": str(pdf.resolve()), "outputs": [], "sha256": None}}
+    assert should_skip(pdf, by_sha, force_summary=False, sha256="abc") is True
+    assert should_skip(pdf, by_path, force_summary=False, sha256="other") is True
+    assert should_skip(pdf, {}, force_summary=False, sha256="abc") is False
+    assert should_skip(pdf, by_sha, force_summary=True, sha256="abc") is False
 
 
 # ---------------------------------------------------------------------------
@@ -251,13 +207,14 @@ def _make_summary(citation_key: str, paper_type: str = "primary") -> MagicMock:
     s = MagicMock()
     s.metadata.citation_key = citation_key
     s.metadata.paper_type = paper_type
+    s.model_dump_json.return_value = json.dumps({"citation_key": citation_key})
     return s
 
 
 def test_run_batch_processes_all_pdfs(tmp_path, config):
     """run_batch calls process_pdf for each PDF and writes output files."""
-    (tmp_path / "paper_a.pdf").write_bytes(b"%PDF")
-    (tmp_path / "paper_b.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper_a.pdf").write_bytes(_pdf_bytes())
+    (tmp_path / "paper_b.pdf").write_bytes(_pdf_bytes())
 
     summaries = [_make_summary("smith2020foo"), _make_summary("jones2021bar")]
 
@@ -275,7 +232,7 @@ def test_run_batch_processes_all_pdfs(tmp_path, config):
 
 def test_run_batch_uses_version_suffix_when_output_exists(tmp_path, config):
     pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
+    pdf.write_bytes(_pdf_bytes())
 
     existing = config.output_dir / "primary" / "smith2020foo_summary.md"
     existing.parent.mkdir(parents=True, exist_ok=True)
@@ -297,7 +254,7 @@ def test_run_batch_uses_version_suffix_when_output_exists(tmp_path, config):
 def test_run_batch_skips_processed_pdfs(tmp_path, config):
     """run_batch skips PDFs already listed in processed.txt."""
     pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
+    pdf.write_bytes(_pdf_bytes())
 
     config.output_dir.mkdir(parents=True)
     (config.output_dir / "processed.txt").write_text(
@@ -315,7 +272,7 @@ def test_run_batch_skips_processed_pdfs(tmp_path, config):
 def test_run_batch_force_summary_reprocesses(tmp_path, config):
     """run_batch with force_summary=True re-processes processed files."""
     pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
+    pdf.write_bytes(_pdf_bytes())
 
     config.output_dir.mkdir(parents=True)
     (config.output_dir / "processed.txt").write_text(
@@ -336,7 +293,7 @@ def test_run_batch_force_summary_reprocesses(tmp_path, config):
 
 def test_run_batch_records_failures(tmp_path, config):
     """run_batch continues after a PipelineError and records the failure."""
-    (tmp_path / "bad_paper.pdf").write_bytes(b"%PDF")
+    (tmp_path / "bad_paper.pdf").write_bytes(_pdf_bytes())
 
     err = PipelineError(tmp_path / "bad_paper.pdf", Exception("boom"))
     with (
@@ -352,7 +309,7 @@ def test_run_batch_records_failures(tmp_path, config):
 
 def test_run_batch_dry_run_makes_no_llm_calls(tmp_path, config):
     """run_batch with dry_run=True does not call process_pdf."""
-    (tmp_path / "paper_a.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper_a.pdf").write_bytes(_pdf_bytes())
     config.dry_run = True
 
     with patch("summarizer.batch.process_pdf") as mock_process:
@@ -365,8 +322,8 @@ def test_run_batch_dry_run_makes_no_llm_calls(tmp_path, config):
 
 def test_run_batch_logs_selection_summary(tmp_path, config, caplog):
     """Batch logs include discovered/selected/skipped counts before processing."""
-    (tmp_path / "paper_a.pdf").write_bytes(b"%PDF")
-    (tmp_path / "paper_b.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper_a.pdf").write_bytes(_pdf_bytes())
+    (tmp_path / "paper_b.pdf").write_bytes(_pdf_bytes())
 
     processed_pdf = tmp_path / "paper_b.pdf"
     config.output_dir.mkdir(parents=True)
@@ -390,7 +347,7 @@ def test_run_batch_logs_selection_summary(tmp_path, config, caplog):
 
 def test_run_batch_writes_to_centralized_output(tmp_path, config):
     """run_batch writes summary to output_summaries/{paper_type}/{citekey}_summary.md."""
-    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper.pdf").write_bytes(_pdf_bytes())
 
     summary = _make_summary("smith2020foo", paper_type="primary")
     with (
@@ -407,7 +364,7 @@ def test_run_batch_writes_to_centralized_output(tmp_path, config):
 def test_run_batch_appends_to_processed_txt(tmp_path, config):
     """After a successful run, the PDF path and summary path are recorded in processed.txt."""
     pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
+    pdf.write_bytes(_pdf_bytes())
 
     summary = _make_summary("smith2020foo")
     with (
@@ -416,17 +373,20 @@ def test_run_batch_appends_to_processed_txt(tmp_path, config):
     ):
         run_batch(tmp_path, config)
 
+    from summarizer.parser import sha256_file
+
     processed = load_processed_index(config.output_dir)
-    abs_path = str(pdf.resolve())
-    assert abs_path in processed
-    assert len(processed[abs_path]) == 1
-    assert processed[abs_path][0].endswith("smith2020foo_summary.md")
+    record = processed[sha256_file(pdf)]  # keyed by content
+    assert record["pdf_path"] == str(pdf.resolve())
+    assert len(record["outputs"]) == 1 and record["outputs"][0].endswith("smith2020foo_summary.md")
+    sidecar = Path(record["outputs"][0]).with_suffix(".json")
+    assert json.loads(sidecar.read_text()) == {"citation_key": "smith2020foo"}
 
 
 def test_run_batch_force_summary_appends_new_summary_path(tmp_path, config):
     """Re-processing with force_summary appends a new summary path to the existing entry."""
     pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
+    pdf.write_bytes(_pdf_bytes())
 
     abs_path = str(pdf.resolve())
     existing_summary = str(config.output_dir / "primary" / "smith2020foo_summary.md")
@@ -448,17 +408,16 @@ def test_run_batch_force_summary_appends_new_summary_path(tmp_path, config):
     ):
         run_batch(tmp_path, config)
 
-    processed = load_processed_index(config.output_dir)
-    assert abs_path in processed
-    assert len(processed[abs_path]) == 2
-    assert processed[abs_path][0] == existing_summary
-    assert processed[abs_path][1].endswith("smith2020foo_summary_v2.md")
+    outputs = _outputs(load_processed_index(config.output_dir))[abs_path]
+    assert len(outputs) == 2
+    assert outputs[0] == existing_summary
+    assert outputs[1].endswith("smith2020foo_summary_v2.md")
 
 
 def test_run_batch_failed_paper_not_in_processed(tmp_path, config):
     """Failed papers are NOT added to processed.txt."""
     pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
+    pdf.write_bytes(_pdf_bytes())
 
     err = PipelineError(pdf, Exception("boom"))
     with patch("summarizer.batch.process_pdf", side_effect=err):
@@ -475,8 +434,8 @@ def test_run_batch_failed_paper_not_in_processed(tmp_path, config):
 
 def test_run_batch_creates_client_once(tmp_path, config):
     """run_batch creates the LLM client exactly once before the thread pool."""
-    (tmp_path / "paper_a.pdf").write_bytes(b"%PDF")
-    (tmp_path / "paper_b.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper_a.pdf").write_bytes(_pdf_bytes())
+    (tmp_path / "paper_b.pdf").write_bytes(_pdf_bytes())
 
     summary_a = _make_summary("smith2020foo")
     summary_b = _make_summary("jones2021bar")
@@ -492,7 +451,7 @@ def test_run_batch_creates_client_once(tmp_path, config):
 
 def test_run_batch_report_has_total_cost(tmp_path, config):
     """BatchReport returned by run_batch has a total_cost field."""
-    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper.pdf").write_bytes(_pdf_bytes())
 
     summary = _make_summary("smith2020foo")
     with (
@@ -507,8 +466,8 @@ def test_run_batch_report_has_total_cost(tmp_path, config):
 
 
 def test_run_batch_loads_references_once_and_passes_them(tmp_path, config):
-    (tmp_path / "paper_a.pdf").write_bytes(b"%PDF")
-    (tmp_path / "paper_b.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper_a.pdf").write_bytes(_pdf_bytes())
+    (tmp_path / "paper_b.pdf").write_bytes(_pdf_bytes())
 
     with (
         patch("summarizer.batch.create_client"),
@@ -534,10 +493,9 @@ def test_run_batch_nothing_to_do_creates_no_client(tmp_path, config):
 
 def test_keyboard_interrupt_cancels_queued_papers(tmp_path, config):
     """Regression: Ctrl-C used to wait for (and pay for) every queued paper."""
-    import threading
 
     for i in range(6):
-        (tmp_path / f"p{i}.pdf").write_bytes(b"%PDF")
+        (tmp_path / f"p{i}.pdf").write_bytes(_pdf_bytes())
     config.workers = 1
     release = threading.Event()
     calls = []
@@ -557,6 +515,9 @@ def test_keyboard_interrupt_cancels_queued_papers(tmp_path, config):
     ):
         run_batch(tmp_path, config)
     release.set()
+    for thread in threading.enumerate():  # let the in-flight worker finish inside this test
+        if thread.name.startswith("worker"):
+            thread.join(5)
     assert len(calls) <= 2  # the interrupted paper plus at most one already in flight
 
 
@@ -564,27 +525,27 @@ def test_index_line_without_pdf_path_is_ignored(tmp_path):
     (tmp_path / "processed.jsonl").write_text(
         '{"outputs": []}\n[1, 2]\n{"pdf_path": "/a.pdf", "outputs": null}\n', encoding="utf-8"
     )
-    assert load_processed_index(tmp_path) == {"/a.pdf": []}
+    assert _outputs(load_processed_index(tmp_path)) == {"/a.pdf": []}
 
 
 def test_failed_index_write_keeps_previous_index(tmp_path):
-    save_processed_index(tmp_path, {"/a.pdf": []})
+    save_processed_index(tmp_path, {"a": {"pdf_path": "/a.pdf", "outputs": [], "sha256": "a"}})
     with (
         patch("summarizer.batch.os.replace", side_effect=OSError("disk full")),
         pytest.raises(OSError),
     ):
-        save_processed_index(tmp_path, {"/b.pdf": []})
-    assert load_processed_index(tmp_path) == {"/a.pdf": []}
+        save_processed_index(tmp_path, {"b": {"pdf_path": "/b.pdf", "outputs": [], "sha256": "b"}})
+    assert _outputs(load_processed_index(tmp_path)) == {"/a.pdf": []}
     assert sorted(p.name for p in tmp_path.iterdir()) == ["processed.jsonl"]
 
 
 def test_legacy_index_is_migrated_on_save(tmp_path, config):
     pdf = tmp_path / "Doe, J - 2024 - Spikes, Robots.pdf"
-    pdf.write_bytes(b"%PDF")
+    pdf.write_bytes(_pdf_bytes())
     config.output_dir.mkdir(parents=True)
     legacy = config.output_dir / "processed.txt"
     legacy.write_text(f"{pdf.resolve()}, /out/doe2024spikes_summary.md\n", encoding="utf-8")
-    (tmp_path / "new.pdf").write_bytes(b"%PDF")
+    (tmp_path / "new.pdf").write_bytes(_pdf_bytes())
 
     with (
         patch("summarizer.batch.create_client"),
@@ -593,9 +554,11 @@ def test_legacy_index_is_migrated_on_save(tmp_path, config):
     ):
         run_batch(tmp_path, config)
 
+    from summarizer.parser import sha256_file
+
     assert proc.call_count == 1  # the legacy entry (comma path) was skipped
     migrated = load_processed_index(config.output_dir)
-    assert migrated[str(pdf.resolve())] == ["/out/doe2024spikes_summary.md"]
+    assert migrated[sha256_file(pdf)]["outputs"] == ["/out/doe2024spikes_summary.md"]
     assert (config.output_dir / "processed.jsonl").exists()
     assert legacy.exists()
 
@@ -617,7 +580,7 @@ def test_parse_legacy_line_edge_cases(line, expected):
 
 
 def test_run_batch_report_includes_token_totals(tmp_path, config):
-    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    (tmp_path / "paper.pdf").write_bytes(_pdf_bytes())
 
     def fake_process(pdf_path, config, client, accumulator, references):
         from summarizer.llm import UsageStats
@@ -642,7 +605,7 @@ def _quota_error(pdf_path):
 
 def test_quota_exhaustion_stops_the_batch_without_failing_papers(tmp_path, config):
     for i in range(4):
-        (tmp_path / f"p{i}.pdf").write_bytes(b"%PDF")
+        (tmp_path / f"p{i}.pdf").write_bytes(_pdf_bytes())
     config.workers = 1
     calls = []
 
@@ -670,7 +633,7 @@ def test_max_cost_stops_starting_new_papers(tmp_path, config):
     from summarizer.llm import UsageStats
 
     for i in range(4):
-        (tmp_path / f"p{i}.pdf").write_bytes(b"%PDF")
+        (tmp_path / f"p{i}.pdf").write_bytes(_pdf_bytes())
     config.workers = 1
     config.max_cost = 0.01
 
@@ -699,7 +662,7 @@ def test_stop_signal_keeps_first_reason_and_quota_race_is_safe(tmp_path, config)
     assert stop.reason == "daily cap"
 
     for i in range(3):
-        (tmp_path / f"p{i}.pdf").write_bytes(b"%PDF")
+        (tmp_path / f"p{i}.pdf").write_bytes(_pdf_bytes())
     config.workers = 2
     with (
         patch("summarizer.batch.create_client"),
@@ -711,3 +674,62 @@ def test_stop_signal_keeps_first_reason_and_quota_race_is_safe(tmp_path, config)
         report = run_batch(tmp_path, config)
     assert report.stopped_reason == "free-models-per-day"
     assert (report.processed, report.failed, report.skipped) == (0, 0, 3)
+
+
+def test_moved_pdf_is_recognized_by_content(tmp_path, config):
+    """A PDF moved after being summarized is not summarized again."""
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    (old / "paper.pdf").write_bytes(_pdf_bytes())
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", return_value=_make_summary("a2020x")) as proc,
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        run_batch(old, config)
+        old.rename(new)
+        report = run_batch(new, config)
+    assert proc.call_count == 1 and report.skipped == 1
+
+
+def test_duplicate_pdfs_in_one_batch_are_processed_once(tmp_path, config):
+    content = _pdf_bytes()
+    (tmp_path / "a.pdf").write_bytes(content)
+    (tmp_path / "a_copy.pdf").write_bytes(content)
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", return_value=_make_summary("a2020x")) as proc,
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        report = run_batch(tmp_path, config)
+    assert (proc.call_count, report.processed, report.skipped) == (1, 1, 1)
+
+
+def test_output_dir_lock_blocks_a_second_run(tmp_path, config):
+    from summarizer.batch import OutputDirLocked, output_dir_lock
+
+    (tmp_path / "paper.pdf").write_bytes(_pdf_bytes())
+    with output_dir_lock(config.output_dir), pytest.raises(OutputDirLocked):
+        run_batch(tmp_path, config)
+    config.dry_run = True
+    with output_dir_lock(config.output_dir):
+        run_batch(tmp_path, config)  # dry runs don't need the lock
+
+
+def test_render_all_rebuilds_markdown_from_sidecars(tmp_path, mock_part1_dict, mock_part2_dict):
+    from summarizer.batch import render_all
+    from summarizer.models import PaperSummary
+
+    meta_keys = {"citation_key", "title", "authors", "year", "venue", "paper_type", "tags"}
+    metadata = {k: mock_part1_dict[k] for k in meta_keys} | {
+        "is_research_paper": True,
+        "rejection_reason": None,
+    }
+    part1 = {k: v for k, v in mock_part1_dict.items() if k not in meta_keys - {"paper_type"}}
+    summary = PaperSummary(metadata=metadata, part1=part1, part2=mock_part2_dict)
+    out = tmp_path / "out" / "primary"
+    out.mkdir(parents=True)
+    (out / "huebotter2025spiking_summary.json").write_text(summary.model_dump_json())
+    (out / "huebotter2025spiking_summary.md").write_text("# stale")
+    assert render_all(tmp_path / "out") == 1
+    assert (out / "huebotter2025spiking_summary.md").read_text().startswith("# Spiking Neural")

@@ -368,3 +368,61 @@ def test_llm_response_invalid_metadata_rejected(mock_part2_dict):
             part1={"paper_type": "primary", "tldr": "x"},
             part2=mock_part2_dict,
         )
+
+
+# ---------------------------------------------------------------------------
+# Classification (typed Part 2 labels)
+# ---------------------------------------------------------------------------
+
+
+def test_classification_labels_are_matched_leniently():
+    from summarizer.models import Classification
+
+    c = Classification(
+        inference_hardware="cpu / gpu",
+        architecture="Fully  Spiking",
+        credit_assignment="semi-local",
+        learning_regime="ONLINE",
+        paradigm_families=["reinforcement learning (model-free)", "Hybrid/multi-phase"],
+    )
+    assert c.model_dump() == {
+        "inference_hardware": "CPU/GPU",
+        "architecture": "fully spiking",
+        "credit_assignment": "Semi-local",
+        "learning_regime": "Online",
+        "paradigm_families": ["Reinforcement learning (model-free)", "Hybrid / multi-phase"],
+    }
+
+
+def test_classification_rejects_unknown_labels():
+    from pydantic import ValidationError
+
+    from summarizer.models import Classification
+
+    with pytest.raises(ValidationError):
+        Classification(
+            inference_hardware="TPU",
+            architecture="hybrid",
+            credit_assignment="Global",
+            learning_regime="Offline",
+            paradigm_families=[],
+        )
+
+
+def test_classification_vocabularies_match_the_references():
+    """Drift guard: every allowed label is spelled out in the prompt references."""
+    from typing import get_args
+
+    from summarizer.models import Classification
+
+    refs = Path(__file__).parent.parent / "skill_data" / "references"
+    contract = (refs / "json-output-contract.md").read_text(encoding="utf-8")
+    paradigms = (refs / "learning-paradigms.md").read_text(encoding="utf-8")
+    for name, field in Classification.model_fields.items():
+        labels = get_args(field.annotation)
+        if name == "paradigm_families":
+            for label in get_args(labels[0]):
+                assert f"`{label}`" in paradigms, label
+        else:
+            for label in labels:
+                assert label in contract, (name, label)

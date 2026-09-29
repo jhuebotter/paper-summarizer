@@ -18,8 +18,15 @@ from summarizer.evaluation import (
 )
 from summarizer.llm import CompletionResponse, LLMError, ModelPricing, UsageStats
 from summarizer.models import Config, PaperSummary
+from summarizer.parser import ParsedText
 
 REFERENCES_DIR = Path(__file__).parent.parent / "skill_data" / "references"
+
+
+def _parsed(text: str) -> ParsedText:
+    return ParsedText(text=text, extractor="pypdf", sha256="0" * 64)
+
+
 PAPER_TEXT = "The controller reaches 95.2% success on the reaching task."
 
 
@@ -184,8 +191,8 @@ def _run(tmp_path, pdfs, reply, configs=None, paper_text=PAPER_TEXT, max_chars=2
         max_chars=max_chars,
     )
     with (
-        patch("summarizer.evaluation.parse_pdf", return_value=paper_text),
-        patch("summarizer.pipeline.parse_pdf", return_value=paper_text[:max_chars]),
+        patch("summarizer.evaluation.load_text", return_value=_parsed(paper_text)),
+        patch("summarizer.pipeline.load_text", return_value=_parsed(paper_text)),
         patch("summarizer.evaluation.create_client", return_value=_inner_client(reply)),
     ):
         rows, _ = run_eval(
@@ -233,7 +240,7 @@ def test_first_try_valid_is_false_after_a_repair(tmp_path, pdfs, good):
 def test_parse_failure_row(tmp_path, pdfs):
     config = Config(base_url="http://localhost:1234/v1", skill_data_dir=REFERENCES_DIR)
     with (
-        patch("summarizer.evaluation.parse_pdf", side_effect=RuntimeError("corrupt")),
+        patch("summarizer.pipeline.load_text", side_effect=RuntimeError("corrupt")),
         patch("summarizer.evaluation.create_client", return_value=_inner_client(lambda p: "")),
     ):
         rows, _ = run_eval(
@@ -243,7 +250,7 @@ def test_parse_failure_row(tmp_path, pdfs):
             out_dir=tmp_path / "run",
             cache_dir=tmp_path / "cache",
         )
-    assert rows[0]["ok"] is False and rows[0]["error"].startswith("text preparation failed")
+    assert rows[0]["ok"] is False and "corrupt" in rows[0]["error"]
     assert rows[0].get("first_try_valid", False) is False
 
 
@@ -290,11 +297,16 @@ def test_run_eval_scores_gold_labels_and_failures_count_as_wrong(tmp_path, pdfs,
 
 
 def test_keyboard_interrupt_propagates(tmp_path, pdfs):
+    import threading
+
     def reply(prompt):
         raise KeyboardInterrupt
 
     with pytest.raises(KeyboardInterrupt):
-        _run(tmp_path, pdfs, reply)
+        _run(tmp_path, pdfs[:1], reply)
+    for thread in threading.enumerate():  # no worker may outlive the test's patches
+        if thread.name.startswith("eval"):
+            thread.join(5)
 
 
 def test_report_with_several_configs(good):
@@ -443,8 +455,8 @@ def test_quota_exhaustion_stops_eval_without_scoring_failures(tmp_path, good):
 
     config = Config(base_url="http://localhost:1234/v1", skill_data_dir=REFERENCES_DIR, workers=1)
     with (
-        patch("summarizer.evaluation.parse_pdf", return_value=PAPER_TEXT),
-        patch("summarizer.pipeline.parse_pdf", return_value=PAPER_TEXT),
+        patch("summarizer.evaluation.load_text", return_value=_parsed(PAPER_TEXT)),
+        patch("summarizer.pipeline.load_text", return_value=_parsed(PAPER_TEXT)),
         patch("summarizer.evaluation.create_client", return_value=_inner_client(reply)),
     ):
         rows, reason = run_eval(
@@ -469,8 +481,8 @@ def test_max_cost_stops_eval(tmp_path, pdfs, good):
         base_url="http://localhost:1234/v1", skill_data_dir=REFERENCES_DIR, workers=1, max_cost=0.01
     )
     with (
-        patch("summarizer.evaluation.parse_pdf", return_value=PAPER_TEXT),
-        patch("summarizer.pipeline.parse_pdf", return_value=PAPER_TEXT),
+        patch("summarizer.evaluation.load_text", return_value=_parsed(PAPER_TEXT)),
+        patch("summarizer.pipeline.load_text", return_value=_parsed(PAPER_TEXT)),
         patch("summarizer.evaluation.create_client", return_value=client),
     ):
         rows, reason = run_eval(
@@ -484,10 +496,23 @@ def test_max_cost_stops_eval(tmp_path, pdfs, good):
     assert reason == "--max-cost $0.01 reached"
 
 
-def test_eval_applies_strip_and_context_fit(tmp_path, pdfs, good):
-    with patch("summarizer.evaluation.fit_to_context", side_effect=lambda t, *a: t) as fit:
-        _run(tmp_path, pdfs[:1], _replies(("a.pdf", good)))
-    fit.assert_called_once()
+def test_eval_scores_against_the_stripped_text(tmp_path, pdfs, good):
+    with patch("summarizer.evaluation.load_text", return_value=_parsed(PAPER_TEXT)) as load:
+        config = Config(base_url="http://localhost:1234/v1", skill_data_dir=REFERENCES_DIR)
+        with (
+            patch("summarizer.pipeline.load_text", return_value=_parsed(PAPER_TEXT)),
+            patch(
+                "summarizer.evaluation.create_client", return_value=_inner_client(lambda p: good)
+            ),
+        ):
+            run_eval(
+                pdfs[:1],
+                config,
+                [EvalConfig("m", "pypdf")],
+                out_dir=tmp_path / "run",
+                cache_dir=tmp_path / "cache",
+            )
+    assert load.call_args.kwargs["strip_references"] is True
 
 
 def test_cache_key_covers_structured_output(tmp_path):
@@ -497,3 +522,24 @@ def test_cache_key_covers_structured_output(tmp_path):
     inner.response_format = {"type": "json_schema"}
     CachingClient(inner, tmp_path).complete("prompt")
     assert inner.complete.call_count == 2
+
+
+def test_gold_scores_classification_labels(mock_part1_dict, mock_part2_dict):
+    summary = PaperSummary(**_combined(mock_part1_dict, mock_part2_dict))
+    labels = {
+        "classification.architecture": "Fully spiking",
+        "classification.paradigm_families": ["gradient-based (surrogate gradient BPTT)"],
+        "classification.inference_hardware": "Physical neuromorphic chip",
+    }
+    assert score_gold(summary, labels) == {
+        "classification.architecture": True,
+        "classification.paradigm_families": True,
+        "classification.inference_hardware": False,
+    }
+
+
+def test_init_gold_stub_has_classification_fields(tmp_path, pdfs):
+    gold = tmp_path / "gold.jsonl"
+    init_gold(gold, pdfs[:1])
+    labels = json.loads(gold.read_text())["labels"]
+    assert "classification.learning_regime" in labels and labels["title"] is None

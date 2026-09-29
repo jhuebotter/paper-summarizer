@@ -1,34 +1,35 @@
 """Batch processing — summarise a list of PDFs (a directory scan or a single file).
 
-Skip detection
---------------
-Two independent skip conditions:
-
-* **Parse step** (handled in ``parser.py``): reuse a cached extraction next to
-  the PDF when one exists.
-* **LLM step** (handled here): skip a PDF entirely if its absolute path is in
-  the processed index ``{output_dir}/processed.jsonl``.
-
 Processed index
 ---------------
-One JSON object per line: ``{"pdf_path": ..., "outputs": [...]}``.  A legacy
-comma-separated ``processed.txt`` is read when no ``processed.jsonl`` exists;
-the next save writes the new format.  Writes are atomic (temp file + rename).
-Only one run should use an output directory at a time.
+``{output_dir}/processed.jsonl`` has one JSON object per paper:
+``{"sha256": ..., "pdf_path": ..., "outputs": [...]}``.  Papers are identified
+by content (sha256), so moved, renamed or duplicated PDFs are not summarized
+again; entries from older versions (path only, or the comma-separated
+``processed.txt``) still match by path and gain their sha256 on the next run.
+Writes are atomic, and a lock file stops two runs from sharing an output
+directory.
 
 Output location
 ---------------
-Summaries are written to ``{output_dir}/{paper_type}/{citekey}_summary.md``.
-If that path already exists, a version suffix is appended (``_v2``, ``_v3``, ...).
+Each summary is written as ``{output_dir}/{paper_type}/{citekey}_summary.md``
+plus a ``.json`` sidecar with the validated data and provenance (re-render with
+``summarize-papers render``).  If the path already exists, a version suffix is
+appended (``_v2``, ``_v3``, ...).
 """
 
-import hashlib
 import json
 import logging
 import os
 import sys
 import tempfile
 import threading
+from contextlib import contextmanager
+
+try:
+    import fcntl
+except ImportError:  # Windows: no advisory locks; runs must not overlap
+    fcntl = None
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -36,7 +37,8 @@ from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from summarizer.llm import CostAccumulator, QuotaExhausted, create_client
-from summarizer.models import BatchReport, Config, FailedPaper, PipelineError
+from summarizer.models import BatchReport, Config, FailedPaper, PaperSummary, PipelineError
+from summarizer.parser import sha256_file
 from summarizer.pipeline import process_pdf
 from summarizer.prompts import load_references
 from summarizer.renderer import render_summary
@@ -65,29 +67,21 @@ def find_pdfs(source_dir: Path) -> list[Path]:
     )
 
 
-def sha256_file(path: Path) -> str:
-    """Hex SHA-256 of a file's contents."""
-    digest = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 # ---------------------------------------------------------------------------
 # Processed index helpers
 # ---------------------------------------------------------------------------
 
 
-def load_processed_index(output_dir: Path) -> dict[str, list[str]]:
-    """Return a mapping of absolute PDF path → summary paths already written.
+def load_processed_index(output_dir: Path) -> dict[str, dict]:
+    """Return processed papers keyed by sha256 (or by path for older entries).
 
+    Each value is ``{"pdf_path": str, "outputs": [str], "sha256": str | None}``.
     Reads ``processed.jsonl``; falls back to the legacy ``processed.txt``.
     Returns an empty dict if neither exists.
     """
     index_path = output_dir / INDEX_FILENAME
     if index_path.exists():
-        result: dict[str, list[str]] = {}
+        result: dict[str, dict] = {}
         for lineno, line in enumerate(index_path.read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
                 continue
@@ -98,7 +92,10 @@ def load_processed_index(output_dir: Path) -> dict[str, list[str]]:
             if not isinstance(entry, dict) or not isinstance(entry.get("pdf_path"), str):
                 logger.warning("Ignoring malformed line %d in %s", lineno, index_path)
                 continue
-            result[entry["pdf_path"]] = list(entry.get("outputs") or [])
+            sha = entry.get("sha256") if isinstance(entry.get("sha256"), str) else None
+            result[sha or entry["pdf_path"]] = _record(
+                entry["pdf_path"], entry.get("outputs") or [], sha
+            )
         return result
 
     legacy_path = output_dir / LEGACY_INDEX_FILENAME
@@ -108,8 +105,15 @@ def load_processed_index(output_dir: Path) -> dict[str, list[str]]:
             LEGACY_INDEX_FILENAME,
             INDEX_FILENAME,
         )
-        return _load_legacy_index(legacy_path)
+        return {
+            path: _record(path, outputs, None)
+            for path, outputs in _load_legacy_index(legacy_path).items()
+        }
     return {}
+
+
+def _record(pdf_path: str, outputs: list[str], sha256: str | None) -> dict:
+    return {"pdf_path": pdf_path, "outputs": list(outputs), "sha256": sha256}
 
 
 def _load_legacy_index(path: Path) -> dict[str, list[str]]:
@@ -145,12 +149,12 @@ def _parse_legacy_line(line: str) -> tuple[str, list[str]]:
     return pdf_path, outputs
 
 
-def save_processed_index(output_dir: Path, index: dict[str, list[str]]) -> None:
+def save_processed_index(output_dir: Path, index: dict[str, dict]) -> None:
     """Atomically write ``index`` to ``output_dir/processed.jsonl``."""
     output_dir.mkdir(parents=True, exist_ok=True)
     lines = [
-        json.dumps({"pdf_path": pdf_path, "outputs": index[pdf_path]}, ensure_ascii=False)
-        for pdf_path in sorted(index)
+        json.dumps({k: v for k, v in record.items() if v is not None}, ensure_ascii=False)
+        for record in sorted(index.values(), key=lambda r: r["pdf_path"])
     ]
     atomic_write_text(output_dir / INDEX_FILENAME, "\n".join(lines) + "\n" if lines else "")
 
@@ -171,15 +175,33 @@ def atomic_write_text(path: Path, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def should_skip(pdf_path: Path, processed: dict[str, list[str]], force_summary: bool) -> bool:
-    """Return ``True`` if the PDF should be skipped for the LLM step.
+def should_skip(
+    pdf_path: Path, processed: dict[str, dict], force_summary: bool, sha256: str | None = None
+) -> bool:
+    """Return ``True`` if the PDF was already summarized (by content or path).
 
-    A PDF is skipped when its absolute path is in ``processed`` and
-    ``force_summary=False``.
+    ``force_summary`` disables skipping.
     """
     if force_summary:
         return False
-    return str(pdf_path.resolve()) in processed
+    return (sha256 is not None and sha256 in processed) or str(pdf_path.resolve()) in processed
+
+
+class OutputDirLocked(Exception):
+    """Another run is using the output directory."""
+
+
+@contextmanager
+def output_dir_lock(output_dir: Path):
+    """Hold an exclusive lock on ``output_dir`` for the duration of a run."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / ".lock").open("w") as handle:
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise OutputDirLocked(f"Another run is using {output_dir}") from None
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +299,20 @@ def _process_one_pdf(
     }
 
 
+def render_all(output_dir: Path) -> int:
+    """Re-render every summary's markdown from its JSON sidecar; return how many.
+
+    No LLM calls: use this after changing the renderer or template.
+    """
+    count = 0
+    with output_dir_lock(output_dir):
+        for json_path in sorted(output_dir.rglob("*_summary*.json")):
+            summary = PaperSummary.model_validate_json(json_path.read_text(encoding="utf-8"))
+            atomic_write_text(json_path.with_suffix(".md"), render_summary(summary))
+            count += 1
+    return count
+
+
 # ---------------------------------------------------------------------------
 # Batch runner
 # ---------------------------------------------------------------------------
@@ -288,11 +324,26 @@ def run_batch(source_dir: Path, config: Config) -> BatchReport:
 
 
 def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
+    """Process ``pdfs`` and return an aggregate report (see ``_run_pdfs``).
+
+    Holds the output-directory lock, except in dry-run mode.
+
+    Raises:
+        OutputDirLocked: if another run is using ``config.output_dir``.
+    """
+    if config.dry_run:
+        return _run_pdfs(pdfs, config)
+    with output_dir_lock(config.output_dir):
+        return _run_pdfs(pdfs, config)
+
+
+def _run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
     """Process ``pdfs`` and return an aggregate report.
 
     1. Load the processed index once.
-    2. Drop PDFs that ``should_skip`` (unless ``force_summary``); in dry-run
-       mode stop after logging what would be processed.
+    2. Drop PDFs that ``should_skip`` (unless ``force_summary``) and duplicates
+       (same content) within the batch; in dry-run mode stop after logging what
+       would be processed.
     3. Process the rest concurrently (``config.workers``) with one shared LLM
        client, cost accumulator and reference text.
     4. On success, write ``get_versioned_output_path(...)`` and record it in
@@ -317,14 +368,28 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
     failed_papers: list[FailedPaper] = []
 
     jobs: list[Path] = []
+    shas: dict[Path, str] = {}
     n_skipped_by_index = 0
+    migrated = False
 
     for pdf_path in pdfs:
-        if should_skip(pdf_path, processed_set, config.force_summary):
+        sha = sha256_file(pdf_path)
+        path_key = str(pdf_path.resolve())
+        if sha not in processed_set and path_key in processed_set:
+            processed_set[sha] = processed_set.pop(path_key) | {"sha256": sha}
+            migrated = True
+        if sha in shas.values():
+            logger.info("Skipping %s: same content as another PDF in this batch", pdf_path.name)
+            n_skipped += 1
+            continue
+        shas[pdf_path] = sha
+        if should_skip(pdf_path, processed_set, config.force_summary, sha):
             n_skipped += 1
             n_skipped_by_index += 1
             continue
         jobs.append(pdf_path)
+    if migrated and not config.dry_run:
+        save_processed_index(config.output_dir, processed_set)
 
     logger.info("Selected for processing: %d", len(jobs))
     logger.info("Skipped by processed index: %d", n_skipped_by_index)
@@ -389,8 +454,14 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
                             summary.metadata.citation_key,
                         )
                     )
-                    output_path.write_text(result["markdown"], encoding="utf-8")
-                    processed_set.setdefault(abs_path, []).append(str(output_path))
+                    atomic_write_text(
+                        output_path.with_suffix(".json"), summary.model_dump_json(indent=2)
+                    )
+                    atomic_write_text(output_path, result["markdown"])
+                    sha = shas[pdf_path]
+                    record = processed_set.setdefault(sha, _record(abs_path, [], sha))
+                    record["pdf_path"] = abs_path
+                    record["outputs"].append(str(output_path))
                     save_processed_index(config.output_dir, processed_set)
                     logger.info("  [%d/%d] Written: %s", run_idx, run_total, output_path)
                     n_processed += 1

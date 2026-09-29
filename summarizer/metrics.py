@@ -202,7 +202,7 @@ def _analytic_texts(summary: PaperSummary) -> list[str]:
     for items in part1.open_problems_future_directions.model_dump().values():
         texts += items
     if summary.part2 is not None:
-        texts += list(summary.part2.model_dump().values())
+        texts += list(summary.part2.model_dump(exclude={"classification"}).values())
     return texts
 
 
