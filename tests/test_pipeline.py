@@ -571,3 +571,26 @@ def test_accumulator_counts_calls_and_repairs(fake_pdf, config, mock_part1_dict,
     with _mock_parse("text"):
         process_pdf(fake_pdf, config, client=mock_client, accumulator=acc)
     assert (acc.calls, acc.json_repairs, acc.schema_repairs) == (3, 1, 1)
+
+
+def test_fit_to_context_cuts_for_small_context_models(config):
+    from summarizer.pipeline import build_combined_prompt, fit_to_context
+
+    refs = "R" * 3000
+    overhead = len(build_combined_prompt("", refs, "x.pdf")) // 3
+    context = overhead + 16_000 + 100  # room for 100 tokens of paper
+    assert len(fit_to_context("p" * 10_000, refs, "x.pdf", context, config)) == 300
+    assert fit_to_context("p" * 10_000, refs, "x.pdf", 0, config) == "p" * 10_000
+    assert fit_to_context("p" * 10, refs, "x.pdf", MagicMock(), config) == "p" * 10
+    with pytest.raises(ValueError, match="exceeds"):
+        fit_to_context("p", refs, "x.pdf", overhead, config)
+
+
+def test_process_pdf_passes_strip_references_to_parser(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    client_patcher, _ = _mock_llm_combined(combined)
+    with _mock_parse("text") as parse, client_patcher:
+        process_pdf(fake_pdf, config)
+    assert parse.call_args.kwargs["strip_references"] is True

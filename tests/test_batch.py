@@ -632,3 +632,59 @@ def test_run_batch_report_includes_token_totals(tmp_path, config):
     ):
         report = run_batch(tmp_path, config)
     assert (report.input_tokens, report.output_tokens) == (1000, 200)
+
+
+def _quota_error(pdf_path):
+    from summarizer.llm import QuotaExhausted
+
+    return PipelineError(pdf_path, QuotaExhausted("free-models-per-day"))
+
+
+def test_quota_exhaustion_stops_the_batch_without_failing_papers(tmp_path, config):
+    for i in range(4):
+        (tmp_path / f"p{i}.pdf").write_bytes(b"%PDF")
+    config.workers = 1
+    calls = []
+
+    def fake_process(pdf_path, *args, **kwargs):
+        calls.append(pdf_path.name)
+        if len(calls) == 1:
+            return _make_summary("first2020x")
+        raise _quota_error(pdf_path)
+
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", side_effect=fake_process),
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        report = run_batch(tmp_path, config)
+
+    assert report.stopped_reason == "free-models-per-day"
+    assert (report.processed, report.failed) == (1, 0)
+    assert report.skipped == 3
+    assert len(calls) <= 3  # queued papers were cancelled, not all attempted
+    assert len(load_processed_index(config.output_dir)) == 1
+
+
+def test_max_cost_stops_starting_new_papers(tmp_path, config):
+    from summarizer.llm import UsageStats
+
+    for i in range(4):
+        (tmp_path / f"p{i}.pdf").write_bytes(b"%PDF")
+    config.workers = 1
+    config.max_cost = 0.01
+
+    def fake_process(pdf_path, config, client, accumulator, references):
+        accumulator.add(UsageStats(), 0.006)
+        return _make_summary(pdf_path.stem)
+
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", side_effect=fake_process),
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        report = run_batch(tmp_path, config)
+
+    assert report.stopped_reason == "--max-cost $0.01 reached"
+    assert report.processed + report.skipped == 4
+    assert 2 <= report.processed <= 3  # stops after the budget is crossed (+ one in flight)

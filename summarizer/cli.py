@@ -34,7 +34,12 @@ from dotenv import load_dotenv
 
 from summarizer.batch import find_pdfs, load_processed_index, run_batch, run_pdfs, should_skip
 from summarizer.evaluation import EvalConfig, init_gold, run_eval
-from summarizer.llm import fetch_openrouter_model_ids, openrouter_listed_id
+from summarizer.llm import (
+    fetch_openrouter_key_info,
+    fetch_openrouter_models,
+    is_openrouter,
+    openrouter_listed_id,
+)
 from summarizer.log import setup_logging
 from summarizer.models import (
     _DEFAULT_MAX_CHARS,
@@ -88,6 +93,9 @@ def main(argv: list[str] | None = None) -> None:
         timeout_s=args.timeout,
         max_output_tokens=args.max_output_tokens,
         workers=args.workers,
+        strip_references=args.strip_references,
+        structured_output=args.structured_output,
+        max_cost=args.max_cost,
     )
 
     # Validate the backend is reachable and usable before starting any work
@@ -164,6 +172,8 @@ def _eval_main(argv: list[str]) -> None:
         timeout_s=args.timeout,
         max_output_tokens=args.max_output_tokens,
         workers=args.workers,
+        strip_references=args.strip_references,
+        structured_output=args.structured_output,
     )
     _check_backend(config.base_url)
     for model in models:
@@ -288,6 +298,12 @@ def _report_and_exit(report: BatchReport) -> None:
         logger.error("Failed papers:")
         for fp in report.failed_papers:
             logger.error("  %s: %s", fp.pdf_path, fp.error)
+    if report.stopped_reason:
+        logger.warning(
+            "Stopped early (%s); finished papers are saved, rerun later to continue.",
+            report.stopped_reason,
+        )
+    if report.failed_papers or report.stopped_reason:
         sys.exit(1)
 
 
@@ -318,19 +334,47 @@ def _check_openrouter_config(config: Config) -> None:
     Checks that an API key is set and that the model id is still listed
     (OpenRouter retires model ids, e.g. ``:free`` variants).
     """
-    if "openrouter.ai" not in config.base_url:
+    if not is_openrouter(config.base_url):
         return
-    if not (config.api_key or os.environ.get("LLM_API_KEY")):
+    api_key = config.api_key or os.environ.get("LLM_API_KEY")
+    if not api_key:
         logger.error("LLM_API_KEY is not set; OpenRouter requires an API key (see README).")
         sys.exit(1)
-    model_ids = fetch_openrouter_model_ids(config.base_url)
-    if model_ids is not None and not _openrouter_model_listed(config.model, model_ids):
-        logger.error(
-            "Model %r is not available on OpenRouter. Pick one from "
-            "https://openrouter.ai/models and pass --model or set LLM_MODEL.",
-            config.model,
+    models = fetch_openrouter_models(config.base_url)
+    if models is not None:
+        by_id = {m["id"]: m for m in models}
+        if not _openrouter_model_listed(config.model, set(by_id)):
+            logger.error(
+                "Model %r is not available on OpenRouter. Pick one from "
+                "https://openrouter.ai/models and pass --model or set LLM_MODEL.",
+                config.model,
+            )
+            sys.exit(1)
+        entry = by_id.get(openrouter_listed_id(config.model), {})
+        if config.structured_output and "structured_outputs" not in (
+            entry.get("supported_parameters") or []
+        ):
+            logger.error("Model %r does not support --structured-output.", config.model)
+            sys.exit(1)
+    _log_key_info(config, api_key)
+
+
+def _log_key_info(config: Config, api_key: str) -> None:
+    """Log the OpenRouter key's spend and limits; warn about the free-model daily cap."""
+    info = fetch_openrouter_key_info(config.base_url, api_key)
+    if info is None:
+        return
+    logger.info(
+        "OpenRouter key: used $%.4f, limit %s, remaining %s",
+        float(info.get("usage") or 0),
+        "none" if info.get("limit") is None else f"${info['limit']}",
+        "n/a" if info.get("limit_remaining") is None else f"${info['limit_remaining']}",
+    )
+    if info.get("is_free_tier") and config.model.endswith(":free"):
+        logger.warning(
+            "Free-tier key: free models allow 50 requests/day (~35 papers with repairs); "
+            "the run stops cleanly at the cap. $10 of credits raises it to 1,000/day."
         )
-        sys.exit(1)
 
 
 def _openrouter_model_listed(model: str, model_ids: set[str]) -> bool:
@@ -405,6 +449,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_default_model,
         help=f"LLM model identifier (default: LLM_MODEL env var, currently {_default_model!r}).",
     )
+    parser.add_argument(
+        "--max-cost",
+        metavar="USD",
+        type=float,
+        default=None,
+        help=(
+            "Stop starting new papers once this much has been spent (papers already "
+            "running still finish)."
+        ),
+    )
     _add_backend_args(parser, log_default="logs/run_TIMESTAMP.log")
     return parser
 
@@ -475,6 +529,20 @@ def _add_backend_args(parser: argparse.ArgumentParser, log_default: str) -> None
             "Maximum tokens the LLM may generate per call. "
             "Default: no limit (model stops on its own). "
             "Set when the backend enforces a cap or to bound cost."
+        ),
+    )
+    parser.add_argument(
+        "--strip-references",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Drop the References/Bibliography section before sending the text (default: on).",
+    )
+    parser.add_argument(
+        "--structured-output",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Constrain replies to the summary JSON schema (backend must support it; default: off)."
         ),
     )
 

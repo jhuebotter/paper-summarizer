@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 _MAX_SCHEMA_REPAIR_RETRIES = 2
 _CONTRACT_FILENAME = "json-output-contract.md"
 _MAX_CITATION_KEY_LEN = 64  # keeps output filenames well below OS limits
+_CHARS_PER_TOKEN = 3  # conservative: maths-heavy text tokenizes densely
+_OUTPUT_RESERVE_TOKENS = 16_000
 
 
 def process_pdf(
@@ -83,6 +85,7 @@ def _run_pipeline(
         config.max_chars,
         reparse=config.reparse,
         extractor=config.extractor,
+        strip_references=config.strip_references,
     )
 
     # Step 2: load references and build combined prompt
@@ -90,6 +93,9 @@ def _run_pipeline(
         references = load_references(config.skill_data_dir)
     if client is None:
         client = create_client(config)
+    paper_text = fit_to_context(
+        paper_text, references, pdf_path.name, client.pricing.context_length, config
+    )
     prompt = build_combined_prompt(
         paper_text=paper_text,
         references=references,
@@ -113,6 +119,32 @@ def _run_pipeline(
     )
 
     return PaperSummary(metadata=response.metadata, part1=response.part1, part2=response.part2)
+
+
+def fit_to_context(
+    paper_text: str, references: str, source_filename: str, context_length: object, config: Config
+) -> str:
+    """Cut the paper text so prompt + reply fit the model's context window.
+
+    Uses a conservative ~3 characters per token and reserves
+    ``max_output_tokens`` (or 16k tokens) for the reply.  Unknown context
+    lengths leave the text unchanged.
+    """
+    if not isinstance(context_length, int) or context_length <= 0:
+        return paper_text
+    overhead = len(build_combined_prompt("", references, source_filename)) // _CHARS_PER_TOKEN
+    reserve = config.max_output_tokens or _OUTPUT_RESERVE_TOKENS
+    budget = (context_length - overhead - reserve) * _CHARS_PER_TOKEN
+    if budget <= 0:
+        raise ValueError(f"The prompt alone exceeds the model's {context_length:,}-token context")
+    if len(paper_text) > budget:
+        logger.warning(
+            "Paper text cut to %s chars to fit the model's %s-token context",
+            f"{budget:,}",
+            f"{context_length:,}",
+        )
+        return paper_text[:budget]
+    return paper_text
 
 
 def _load_contract(references_dir: Path) -> str:

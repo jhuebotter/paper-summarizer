@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import threading
+import time
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
@@ -215,7 +216,10 @@ def test_call_llm_retries_on_429_then_succeeds():
         MagicMock(text=json.dumps(data)),
     ]
 
-    with patch("summarizer.llm.time.sleep") as mock_sleep:
+    with (
+        patch("summarizer.llm.time.sleep") as mock_sleep,
+        patch("summarizer.llm.random.uniform", return_value=1.0),
+    ):
         result = call_llm(mock_client, "some prompt")
 
     assert result == data
@@ -233,7 +237,10 @@ def test_call_llm_retries_on_5xx_then_succeeds():
         MagicMock(text=json.dumps(data)),
     ]
 
-    with patch("summarizer.llm.time.sleep") as mock_sleep:
+    with (
+        patch("summarizer.llm.time.sleep") as mock_sleep,
+        patch("summarizer.llm.random.uniform", return_value=1.0),
+    ):
         result = call_llm(mock_client, "some prompt")
 
     assert result == data
@@ -953,3 +960,139 @@ def test_pricing_lookup_strips_routing_suffix():
     with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)):
         pricing = fetch_model_pricing("a/b:nitro", "k", "https://openrouter.ai/api/v1")
     assert pricing.prompt == 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Quotas, backoff, billed cost, structured output
+# ---------------------------------------------------------------------------
+
+
+def _api_error(status: int, message: str = "error", headers: dict | None = None):
+    exc = Exception(f"Error code: {status} - {message}")
+    exc.status_code = status
+    exc.body = {"message": message, "metadata": {"headers": headers or {}}}
+    return exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _api_error(402, "Insufficient credits"),
+        _api_error(429, "Rate limit exceeded: free-models-per-day"),
+        _api_error(
+            429,
+            "Rate limit exceeded",
+            {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str((time.time() + 7200) * 1000)},
+        ),
+    ],
+)
+def test_exhausted_quota_is_not_retried(exc):
+    from summarizer.llm import QuotaExhausted
+
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = exc
+    with patch("summarizer.llm.time.sleep") as sleep, pytest.raises(QuotaExhausted):
+        call_llm(mock_client, "prompt")
+    sleep.assert_not_called()
+    assert mock_client.complete.call_count == 1
+
+
+def test_per_minute_rate_limit_is_retried_with_retry_after():
+    mock_client = MagicMock()
+    exc = _api_error(429, "Rate limit exceeded: 20 per minute")
+    exc.response = MagicMock(headers={"retry-after": "7"})
+    mock_client.complete.side_effect = [exc, MagicMock(text='{"ok": true}', usage=None)]
+    with patch("summarizer.llm.time.sleep") as sleep:
+        assert call_llm(mock_client, "prompt") == {"ok": True}
+    sleep.assert_called_once_with(7.0)
+
+
+def test_quota_message_includes_reset_time():
+    from summarizer.llm import _quota_exhausted_message
+
+    reset = (time.time() + 3600) * 1000
+    message = _quota_exhausted_message(
+        _api_error(429, "limit", {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(reset)})
+    )
+    assert "resets at" in message
+
+
+def test_billed_cost_and_cached_tokens_are_read_from_usage():
+    usage = MagicMock(
+        prompt_tokens=1000,
+        completion_tokens=100,
+        completion_tokens_details=MagicMock(reasoning_tokens=20),
+        prompt_tokens_details=MagicMock(cached_tokens=800),
+        cost=0.0042,
+    )
+    stats = _extract_usage(MagicMock(usage=usage))
+    assert (stats.cached_tokens, stats.cost) == (800, 0.0042)
+    assert _calculate_cost(stats, ModelPricing(prompt=1.0)) == 0.0042  # billed beats list price
+
+
+def test_non_numeric_cost_is_ignored():
+    usage = MagicMock(prompt_tokens=1, completion_tokens=1)  # .cost is a MagicMock
+    assert _extract_usage(MagicMock(usage=usage)).cost is None
+
+
+def test_structured_output_request_shape():
+    config = Config(
+        base_url="https://openrouter.ai/api/v1", model="m", api_key="k", structured_output=True
+    )
+    with (
+        patch("summarizer.llm._openai.OpenAI") as mock_openai,
+        patch("summarizer.llm.fetch_model_pricing", return_value=ModelPricing()),
+    ):
+        mock_openai.return_value.chat.completions.create.return_value = _sdk_response()
+        create_client(config).complete("hello")
+    kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
+    assert kwargs["response_format"]["type"] == "json_schema"
+    assert "metadata" in kwargs["response_format"]["json_schema"]["schema"]["properties"]
+    assert kwargs["extra_body"] == {"provider": {"require_parameters": True}}
+
+
+def test_structured_output_off_by_default():
+    with _client_returning(_sdk_response()) as (client, mock_openai):
+        client.complete("hello")
+    kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
+    assert "response_format" not in kwargs and "extra_body" not in kwargs
+
+
+def test_structured_output_rejection_gets_a_hint():
+    mock_client = MagicMock()
+    mock_client.response_format = {"type": "json_schema"}
+    mock_client.complete.side_effect = _api_error(404, "No endpoints found")
+    with pytest.raises(LLMError, match="without --structured-output"):
+        call_llm(mock_client, "prompt")
+
+
+def test_pricing_records_structured_output_support():
+    body = json.dumps(
+        {"data": [{"id": "a/b", "supported_parameters": ["structured_outputs", "tools"]}]}
+    ).encode()
+    with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)):
+        assert fetch_model_pricing("a/b", "k", "https://openrouter.ai/api/v1").structured_outputs
+
+
+def test_fetch_openrouter_key_info():
+    from summarizer.llm import fetch_openrouter_key_info
+
+    body = json.dumps({"data": {"usage": 0.5, "is_free_tier": True}}).encode()
+    with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)):
+        info = fetch_openrouter_key_info("https://openrouter.ai/api/v1", "k")
+    assert info == {"usage": 0.5, "is_free_tier": True}
+    assert fetch_openrouter_key_info("https://openrouter.ai/api/v1", "k") is None  # no network
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://openrouter.ai/api/v1", True),
+        ("http://localhost:1234/v1", False),
+        ("http://proxy.local/openrouter.ai/v1", False),
+    ],
+)
+def test_is_openrouter(url, expected):
+    from summarizer.llm import is_openrouter
+
+    assert is_openrouter(url) is expected

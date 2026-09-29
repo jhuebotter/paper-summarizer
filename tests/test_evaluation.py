@@ -418,7 +418,22 @@ def test_non_eval_invocations_route_to_run(tmp_path, argv):
             total_cost=0.0,
             input_tokens=0,
             output_tokens=0,
+            stopped_reason=None,
         )
         main([a.format(tmp=tmp_path) for a in argv] + ["--dry-run"])
     run_batch.assert_called_once()
     run_eval_mock.assert_not_called()
+
+
+def test_quota_exhaustion_stops_eval_without_scoring_failures(tmp_path, pdfs, good):
+    from summarizer.llm import QuotaExhausted
+
+    def reply(prompt):
+        if "a.pdf" in prompt:
+            return good
+        raise QuotaExhausted("free-models-per-day")
+
+    rows = _run(tmp_path, pdfs, reply)
+    assert [r["file"] for r in rows] == ["a.pdf"]
+    report = (tmp_path / "run" / "report.md").read_text()
+    assert "Stopped early: free-models-per-day" in report

@@ -281,6 +281,7 @@ class BatchReport(BaseModel):
     total_cost: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
+    stopped_reason: str | None = None  # set when the run stopped before all papers
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +350,11 @@ class Config:
                            the backend enforces a cap or to bound cost.
         workers:           Number of concurrent workers used in batch mode.
                            Each worker processes full PDFs end-to-end.
+        strip_references:  Drop the References/Bibliography section before the
+                           text is truncated and sent.
+        structured_output: Ask the backend to constrain replies to the
+                           ``LLMResponse`` JSON schema.
+        max_cost:          Stop starting new papers once this many USD are spent.
     """
 
     base_url: str = DEFAULT_BASE_URL
@@ -365,6 +371,9 @@ class Config:
     timeout_s: int = 120
     max_output_tokens: int | None = None
     workers: int = 3
+    strip_references: bool = True
+    structured_output: bool = False
+    max_cost: float | None = None
 
 
 # ---------------------------------------------------------------------------
