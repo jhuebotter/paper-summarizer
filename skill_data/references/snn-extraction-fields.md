@@ -1,10 +1,10 @@
 # SNN Control Extraction Fields — Definitions & Guidance
 
-**Every field: 1 sentence (one line). Learning mechanism: 2 sentences max. Notable findings: bullet points.  
+**Every field: 1 sentence (one line). Learning mechanism: 2 sentences max.  
 Numbers: neuron/parameter counts and DOF only. No hyperparameters. No padding.**
 
 **Filling rules (must follow):**
-- No blanks: use `not reported` / `not applicable` / `not applicable (survey)` as appropriate.
+- No blanks: use `not reported` / `not applicable` as appropriate.
 - Any specific numeric value or concrete claim should include a short anchor: `Source: Sec. X / Fig. Y / Tbl. Z / App. A`.
 - Prefer compact phrasing with semicolons/parentheses over multiple sentences.
 
@@ -15,9 +15,6 @@ Numbers: neuron/parameter counts and DOF only. No hyperparameters. No padding.**
 **"not applicable" vs. "not reported":**
 - `not applicable` — concept genuinely doesn't apply (e.g. "online vs. offline" for a system with no learning)
 - `not reported` — concept applies but paper omits it; this is a transparency gap worth noting
-- `not applicable (survey)` — survey paper; details are aggregated, not per-system
-
-**Opinion / commentary papers:** Describe the target system with attribution "(as described in [author year], re [target paper])". Do not describe the commentary author's perspective arguments as technical properties of the system.
 
 **Strength of evidence:** If a field is filled based on what a paper claims rather than demonstrates, note this (e.g., “claimed”, “measured”, “estimated”). "Authors claim energy efficiency of X" differs from "measured energy on Loihi: X J/inference."
 

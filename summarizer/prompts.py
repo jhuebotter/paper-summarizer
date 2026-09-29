@@ -66,7 +66,7 @@ Year resolution priority (for metadata.year):
 1) explicit publication year in the paper metadata/header,
 2) source filename,
 3) best-supported inference from paper context (e.g., references) only if needed.
-- metadata.year must be an integer (never "not reported").
+- metadata.year must be an integer; use null only if no year can be determined at all (never "not reported").
 
 Research gate rules:
 - If the document is a research paper:

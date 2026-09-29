@@ -31,7 +31,7 @@ Classify as: **primary research** or **synthesis**.
 - **Consistency:** Use `not reported` when the concept applies but is omitted; use `not applicable` when it genuinely does not apply.
 - **Arguments:** Author arguments are perspectives ("the authors argue..."), rarely facts.
 - **Author names:** Copy author names verbatim from the paper's byline or header. Do not alter spelling, capitalisation, or diacritics.
-- **Citation key:** Always `firstauthorYEARfirstword` (all lowercase, letters and digits only). For the year, trust the source filename first. If the first word of the title is non-descriptive (e.g., "A", "An", "The", "On", "Towards", "Novel"), skip it and use the next descriptive word instead. Examples: "A Novel Robotic Controller…" → `marrero2024novel`; "On the Role of…" → `smith2020role`. Do not use the first name of the author in the authorname.
+- **Citation key:** Always `firstauthorYEARfirstword` (all lowercase, letters and digits only). For the year, use the year printed in the paper header; fall back to the source filename. If the first word of the title is non-descriptive (e.g., "A", "An", "The", "On", "Towards", "Novel"), skip it and use the next descriptive word instead. Examples: "A Novel Robotic Controller…" → `marrero2024robotic`; "On the Role of…" → `smith2020role`. Do not use the first name of the author in the authorname.
 
 ---
 
@@ -125,7 +125,7 @@ Primary source / background / contrasting example. Which hypothetical sections o
 
 (See references/snn-extraction-fields.md for field definitions and references/learning-paradigms.md for learning mechanism guidance.)
 
-**1 full and detailed sentence per field. Learning mechanism: 2 sentences max. Notable findings: bullet points.
+**1 sentence per field. Learning mechanism: 2 sentences max.
 Numbers: neuron/parameter counts and DOF only. No hyperparameters. No padding.
 Task environment (simulated/real robot) and controller hardware (CPU/GPU/neuromorphic) are orthogonal — report both clearly and separately.**
 
@@ -240,11 +240,11 @@ One finding per bullet. Include a trace anchor for any specific claim.Exactly on
 - Claimed — asserted without direct experimental support
 - Attributed — from another paper this paper cites
 Template:
-- [finding] (Measured) (Source: Fig./Tbl./Sec.)
 - [finding] (Reported) (Source: Fig./Tbl./Sec.)
+- [finding] (Attributed) (Author, Year) (Source: Sec.)
 - ...
-Example: "- 100× lower inference energy on Loihi vs. GPU (Measured) (Source: Tbl. 2)"
-Example: "- Suitable for neuromorphic deployment (Claimed — no chip deployment attempted) (Source: Sec. 5)"
+Example: "- Most surveyed controllers are evaluated in simulation only (Reported) (Source: Tbl. 3)"
+Example: "- Neuromorphic hardware will make SNN control mainstream (Claimed — editorial judgment) (Source: Sec. 6)"
 
 ### Citable Snippets
 2-4 bullets listing specific claims or sections where this paper would be cited (each with a trace anchor). Max 1 quotable sentence per bullet. If no suitable verbatim sentence exists, write `*no suitable quotable sentence*` and omit the blockquote. Quotes must be verbatim from this paper only — never from cited works. Each must be searchable in the PDF. Avoid generic boilerplate; pick quotes that uniquely define the method, evidence, or interpretation. Prefer at least one (Definition | Method) over pure (Claim).
