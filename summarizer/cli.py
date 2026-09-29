@@ -3,10 +3,10 @@
 Entry point: ``summarize-papers`` (configured in ``pyproject.toml``).
 
 Usage:
-    summarize-papers --source DIR [options]   # batch mode
-    summarize-papers --file PDF [options]     # single-file mode
-    summarize-papers eval --source DIR ...    # evaluation (see evaluation.py)
-    summarize-papers render [--output-dir DIR] # re-render markdown from JSON sidecars
+    summarize-papers --source DIR [options]     # batch mode
+    summarize-papers --file PDF [options]       # single-file mode
+    summarize-papers eval --source DIR ...      # evaluation (see evaluation.py)
+    summarize-papers render [--output-dir DIR]  # re-render markdown from JSON sidecars
 
 ``--source`` and ``--file`` are mutually exclusive; exactly one must be supplied.
 ``--reparse`` implies ``--force-summary``.
@@ -154,11 +154,14 @@ def _render_main(argv: list[str]) -> None:
         logger.error("Not a directory: %s", output_dir)
         sys.exit(1)
     try:
-        count = render_all(output_dir)
+        rendered, failed = render_all(output_dir)
     except OutputDirLocked as exc:
         logger.error("%s; wait for it to finish.", exc)
         sys.exit(1)
-    logger.info("Re-rendered %d summaries in %s", count, output_dir)
+    logger.info("Re-rendered %d summaries in %s", rendered, output_dir)
+    if failed:
+        logger.error("%d sidecar(s) could not be rendered (see above)", failed)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

@@ -28,7 +28,7 @@ from summarizer.metrics import compute_metrics, duplicate_keys
 from summarizer.models import Classification, Config, PaperSummary, PipelineError
 from summarizer.parser import load_text, sha256_file
 from summarizer.pipeline import author_surname_token, git_commit, process_pdf
-from summarizer.prompts import load_references
+from summarizer.prompts import load_references, references_digest
 
 logger = logging.getLogger(__name__)
 
@@ -187,8 +187,10 @@ def score_gold(summary: PaperSummary, labels: dict) -> dict[str, bool]:
         got = predicted[field]
         if field == "first_author":
             expected = _surname(str(expected))
-        if isinstance(expected, list):
-            scores[field] = {_norm(v) for v in got or []} == {_norm(v) for v in expected}
+        if got is None and field.startswith("classification."):
+            scores[field] = False  # no Part 2: the model didn't classify the paper
+        elif isinstance(expected, list):
+            scores[field] = {_norm(v) for v in got} == {_norm(v) for v in expected}
         elif isinstance(expected, str) and got is not None:
             scores[field] = _norm(got) == _norm(expected)
         else:
@@ -266,9 +268,11 @@ def _eval_one(
 
     # Score against exactly the text the model was shown (a prefix of the stripped text).
     provenance = summary.provenance
-    paper_text = load_text(pdf, cfg.extractor, strip_references=config.strip_references).text[
-        : provenance.chars_sent
-    ]
+    try:
+        parsed = load_text(pdf, cfg.extractor, strip_references=config.strip_references)
+    except Exception as exc:
+        return row | {"ok": False, "error": f"could not reload text for scoring: {exc}"}
+    paper_text = parsed.text[: provenance.chars_sent]
     summaries_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(summaries_dir / f"{sha}.json", summary.model_dump_json(indent=2))
     row |= {
@@ -301,18 +305,19 @@ def run_eval(
     references = load_references(base_config.skill_data_dir)
     provenance = {
         "git_commit": git_commit(),
-        "references_sha256": hashlib.sha256(references.encode()).hexdigest()[:12],
+        "references_sha256": references_digest(references),
         "max_chars": base_config.max_chars,
         "strip_references": base_config.strip_references,
         "structured_output": base_config.structured_output,
     }
-    shas: dict[Path, str] = {}
+    by_sha: dict[str, Path] = {}
     for pdf in pdfs:
         sha = sha256_file(pdf)
-        if sha in shas.values():
+        if sha in by_sha:
             logger.warning("Skipping %s: same content as another PDF in the set", pdf.name)
         else:
-            shas[pdf] = sha
+            by_sha[sha] = pdf
+    shas = {pdf: sha for sha, pdf in by_sha.items()}
     results_path = out_dir / "results.jsonl"
     results_path.write_text("", encoding="utf-8")
     rows: list[dict] = []

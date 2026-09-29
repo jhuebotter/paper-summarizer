@@ -262,3 +262,9 @@ def test_part2_starts_with_the_classification_block(mock_part1_dict, mock_part2_
     assert part2.index("### Classification") < part2.index("### Details")
     assert "**Inference hardware:** CPU/GPU  " in part2
     assert "**Paradigm families:** Gradient-based (surrogate gradient BPTT)" in part2
+
+
+def test_empty_paradigm_list_renders_none(mock_part1_dict, mock_part2_dict):
+    mock_part2_dict["classification"]["paradigm_families"] = []
+    md = render_summary(_make_summary(mock_part1_dict, mock_part2_dict))
+    assert "**Paradigm families:** none" in md

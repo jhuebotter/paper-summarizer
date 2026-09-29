@@ -639,10 +639,14 @@ def test_process_pdf_passes_strip_references_to_parser(
 
 
 def test_provenance_records_how_the_summary_was_made(
-    fake_pdf, config, mock_part1_dict, mock_part2_dict
+    tmp_path, monkeypatch, config, mock_part1_dict, mock_part2_dict
 ):
+    from dataclasses import replace
+
     from summarizer.llm import UsageStats
 
+    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    monkeypatch.chdir(tmp_path)
     combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
     mock_client = MagicMock()
     mock_client.pricing = ModelPricing()
@@ -651,18 +655,25 @@ def test_provenance_records_how_the_summary_was_made(
         usage=UsageStats(input_tokens=1200, output_tokens=300, cost=0.002),
     )
     batch_total = CostAccumulator()
+    batch_total.add(UsageStats(), 1.0)  # an earlier paper in the same batch
     with patch(
         "summarizer.pipeline.load_text",
         return_value=ParsedText("x" * 500, "docling", "f" * 64),
     ):
-        summary = process_pdf(fake_pdf, config, client=mock_client, accumulator=batch_total)
+        summary = process_pdf(
+            Path("paper.pdf"),
+            replace(config, max_chars=100),
+            client=mock_client,
+            accumulator=batch_total,
+        )
 
     prov = summary.provenance
     assert (prov.pdf_sha256, prov.extractor) == ("f" * 64, "docling")
-    assert (prov.chars_full, prov.chars_sent) == (500, 500)
-    assert (prov.calls, prov.input_tokens, prov.cost_usd) == (1, 1200, 0.002)
-    assert prov.model == config.model and prov.source_path == str(fake_pdf.resolve())
-    assert batch_total.total_cost == 0.002  # per-paper totals feed the caller's
+    assert (prov.chars_full, prov.chars_sent) == (500, 100)
+    assert (prov.calls, prov.input_tokens, prov.cost_usd) == (1, 1200, 0.002)  # this paper only
+    assert prov.model == config.model
+    assert prov.source_path == str((tmp_path / "paper.pdf").resolve())
+    assert batch_total.total_cost == 1.002  # per-paper totals feed the caller's
 
 
 def test_provenance_survives_a_json_roundtrip(fake_pdf, config, mock_part1_dict, mock_part2_dict):

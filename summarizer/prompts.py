@@ -6,6 +6,7 @@ prompt embeds the reference guidelines (loaded from ``skill_data/references/``)
 so every call is stateless.
 """
 
+import hashlib
 from pathlib import Path
 
 
@@ -21,6 +22,11 @@ def load_references(references_dir: Path) -> str:
         raise FileNotFoundError(f"References directory not found: {references_dir}")
     parts = [f.read_text(encoding="utf-8") for f in sorted(references_dir.glob("*.md"))]
     return "\n\n---\n\n".join(parts)
+
+
+def references_digest(references: str) -> str:
+    """Short hash identifying the reference text (recorded as provenance)."""
+    return hashlib.sha256(references.encode()).hexdigest()[:12]
 
 
 def build_combined_prompt(paper_text: str, references: str, source_filename: str) -> str:

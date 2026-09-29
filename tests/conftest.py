@@ -1,5 +1,6 @@
 """Shared pytest fixtures for the snn_summarizer test suite."""
 
+import copy
 import logging
 from pathlib import Path
 
@@ -176,10 +177,10 @@ MOCK_PART2_DICT = {
 @pytest.fixture
 def mock_part1_dict() -> dict:
     """Flat metadata + Part 1 dict (copy) for building models and combined responses."""
-    return MOCK_PART1_DICT.copy()
+    return copy.deepcopy(MOCK_PART1_DICT)
 
 
 @pytest.fixture
 def mock_part2_dict() -> dict:
     """Part 2 (SNN extraction) dict (copy)."""
-    return MOCK_PART2_DICT.copy()
+    return copy.deepcopy(MOCK_PART2_DICT)

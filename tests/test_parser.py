@@ -8,7 +8,14 @@ import pytest
 
 import summarizer.parser as parser_mod
 from summarizer.models import ParseError
-from summarizer.parser import parse_pdf
+from summarizer.parser import load_text, truncate_text
+
+
+def parse_pdf(pdf_path, max_chars=200_000, reparse=False, extractor="auto", strip_references=False):
+    """``load_text`` + ``truncate_text``, as the pipeline combines them."""
+    parsed = load_text(pdf_path, extractor, reparse=reparse, strip_references=strip_references)
+    return truncate_text(parsed.text, max_chars, pdf_path.name)
+
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
@@ -587,5 +594,49 @@ def test_old_caches_next_to_the_pdf_are_still_read(tmp_path):
     pdf = _fake_pdf(tmp_path)
     (tmp_path / "paper.md").write_text("legacy text", encoding="utf-8")
     parsed = load_text(pdf)
-    assert (parsed.text, parsed.extractor) == ("legacy text", "legacy")
+    assert (parsed.text, parsed.extractor) == ("legacy text", "unknown")
     assert not list(tmp_path.glob("*.docling.md"))  # nothing new written next to the PDF
+
+
+def test_stale_cache_next_to_a_replaced_pdf_is_ignored(tmp_path):
+    """Regression: an old <stem>.docling.md fed the previous paper's text to a new PDF."""
+    import os
+
+    pdf = _fake_pdf(tmp_path)
+    cache = tmp_path / "paper.docling.md"
+    cache.write_text("TEXT OF THE OLD PAPER", encoding="utf-8")
+    os.utime(cache, (1_000_000, 1_000_000))  # written long before the PDF was replaced
+    with patch("summarizer.parser._extract_text_with_pypdf", return_value="new paper"):
+        assert load_text(pdf, "pypdf").text == "new paper"
+    assert load_text(pdf, "auto").text == "new paper"  # now from the content-keyed cache
+
+
+def test_extracted_newlines_are_normalized(tmp_path):
+    pdf = _fake_pdf(tmp_path)
+    with patch("summarizer.parser._extract_text_with_pypdf", return_value="a\r\nb\rc"):
+        fresh = load_text(pdf, "pypdf").text
+    assert fresh == "a\nb\nc" == load_text(pdf, "pypdf").text
+
+
+def test_relative_xdg_cache_home_is_ignored(tmp_path, monkeypatch):
+    from summarizer.parser import _extraction_cache_dir
+
+    monkeypatch.setenv("XDG_CACHE_HOME", "relative/dir")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _extraction_cache_dir() == tmp_path / ".cache" / "paper-summarizer"
+
+
+def test_auto_prefers_docling_cache_in_the_cache_dir(tmp_path):
+    pdf = _fake_pdf(tmp_path)
+    for extractor in ("docling", "pypdf"):
+        path = _cache(tmp_path, pdf, extractor)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(extractor, encoding="utf-8")
+    assert load_text(pdf).text == "docling"
+
+
+@pytest.mark.parametrize("extractor", ["docling", "pypdf"])
+def test_explicit_extractor_reads_its_old_cache_next_to_the_pdf(tmp_path, extractor):
+    pdf = _fake_pdf(tmp_path)
+    (tmp_path / f"paper.{extractor}.md").write_text("old cache", encoding="utf-8")
+    assert load_text(pdf, extractor).text == "old cache"

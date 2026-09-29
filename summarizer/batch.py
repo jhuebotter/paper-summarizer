@@ -6,9 +6,9 @@ Processed index
 ``{"sha256": ..., "pdf_path": ..., "outputs": [...]}``.  Papers are identified
 by content (sha256), so moved, renamed or duplicated PDFs are not summarized
 again; entries from older versions (path only, or the comma-separated
-``processed.txt``) still match by path and gain their sha256 on the next run.
-Writes are atomic, and a lock file stops two runs from sharing an output
-directory.
+``processed.txt``) gain their sha256 the next time their PDF is seen, unless
+the PDF changed after it was summarized.  Writes are atomic, and (on POSIX) a
+lock file stops two runs from sharing an output directory.
 
 Output location
 ---------------
@@ -24,13 +24,8 @@ import os
 import sys
 import tempfile
 import threading
-from contextlib import contextmanager
-
-try:
-    import fcntl
-except ImportError:  # Windows: no advisory locks; runs must not overlap
-    fcntl = None
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from tqdm.auto import tqdm
@@ -42,6 +37,11 @@ from summarizer.parser import sha256_file
 from summarizer.pipeline import process_pdf
 from summarizer.prompts import load_references
 from summarizer.renderer import render_summary
+
+try:
+    import fcntl
+except ImportError:  # Windows: no advisory locks; runs must not overlap
+    fcntl = None
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +116,24 @@ def _record(pdf_path: str, outputs: list[str], sha256: str | None) -> dict:
     return {"pdf_path": pdf_path, "outputs": list(outputs), "sha256": sha256}
 
 
+def _migrate_path_entry(index: dict[str, dict], pdf_path: Path, sha: str) -> bool:
+    """Re-key an old path-only entry to ``sha``; return True if the index changed.
+
+    If the PDF was modified after its summaries were written, the entry is
+    dropped instead, so the (probably different) paper is summarized again.
+    """
+    path_key = str(pdf_path.resolve())
+    if sha in index or path_key not in index:
+        return False
+    entry = index.pop(path_key)
+    outputs = [Path(o) for o in entry["outputs"] if Path(o).exists()]
+    if outputs and pdf_path.stat().st_mtime > max(o.stat().st_mtime for o in outputs):
+        logger.info("%s changed since it was summarized; summarizing it again", pdf_path.name)
+    else:
+        index[sha] = entry | {"sha256": sha}
+    return True
+
+
 def _load_legacy_index(path: Path) -> dict[str, list[str]]:
     result: dict[str, list[str]] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -175,16 +193,9 @@ def atomic_write_text(path: Path, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def should_skip(
-    pdf_path: Path, processed: dict[str, dict], force_summary: bool, sha256: str | None = None
-) -> bool:
-    """Return ``True`` if the PDF was already summarized (by content or path).
-
-    ``force_summary`` disables skipping.
-    """
-    if force_summary:
-        return False
-    return (sha256 is not None and sha256 in processed) or str(pdf_path.resolve()) in processed
+def should_skip(sha256: str, processed: dict[str, dict], force_summary: bool) -> bool:
+    """Return ``True`` if a PDF with this content was already summarized."""
+    return not force_summary and sha256 in processed
 
 
 class OutputDirLocked(Exception):
@@ -227,20 +238,19 @@ def get_output_path(output_dir: Path, paper_type: str, citation_key: str) -> Pat
 def get_versioned_output_path(path: Path) -> Path:
     """Return a non-clobbering output path by appending a version suffix.
 
-    If ``path`` does not exist, it is returned unchanged.
-    If it exists, ``_v2``, ``_v3``, ... are appended before the suffix.
+    If neither ``path`` nor its ``.json`` sidecar exists, ``path`` is returned
+    unchanged; otherwise ``_v2``, ``_v3``, ... are appended before the suffix.
     """
-    if not path.exists():
-        return path
 
-    stem = path.stem
-    suffix = path.suffix
+    def taken(candidate: Path) -> bool:
+        return candidate.exists() or candidate.with_suffix(".json").exists()
+
+    if not taken(path):
+        return path
     version = 2
-    while True:
-        candidate = path.with_name(f"{stem}_v{version}{suffix}")
-        if not candidate.exists():
-            return candidate
+    while taken(candidate := path.with_name(f"{path.stem}_v{version}{path.suffix}")):
         version += 1
+    return candidate
 
 
 class StopSignal:
@@ -299,18 +309,24 @@ def _process_one_pdf(
     }
 
 
-def render_all(output_dir: Path) -> int:
-    """Re-render every summary's markdown from its JSON sidecar; return how many.
+def render_all(output_dir: Path) -> tuple[int, int]:
+    """Re-render every summary's markdown from its JSON sidecar.
 
-    No LLM calls: use this after changing the renderer or template.
+    No LLM calls: use this after changing the renderer or template.  Returns
+    ``(rendered, failed)``; unreadable sidecars are logged and skipped.
     """
-    count = 0
+    rendered = failed = 0
     with output_dir_lock(output_dir):
         for json_path in sorted(output_dir.rglob("*_summary*.json")):
-            summary = PaperSummary.model_validate_json(json_path.read_text(encoding="utf-8"))
+            try:
+                summary = PaperSummary.model_validate_json(json_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                logger.error("Cannot render %s: %s", json_path, exc)
+                failed += 1
+                continue
             atomic_write_text(json_path.with_suffix(".md"), render_summary(summary))
-            count += 1
-    return count
+            rendered += 1
+    return rendered, failed
 
 
 # ---------------------------------------------------------------------------
@@ -324,20 +340,6 @@ def run_batch(source_dir: Path, config: Config) -> BatchReport:
 
 
 def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
-    """Process ``pdfs`` and return an aggregate report (see ``_run_pdfs``).
-
-    Holds the output-directory lock, except in dry-run mode.
-
-    Raises:
-        OutputDirLocked: if another run is using ``config.output_dir``.
-    """
-    if config.dry_run:
-        return _run_pdfs(pdfs, config)
-    with output_dir_lock(config.output_dir):
-        return _run_pdfs(pdfs, config)
-
-
-def _run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
     """Process ``pdfs`` and return an aggregate report.
 
     1. Load the processed index once.
@@ -346,14 +348,24 @@ def _run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
        would be processed.
     3. Process the rest concurrently (``config.workers``) with one shared LLM
        client, cost accumulator and reference text.
-    4. On success, write ``get_versioned_output_path(...)`` and record it in
-       the index (saved after every paper, so an interrupted run keeps its
-       progress).
+    4. On success, write ``get_versioned_output_path(...)`` and its ``.json``
+       sidecar and record them in the index (saved after every paper, so an
+       interrupted run keeps its progress).
     5. On failure, record it and continue; the index is not updated, so the
        next run retries the paper.
     6. Stop early (cancel queued papers, count them as skipped) when the
        backend reports an exhausted quota or ``config.max_cost`` is reached.
+
+    Holds the output-directory lock, except in dry-run mode.
+
+    Raises:
+        OutputDirLocked: if another run is using ``config.output_dir``.
     """
+    with nullcontext() if config.dry_run else output_dir_lock(config.output_dir):
+        return _run_pdfs(pdfs, config)
+
+
+def _run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
     total = len(pdfs)
 
     processed_set = load_processed_index(config.output_dir)
@@ -369,21 +381,26 @@ def _run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
 
     jobs: list[Path] = []
     shas: dict[Path, str] = {}
+    seen: set[str] = set()
     n_skipped_by_index = 0
     migrated = False
 
     for pdf_path in pdfs:
-        sha = sha256_file(pdf_path)
-        path_key = str(pdf_path.resolve())
-        if sha not in processed_set and path_key in processed_set:
-            processed_set[sha] = processed_set.pop(path_key) | {"sha256": sha}
-            migrated = True
-        if sha in shas.values():
+        try:
+            sha = sha256_file(pdf_path)
+        except OSError as exc:
+            logger.error("Cannot read %s: %s", pdf_path, exc)
+            n_failed += 1
+            failed_papers.append(FailedPaper(pdf_path=str(pdf_path), error=str(exc)))
+            continue
+        migrated |= _migrate_path_entry(processed_set, pdf_path, sha)
+        if sha in seen:
             logger.info("Skipping %s: same content as another PDF in this batch", pdf_path.name)
             n_skipped += 1
             continue
+        seen.add(sha)
         shas[pdf_path] = sha
-        if should_skip(pdf_path, processed_set, config.force_summary, sha):
+        if should_skip(sha, processed_set, config.force_summary):
             n_skipped += 1
             n_skipped_by_index += 1
             continue
@@ -400,11 +417,13 @@ def _run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
         return BatchReport(
             processed=0,
             skipped=n_skipped + len(jobs),
-            failed=0,
-            failed_papers=[],
+            failed=n_failed,
+            failed_papers=failed_papers,
         )
     if not jobs:
-        return BatchReport(processed=0, skipped=n_skipped, failed=0, failed_papers=[])
+        return BatchReport(
+            processed=0, skipped=n_skipped, failed=n_failed, failed_papers=failed_papers
+        )
 
     # Shared across workers: one client, one cost accumulator, one reference text.
     client = create_client(config)

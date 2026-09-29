@@ -5,7 +5,6 @@ in one combined JSON response.
 """
 
 import functools
-import hashlib
 import json
 import logging
 import re
@@ -27,7 +26,7 @@ from summarizer.models import (
     SummaryPart2,
 )
 from summarizer.parser import load_text, truncate_text
-from summarizer.prompts import build_combined_prompt, load_references
+from summarizer.prompts import build_combined_prompt, load_references, references_digest
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +137,7 @@ def _run_pipeline(
         chars_sent=len(paper_text),
         model=config.model,
         base_url=config.base_url,
-        references_sha256=hashlib.sha256(references.encode()).hexdigest()[:12],
+        references_sha256=references_digest(references),
         calls=paper_cost.calls,
         json_repairs=paper_cost.json_repairs,
         schema_repairs=paper_cost.schema_repairs,

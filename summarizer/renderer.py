@@ -206,7 +206,7 @@ def _render_classification(classification: Classification) -> str:
     """One line per typed label, e.g. ``**Inference hardware:** CPU/GPU``."""
     lines = []
     for name, value in classification.model_dump().items():
-        shown = "; ".join(value) or "none" if isinstance(value, list) else value
+        shown = ("; ".join(value) or "none") if isinstance(value, list) else value
         lines.append(f"**{name.replace('_', ' ').capitalize()}:** {shown}  ")
     return "\n".join(lines)
 

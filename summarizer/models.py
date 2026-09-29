@@ -9,7 +9,7 @@ reporting, and runtime configuration.
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal, get_args
+from typing import Annotated, Literal, get_args, get_origin
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -190,11 +190,24 @@ def _canonical_key(value: str) -> str:
     return re.sub(r"\s*/\s*", "/", re.sub(r"\s+", " ", value.strip())).casefold()
 
 
+def labels(annotation: object) -> tuple[str, ...]:
+    """Allowed labels of a ``Literal`` or ``list[Literal]`` annotation."""
+    if get_origin(annotation) is list:
+        annotation = get_args(annotation)[0]
+    return get_args(annotation)
+
+
+_NOT_APPLICABLE = {"not applicable", "n/a", "na", "none"}
+
+
 class Classification(BaseModel):
     """Typed labels from the controlled vocabularies in the prompt references.
 
     These are the columns for comparison tables and gold-label scoring.  Values
-    are matched case- and whitespace-insensitively to the allowed labels.
+    are matched case- and whitespace-insensitively to the allowed labels;
+    "not applicable" becomes "not reported" where a field has no such label,
+    and ``paradigm_families`` tolerates a bare string, null, placeholders and
+    duplicates.
     """
 
     inference_hardware: InferenceHardware
@@ -210,17 +223,33 @@ class Classification(BaseModel):
             return data
         data = dict(data)
         for name, field in cls.model_fields.items():
-            labels = get_args(field.annotation)
-            if name == "paradigm_families":
-                labels = get_args(labels[0])
-            allowed = {_canonical_key(label): label for label in labels}
+            allowed = {_canonical_key(label): label for label in labels(field.annotation)}
+
+            def canonical(value: object, allowed: dict = allowed) -> object:
+                if not isinstance(value, str):
+                    return value
+                key = _canonical_key(value)
+                if key in _NOT_APPLICABLE and key not in allowed:
+                    key = "not reported"
+                return allowed.get(key, value)
+
             value = data.get(name)
-            if isinstance(value, str):
-                data[name] = allowed.get(_canonical_key(value), value)
-            elif isinstance(value, list):
-                data[name] = [
-                    allowed.get(_canonical_key(v), v) if isinstance(v, str) else v for v in value
-                ]
+            if name == "paradigm_families":
+                items = [] if value is None else [value] if isinstance(value, str) else value
+                if isinstance(items, list):
+                    kept = [canonical(v) for v in items]
+                    kept = [
+                        v
+                        for v in kept
+                        if not (
+                            isinstance(v, str)
+                            and _canonical_key(v) in _NOT_APPLICABLE | {"not reported"}
+                        )
+                    ]
+                    hashable = all(isinstance(v, str) for v in kept)
+                    data[name] = list(dict.fromkeys(kept)) if hashable else kept
+            else:
+                data[name] = canonical(value)
         return data
 
 

@@ -426,3 +426,42 @@ def test_classification_vocabularies_match_the_references():
         else:
             for label in labels:
                 assert label in contract, (name, label)
+
+
+def test_classification_placeholders_and_list_forms():
+    from summarizer.models import Classification
+
+    c = Classification(
+        inference_hardware="N/A",
+        architecture="Not applicable",
+        credit_assignment="not applicable",
+        learning_regime="Not Applicable",
+        paradigm_families="hybrid/multi-phase",
+    )
+    assert (c.inference_hardware, c.architecture) == ("not reported", "not reported")
+    assert (c.credit_assignment, c.learning_regime) == ("Not applicable", "not applicable")
+    assert c.paradigm_families == ["Hybrid / multi-phase"]
+    none = Classification(**{**c.model_dump(), "paradigm_families": None})
+    assert none.paradigm_families == []
+    dupes = Classification(
+        **{
+            **c.model_dump(),
+            "paradigm_families": ["hybrid/multi-phase", "Hybrid / Multi-phase", "not reported"],
+        }
+    )
+    assert dupes.paradigm_families == ["Hybrid / multi-phase"]
+
+
+def test_classification_contract_lists_exactly_the_allowed_labels():
+    """Two-way drift guard: the contract's `a | b | c` line per field equals the Literal."""
+    import re
+
+    from summarizer.models import Classification, labels
+
+    refs = Path(__file__).parent.parent / "skill_data" / "references"
+    contract = (refs / "json-output-contract.md").read_text(encoding="utf-8")
+    for name, field in Classification.model_fields.items():
+        if name == "paradigm_families":
+            continue  # defined in learning-paradigms.md, checked separately
+        line = re.search(rf'"{name}": "([^"]+)"', contract).group(1)
+        assert set(line.split(" | ")) == set(labels(field.annotation)), name

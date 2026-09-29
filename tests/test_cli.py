@@ -605,7 +605,7 @@ def test_new_flag_defaults():
 def test_render_subcommand(tmp_path):
     out = tmp_path / "out"
     out.mkdir()
-    with patch("summarizer.cli.render_all", return_value=3) as render:
+    with patch("summarizer.cli.render_all", return_value=(3, 0)) as render:
         main(["render", "--output-dir", str(out)])
     render.assert_called_once_with(out)
 
@@ -635,4 +635,38 @@ def test_locked_output_dir_exits_1(tmp_path):
         pytest.raises(SystemExit) as exc_info,
     ):
         main(["--source", str(tmp_path)])
+    assert exc_info.value.code == 1
+
+
+def test_render_exits_1_when_sidecars_fail(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    with (
+        patch("summarizer.cli.render_all", return_value=(2, 1)),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main(["render", "--output-dir", str(out)])
+    assert exc_info.value.code == 1
+
+
+def test_render_command_end_to_end(tmp_path, mock_part1_dict, mock_part2_dict):
+    from summarizer.models import PaperSummary
+
+    meta_keys = {"citation_key", "title", "authors", "year", "venue", "paper_type", "tags"}
+    metadata = {k: mock_part1_dict[k] for k in meta_keys} | {
+        "is_research_paper": True,
+        "rejection_reason": None,
+    }
+    part1 = {k: v for k, v in mock_part1_dict.items() if k not in meta_keys - {"paper_type"}}
+    summary = PaperSummary(metadata=metadata, part1=part1, part2=mock_part2_dict)
+    out = tmp_path / "out" / "primary"
+    out.mkdir(parents=True)
+    (out / "a2020x_summary.json").write_text(summary.model_dump_json())
+    main(["render", "--output-dir", str(tmp_path / "out")])
+    assert "### Classification" in (out / "a2020x_summary.md").read_text()
+
+
+def test_render_rejects_a_missing_output_dir(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["render", "--output-dir", str(tmp_path / "missing")])
     assert exc_info.value.code == 1

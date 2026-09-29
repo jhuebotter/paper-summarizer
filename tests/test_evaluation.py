@@ -536,6 +536,11 @@ def test_gold_scores_classification_labels(mock_part1_dict, mock_part2_dict):
         "classification.paradigm_families": True,
         "classification.inference_hardware": False,
     }
+    two = ["Gradient-based (surrogate gradient BPTT)", "Hybrid / multi-phase"]
+    summary.part2.classification.paradigm_families = two
+    field = "classification.paradigm_families"
+    assert score_gold(summary, {field: list(reversed(two))}) == {field: True}  # order-free
+    assert score_gold(summary, {field: two[:1]}) == {field: False}  # not a subset match
 
 
 def test_init_gold_stub_has_classification_fields(tmp_path, pdfs):
@@ -543,3 +548,28 @@ def test_init_gold_stub_has_classification_fields(tmp_path, pdfs):
     init_gold(gold, pdfs[:1])
     labels = json.loads(gold.read_text())["labels"]
     assert "classification.learning_regime" in labels and labels["title"] is None
+
+
+def test_gold_classification_without_part2_is_wrong(mock_part1_dict, mock_part2_dict):
+    summary = PaperSummary(**_combined(mock_part1_dict, mock_part2_dict))
+    summary.part2 = None
+    assert score_gold(summary, {"classification.paradigm_families": []}) == {
+        "classification.paradigm_families": False
+    }
+
+
+def test_text_reload_failure_during_scoring_is_a_row_error(tmp_path, pdfs, good):
+    config = Config(base_url="http://localhost:1234/v1", skill_data_dir=REFERENCES_DIR)
+    with (
+        patch("summarizer.pipeline.load_text", return_value=_parsed(PAPER_TEXT)),
+        patch("summarizer.evaluation.load_text", side_effect=OSError("moved")),
+        patch("summarizer.evaluation.create_client", return_value=_inner_client(lambda p: good)),
+    ):
+        rows, _ = run_eval(
+            pdfs[:1],
+            config,
+            [EvalConfig("m", "pypdf")],
+            out_dir=tmp_path / "run",
+            cache_dir=tmp_path / "cache",
+        )
+    assert rows[0]["ok"] is False and "moved" in rows[0]["error"]

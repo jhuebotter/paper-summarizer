@@ -2,6 +2,7 @@
 
 import itertools
 import json
+import sys
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -164,15 +165,11 @@ def test_save_processed_index_leaves_no_temp_files(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_should_skip_by_sha_or_path(tmp_path):
-    pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(_pdf_bytes())
-    by_sha = {"abc": {"pdf_path": "/elsewhere.pdf", "outputs": [], "sha256": "abc"}}
-    by_path = {str(pdf.resolve()): {"pdf_path": str(pdf.resolve()), "outputs": [], "sha256": None}}
-    assert should_skip(pdf, by_sha, force_summary=False, sha256="abc") is True
-    assert should_skip(pdf, by_path, force_summary=False, sha256="other") is True
-    assert should_skip(pdf, {}, force_summary=False, sha256="abc") is False
-    assert should_skip(pdf, by_sha, force_summary=True, sha256="abc") is False
+def test_should_skip_by_sha():
+    index = {"abc": {"pdf_path": "/elsewhere.pdf", "outputs": [], "sha256": "abc"}}
+    assert should_skip("abc", index, force_summary=False) is True
+    assert should_skip("other", index, force_summary=False) is False
+    assert should_skip("abc", index, force_summary=True) is False
 
 
 # ---------------------------------------------------------------------------
@@ -423,8 +420,7 @@ def test_run_batch_failed_paper_not_in_processed(tmp_path, config):
     with patch("summarizer.batch.process_pdf", side_effect=err):
         run_batch(tmp_path, config)
 
-    processed = load_processed_index(config.output_dir)
-    assert str(pdf.resolve()) not in processed
+    assert load_processed_index(config.output_dir) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -705,15 +701,23 @@ def test_duplicate_pdfs_in_one_batch_are_processed_once(tmp_path, config):
     assert (proc.call_count, report.processed, report.skipped) == (1, 1, 1)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="no advisory locks on Windows")
 def test_output_dir_lock_blocks_a_second_run(tmp_path, config):
-    from summarizer.batch import OutputDirLocked, output_dir_lock
+    from summarizer.batch import OutputDirLocked, output_dir_lock, render_all
 
     (tmp_path / "paper.pdf").write_bytes(_pdf_bytes())
-    with output_dir_lock(config.output_dir), pytest.raises(OutputDirLocked):
-        run_batch(tmp_path, config)
-    config.dry_run = True
-    with output_dir_lock(config.output_dir):
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf") as process,
+        output_dir_lock(config.output_dir),
+    ):
+        with pytest.raises(OutputDirLocked):
+            run_batch(tmp_path, config)
+        with pytest.raises(OutputDirLocked):
+            render_all(config.output_dir)
+        config.dry_run = True
         run_batch(tmp_path, config)  # dry runs don't need the lock
+    process.assert_not_called()
 
 
 def test_render_all_rebuilds_markdown_from_sidecars(tmp_path, mock_part1_dict, mock_part2_dict):
@@ -731,5 +735,144 @@ def test_render_all_rebuilds_markdown_from_sidecars(tmp_path, mock_part1_dict, m
     out.mkdir(parents=True)
     (out / "huebotter2025spiking_summary.json").write_text(summary.model_dump_json())
     (out / "huebotter2025spiking_summary.md").write_text("# stale")
-    assert render_all(tmp_path / "out") == 1
+    assert render_all(tmp_path / "out") == (1, 0)
     assert (out / "huebotter2025spiking_summary.md").read_text().startswith("# Spiking Neural")
+
+
+def test_changed_pdf_at_an_old_path_is_summarized_again(tmp_path, config):
+    """An old path-only entry is not carried over to different content."""
+    import os
+
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(_pdf_bytes())
+    old_output = tmp_path / "old_summary.md"
+    old_output.write_text("# old")
+    os.utime(old_output, (1_000_000, 1_000_000))  # summarized long before the file changed
+    config.output_dir.mkdir(parents=True)
+    (config.output_dir / "processed.txt").write_text(f"{pdf.resolve()}, {old_output}\n")
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", return_value=_make_summary("new2024x")) as proc,
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        run_batch(tmp_path, config)
+    proc.assert_called_once()
+
+
+def test_unreadable_pdf_fails_only_itself(tmp_path, config):
+    from summarizer.parser import sha256_file as real_sha
+
+    (tmp_path / "ok.pdf").write_bytes(_pdf_bytes())
+    (tmp_path / "locked.pdf").write_bytes(_pdf_bytes())
+
+    def sha(path):
+        if path.name == "locked.pdf":
+            raise PermissionError("denied")
+        return real_sha(path)
+
+    with (
+        patch("summarizer.batch.sha256_file", side_effect=sha),
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", return_value=_make_summary("ok2024x")),
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        report = run_batch(tmp_path, config)
+    assert (report.processed, report.failed) == (1, 1)
+    assert "denied" in report.failed_papers[0].error
+
+
+def test_versioned_path_respects_an_orphan_sidecar(tmp_path):
+    from summarizer.batch import get_versioned_output_path
+
+    md = tmp_path / "x2020y_summary.md"
+    md.with_suffix(".json").write_text("{}")
+    assert get_versioned_output_path(md).name == "x2020y_summary_v2.md"
+
+
+def test_render_all_skips_invalid_sidecars(tmp_path):
+    from summarizer.batch import render_all
+
+    (tmp_path / "bad_summary.json").write_text("{}")
+    assert render_all(tmp_path) == (0, 1)
+
+
+def test_pdf_edited_in_place_is_summarized_again(tmp_path, config):
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(_pdf_bytes())
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", return_value=_make_summary("a2020x")) as proc,
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        run_batch(tmp_path, config)
+        pdf.write_bytes(_pdf_bytes())  # new content, same path
+        run_batch(tmp_path, config)
+    assert proc.call_count == 2
+    assert len(load_processed_index(config.output_dir)) == 2
+
+
+def test_dry_run_writes_nothing(tmp_path, config):
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(_pdf_bytes())
+    config.output_dir.mkdir(parents=True)
+    (config.output_dir / "processed.txt").write_text(f"{pdf.resolve()}\n")  # would migrate
+    config.dry_run = True
+    run_batch(tmp_path, config)
+    assert sorted(p.name for p in config.output_dir.iterdir()) == ["processed.txt"]
+
+
+def test_forced_rerun_after_a_move_updates_the_path(tmp_path, config):
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    (old / "paper.pdf").write_bytes(_pdf_bytes())
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", return_value=_make_summary("a2020x")),
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        run_batch(old, config)
+        old.rename(new)
+        config.force_summary = True
+        run_batch(new, config)
+    (record,) = load_processed_index(config.output_dir).values()
+    assert record["pdf_path"] == str((new / "paper.pdf").resolve())
+    assert len(record["outputs"]) == 2
+
+
+def test_sidecar_is_written_before_the_markdown(tmp_path, config):
+    from summarizer.batch import atomic_write_text as real_write
+
+    (tmp_path / "paper.pdf").write_bytes(_pdf_bytes())
+
+    def write(path, text):
+        if path.suffix == ".md":
+            raise OSError("disk full")
+        real_write(path, text)
+
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", return_value=_make_summary("a2020x")),
+        patch("summarizer.batch.render_summary", return_value="# md"),
+        patch("summarizer.batch.atomic_write_text", side_effect=write),
+    ):
+        report = run_batch(tmp_path, config)
+    assert report.failed == 1
+    assert (config.output_dir / "primary" / "a2020x_summary.json").exists()
+    assert load_processed_index(config.output_dir) == {}  # not indexed, so it will be retried
+
+
+def test_render_all_includes_versioned_sidecars(tmp_path, mock_part1_dict, mock_part2_dict):
+    from summarizer.batch import render_all
+    from summarizer.models import PaperSummary
+
+    meta_keys = {"citation_key", "title", "authors", "year", "venue", "paper_type", "tags"}
+    metadata = {k: mock_part1_dict[k] for k in meta_keys} | {
+        "is_research_paper": True,
+        "rejection_reason": None,
+    }
+    part1 = {k: v for k, v in mock_part1_dict.items() if k not in meta_keys - {"paper_type"}}
+    summary = PaperSummary(metadata=metadata, part1=part1, part2=mock_part2_dict)
+    for name in ("x2020y_summary.json", "x2020y_summary_v2.json"):
+        (tmp_path / name).write_text(summary.model_dump_json())
+    assert render_all(tmp_path) == (2, 0)
+    assert (tmp_path / "x2020y_summary_v2.md").exists()

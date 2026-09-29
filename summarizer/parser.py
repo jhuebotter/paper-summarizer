@@ -19,13 +19,14 @@ import hashlib
 import logging
 import os
 import re
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 from pypdf import PdfReader
 
-from summarizer.models import _DEFAULT_MAX_CHARS, ParseError
+from summarizer.models import ParseError
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,7 @@ class ParsedText:
     """Extracted (optionally reference-stripped) text of one PDF, not yet truncated."""
 
     text: str
-    extractor: str  # "docling", "pypdf" or "legacy" (an old cache of unknown origin)
+    extractor: str  # "docling", "pypdf" or "unknown" (an old cache of unknown origin)
     sha256: str
 
 
@@ -89,23 +90,12 @@ def load_text(
     else:
         logger.info("Running %s extraction on: %s", extractor, pdf_path.name)
         text, used = _extract_text(pdf_path, extractor=extractor)
+        text = text.replace("\r\n", "\n").replace("\r", "\n")  # as a cache read returns it
         _write_cache(_cache_path(sha, used), text)
         logger.info("Extraction complete (%s): %s chars", used, f"{len(text):,}")
     if strip_references:
         text = strip_reference_section(text, pdf_path.name)
     return ParsedText(text=text, extractor=used, sha256=sha)
-
-
-def parse_pdf(
-    pdf_path: Path,
-    max_chars: int = _DEFAULT_MAX_CHARS,
-    reparse: bool = False,
-    extractor: str = "auto",
-    strip_references: bool = False,
-) -> str:
-    """``load_text`` followed by truncation to ``max_chars`` (with a warning)."""
-    parsed = load_text(pdf_path, extractor, reparse=reparse, strip_references=strip_references)
-    return truncate_text(parsed.text, max_chars, pdf_path.name)
 
 
 # ---------------------------------------------------------------------------
@@ -155,13 +145,14 @@ def strip_reference_section(text: str, name: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 
-def cache_dir() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
-    return Path(base) / "paper-summarizer"
+def _extraction_cache_dir() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME", "")
+    root = Path(base) if base and Path(base).is_absolute() else Path.home() / ".cache"
+    return root / "paper-summarizer"
 
 
 def _cache_path(sha: str, extractor: str) -> Path:
-    return cache_dir() / f"{sha}.{extractor}.md"
+    return _extraction_cache_dir() / f"{sha}.{extractor}.md"
 
 
 def _cache_candidates(pdf_path: Path, sha: str, extractor: str) -> list[tuple[Path, str]]:
@@ -170,33 +161,47 @@ def _cache_candidates(pdf_path: Path, sha: str, extractor: str) -> list[tuple[Pa
 
     if extractor in ("docling", "pypdf"):
         return [(_cache_path(sha, extractor), extractor), (beside(extractor), extractor)]
-    # auto: prefer docling output, then a previous pypdf fallback, then legacy.
+    # auto: prefer docling output, then a previous pypdf fallback, then an old cache.
     return [
         (_cache_path(sha, "docling"), "docling"),
         (_cache_path(sha, "pypdf"), "pypdf"),
         (beside("docling"), "docling"),
         (beside("pypdf"), "pypdf"),
-        (pdf_path.parent / f"{pdf_path.stem}.md", "legacy"),
+        (pdf_path.parent / f"{pdf_path.stem}.md", "unknown"),
     ]
 
 
 def _read_cache(pdf_path: Path, sha: str, extractor: str) -> tuple[str, str] | None:
+    """Return ``(text, extractor)`` from the first usable cache.
+
+    Caches next to the PDF are named after the file, not its content, so they
+    are ignored when older than the PDF (the file was replaced).
+    """
+    pdf_mtime = pdf_path.stat().st_mtime
     for path, used in _cache_candidates(pdf_path, sha, extractor):
-        if path.exists() and path.stat().st_size > 0:
-            cached = path.read_text(encoding="utf-8")
-            logger.info("Extraction cache found: %s (%s chars)", path.name, f"{len(cached):,}")
-            return cached, used
+        if not path.exists() or path.stat().st_size == 0:
+            continue
+        if path.parent == pdf_path.parent and path.stat().st_mtime < pdf_mtime:
+            continue
+        cached = path.read_text(encoding="utf-8")
+        logger.info("Extraction cache found: %s (%s chars)", path.name, f"{len(cached):,}")
+        return cached, used
     return None
 
 
 def _write_cache(path: Path, text: str) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(text, encoding="utf-8")
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    except OSError as exc:
+        logger.warning("Could not write extraction cache %s: %s", path, exc)
+        return
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
         os.replace(tmp, path)
     except OSError as exc:
-        tmp.unlink(missing_ok=True)
+        Path(tmp).unlink(missing_ok=True)
         logger.warning("Could not write extraction cache %s: %s", path, exc)
 
 
