@@ -179,12 +179,38 @@ def test_process_pdf_sanitizes_accented_citation_key(
     bad_part1 = dict(mock_part1_dict)
     bad_part1["citation_key"] = "paredes-vallés2024fully"
     combined = _make_combined_dict(bad_part1, mock_part2_dict)
+    combined["metadata"].update(authors=["Federico Paredes-Vallés"], year=2024)
     client_patcher, _ = _mock_llm_combined(combined)
 
     with _mock_parse("Some paper text."), client_patcher:
         summary = process_pdf(fake_pdf, config)
 
     assert summary.metadata.citation_key == "paredesvalles2024fully"
+
+
+@pytest.mark.parametrize(
+    "llm_key, author, year, expected",
+    [
+        ("ckl2024local", "Johannes Stöckl", 2024, "stockl2024local"),
+        ("s2024fully", "F. Paredes-Vallés", 2024, "paredesvalles2024fully"),
+        ("apolinaro2025tess", "Ana Apolinario", 2025, "apolinario2025tess"),
+        ("lora2022r", "Juan Juarez-Lora", 2022, "juarezlora2022r"),
+        ("dewolf2021spiking", "Travis DeWolf", 2021, "dewolf2021spiking"),  # already right
+        ("dewolf2023", "Travis DeWolf", 2021, "dewolf2021neuromorphic"),  # wrong year, no word
+        ("dewolfspiking", "Travis DeWolf", 2021, "dewolf2021neuromorphic"),  # no year
+        ("smith2020control", "Smith, J.", 2020, "smith2020control"),  # "Surname, Given"
+        ("muller2020control", "Müller J.", 2020, "muller2020control"),  # initial last: kept
+    ],
+)
+def test_citation_key_is_rebuilt_when_it_does_not_match_the_first_author(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict, llm_key, author, year, expected
+):
+    """Regression: mangled surnames from real runs passed the [a-z][a-z0-9]* check."""
+    combined = _make_combined_dict(dict(mock_part1_dict, citation_key=llm_key), mock_part2_dict)
+    combined["metadata"].update(authors=[author], year=year, title="Neuromorphic control")
+    client_patcher, _ = _mock_llm_combined(combined)
+    with _mock_parse("Some paper text."), client_patcher:
+        assert process_pdf(fake_pdf, config).metadata.citation_key == expected
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +235,11 @@ def test_sanitize_citation_key(value, expected):
 @pytest.mark.parametrize(
     "author_name, expected",
     [
-        ("F. Paredes-Vallés", "valles"),  # "First. Surname" → last token is surname
+        ("F. Paredes-Vallés", "paredesvalles"),  # hyphenated surname kept whole
+        ("Robin Van den Berghe", "vandenberghe"),  # leading particles kept
+        ("Lancelot Da Costa", "dacosta"),
+        ("DeWolf, Travis", "dewolf"),  # "Surname, Given"
+        ("Martin Luther King Jr.", "king"),
         ("Müller J.", "j"),  # "Surname I." → last token is initial (by design)
         ("J. Müller", "muller"),  # "I. Surname" → last token is surname
         ("Travis DeWolf", "dewolf"),
@@ -524,11 +554,11 @@ def test_integral_float_year_is_kept(tmp_path, config, mock_part1_dict, mock_par
 
 def test_citation_key_is_stripped_and_capped(tmp_path, config, mock_part1_dict, mock_part2_dict):
     combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
-    combined["metadata"]["citation_key"] = "  smith2020" + "x" * 300 + "\n"
+    combined["metadata"]["citation_key"] = "  huebotter2025" + "x" * 300 + "\n"
     client_patcher, _ = _mock_llm_combined(combined)
     with _mock_parse("text"), client_patcher:
         key = process_pdf(tmp_path / "x.pdf", config).metadata.citation_key
-    assert key.startswith("smith2020") and key == key.strip() and len(key) <= 64
+    assert key.startswith("huebotter2025") and key == key.strip() and len(key) <= 64
 
 
 def test_schema_repair_for_null_field_includes_paper(

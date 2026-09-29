@@ -154,17 +154,6 @@ def _norm(value: object) -> str:
     return "".join(ch for ch in str(value).casefold() if ch.isalnum())
 
 
-_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
-
-
-def _surname(name: str) -> str:
-    """Surname token of "Given Surname" or "Surname, Given" (suffixes like Jr. ignored)."""
-    if "," in name:
-        name = name.split(",")[0]
-    words = [w for w in name.split() if _norm(w) not in _NAME_SUFFIXES]
-    return author_surname_token(" ".join(words))
-
-
 def score_gold(summary: PaperSummary, labels: dict) -> dict[str, bool]:
     """Compare predictions with the labelled (non-null) gold fields."""
     meta = summary.metadata
@@ -173,7 +162,7 @@ def score_gold(summary: PaperSummary, labels: dict) -> dict[str, bool]:
         "paper_type": meta.paper_type or "non_research",
         "synthesis_subtype": meta.synthesis_subtype,
         "year": meta.year,
-        "first_author": _surname(meta.authors[0]) if meta.authors else None,
+        "first_author": author_surname_token(meta.authors[0]) if meta.authors else None,
         "title": meta.title,
     }
     classification = summary.part2.classification if summary.part2 else None
@@ -186,7 +175,7 @@ def score_gold(summary: PaperSummary, labels: dict) -> dict[str, bool]:
             continue
         got = predicted[field]
         if field == "first_author":
-            expected = _surname(str(expected))
+            expected = author_surname_token(str(expected))
         if got is None and field.startswith("classification."):
             scores[field] = False  # no Part 2: the model didn't classify the paper
         elif isinstance(expected, list):
