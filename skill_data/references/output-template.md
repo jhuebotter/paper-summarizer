@@ -1,6 +1,6 @@
 # Output Template v2
 
-Two-part summary saved as `<citationkey>.md` next to the PDF.
+Two-part summary, rendered from the JSON response to `output_summaries/<paper_type>/<citationkey>_summary.md`.
 
 ---
 
