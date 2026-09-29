@@ -846,13 +846,13 @@ def test_complete_raises_when_response_has_no_choices():
             client.complete("hello")
 
 
-def _provider_failure(code, finish_reason=None):
+def _provider_failure(code, finish_reason=None, usage=None):
     """A 200 response carrying OpenRouter's ``error`` object instead of a reply."""
     error = {"error": {"code": code, "message": "Upstream error"}}
     if finish_reason is None:
-        return MagicMock(choices=[], model_extra=error, usage=None)
+        return MagicMock(choices=[], model_extra=error, usage=usage)
     choice = MagicMock(finish_reason=finish_reason, model_extra=error)
-    return MagicMock(choices=[choice], usage=None)
+    return MagicMock(choices=[choice], usage=usage)
 
 
 @pytest.mark.parametrize("finish_reason", [None, "error"])
@@ -861,10 +861,72 @@ def test_provider_error_in_a_200_response_is_retried(finish_reason):
     with _client_returning(_provider_failure(502, finish_reason)) as (client, mock_openai):
         create = mock_openai.return_value.chat.completions.create
         create.side_effect = [_provider_failure(502, finish_reason), _sdk_response('{"ok": 1}')]
-        with patch("summarizer.llm.time.sleep") as sleep:
+        with (
+            patch("summarizer.llm.time.sleep") as sleep,
+            patch("summarizer.llm.random.uniform", return_value=1.0),
+        ):
             assert call_llm(client, "prompt") == {"ok": 1}
     assert create.call_count == 2
-    sleep.assert_called_once()  # backs off like any transient error
+    sleep.assert_called_once_with(1.0)  # backs off like any transient error
+
+
+@pytest.mark.parametrize(
+    "code, retried",
+    [
+        (None, True),
+        (408, True),
+        (429, True),
+        ("502", True),
+        (503, True),
+        (400, False),
+        (401, False),
+    ],
+)
+def test_provider_error_codes_that_are_retried(code, retried):
+    with _client_returning(_provider_failure(code)) as (client, mock_openai):
+        create = mock_openai.return_value.chat.completions.create
+        create.side_effect = [_provider_failure(code), _sdk_response('{"ok": 1}')]
+        with patch("summarizer.llm.time.sleep"):
+            if retried:
+                assert call_llm(client, "prompt") == {"ok": 1}
+            else:
+                with pytest.raises(LLMError):
+                    call_llm(client, "prompt")
+    assert create.call_count == (2 if retried else 1)
+
+
+def test_provider_error_retries_are_bounded():
+    with _client_returning(_provider_failure(502)) as (client, mock_openai):
+        with patch("summarizer.llm.time.sleep"), pytest.raises(LLMError, match="Upstream"):
+            call_llm(client, "prompt")
+    assert mock_openai.return_value.chat.completions.create.call_count == 4
+
+
+def test_billed_usage_of_failed_provider_attempts_is_recorded():
+    """Review finding: a provider error that was billed must still count toward --max-cost."""
+    from summarizer.llm import CostAccumulator
+
+    usage = MagicMock(
+        prompt_tokens=100,
+        completion_tokens=50,
+        completion_tokens_details=None,
+        prompt_tokens_details=None,
+        cost=0.02,
+    )
+    acc = CostAccumulator()
+    with _client_returning(_provider_failure(502, "error", usage)) as (client, _):
+        with patch("summarizer.llm.time.sleep"), pytest.raises(LLMError):
+            call_llm(client, "prompt", accumulator=acc)
+    assert acc.calls == 4 and acc.total_cost == pytest.approx(0.08)
+
+
+def test_credits_exhausted_inside_a_200_response_stops_the_run():
+    from summarizer.llm import QuotaExhausted
+
+    with _client_returning(_provider_failure(402)) as (client, mock_openai):
+        with patch("summarizer.llm.time.sleep") as sleep, pytest.raises(QuotaExhausted):
+            call_llm(client, "prompt")
+    sleep.assert_not_called()
 
 
 def test_non_transient_provider_error_is_not_retried_and_reports_the_reason():
@@ -1185,6 +1247,14 @@ def test_backoff_is_jittered_within_bounds():
 
     delays = {_retry_delay_seconds(3) for _ in range(50)}
     assert all(2.0 <= d <= 6.0 for d in delays) and len(delays) > 1
+
+
+def test_rate_limit_reset_beyond_a_minute_falls_back_to_backoff():
+    from summarizer.llm import _retry_delay_seconds
+
+    exc = _api_error(429, "limit", {"X-RateLimit-Reset": "1000300000"})  # 300 s away
+    with patch("summarizer.llm.time.time", return_value=1_000_000.0):
+        assert 2.5 <= _retry_delay_seconds(1, exc) <= 7.5
 
 
 def test_long_retry_after_falls_back_to_backoff():

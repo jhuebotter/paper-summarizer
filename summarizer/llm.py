@@ -119,27 +119,27 @@ class RejectedCompletion(LLMError):
         self.usage = usage
 
 
-class ProviderError(LLMError):
+class ProviderError(RejectedCompletion):
     """The request was accepted but the provider failed; OpenRouter reports this
     as an ``error`` object in a 200 response (no choices, or ``finish_reason="error"``)."""
 
-    def __init__(self, message: str, code: int | None) -> None:
-        super().__init__(message)
+    def __init__(self, message: str, usage: "UsageStats | None", code: int | None) -> None:
+        super().__init__(message, usage)
         self.code = code
 
     @property
     def retryable(self) -> bool:
-        return self.code is None or self.code == 429 or 500 <= self.code <= 599
+        return self.code is None or self.code in (408, 429) or 500 <= self.code <= 599
 
 
-def _provider_error(obj: object, fallback: str) -> ProviderError:
+def _provider_error(obj: object, fallback: str, usage: "UsageStats | None") -> ProviderError:
     extra = getattr(obj, "model_extra", None)
     error = extra.get("error") if isinstance(extra, dict) else None
     if not isinstance(error, dict):
-        return ProviderError(fallback, None)
-    code = error.get("code")
-    code = code if isinstance(code, int) else None
-    return ProviderError(f"{fallback}: {error.get('message') or error} (code {code})", code)
+        return ProviderError(fallback, usage, None)
+    code = str(error.get("code"))
+    code = int(code) if code.isdigit() else None
+    return ProviderError(f"{fallback}: {error.get('message') or error} (code {code})", usage, code)
 
 
 class CompletionResponse:
@@ -212,10 +212,10 @@ class LLMClient:
         response = self._client.chat.completions.create(**kwargs)
         usage = _extract_usage(response)
         if not getattr(response, "choices", None):
-            raise _provider_error(response, "LLM response contains no choices")
+            raise _provider_error(response, "LLM response contains no choices", usage)
         choice = response.choices[0]
         if choice.finish_reason == "error":
-            raise _provider_error(choice, "LLM generation failed mid-response")
+            raise _provider_error(choice, "LLM generation failed mid-response", usage)
         if choice.finish_reason == "length":
             raise RejectedCompletion(
                 "LLM output was truncated by the token limit (finish_reason=length); "
@@ -491,7 +491,7 @@ def call_llm(
     logger.info("Awaiting response...")
     t0 = time.monotonic()
     try:
-        completion = _complete_with_retries(client, prompt)
+        completion = _complete_with_retries(client, prompt, accumulator)
     except RejectedCompletion as exc:
         _record(accumulator, exc.usage, _calculate_cost(exc.usage, client.pricing))
         raise
@@ -583,7 +583,7 @@ def _repair_json_once(
         f"{bad_text}"
     )
     try:
-        response = _complete_with_retries(client, repair_prompt)
+        response = _complete_with_retries(client, repair_prompt, accumulator)
     except RejectedCompletion as exc:
         _record(accumulator, exc.usage, _calculate_cost(exc.usage, client.pricing))
         raise
@@ -606,21 +606,27 @@ def _record(accumulator: "CostAccumulator | None", usage: "UsageStats | None", c
         accumulator.add(usage if usage is not None else UsageStats(), cost)
 
 
-def _complete_with_retries(client: LLMClient, prompt: str) -> CompletionResponse:
+def _complete_with_retries(
+    client: LLMClient, prompt: str, accumulator: "CostAccumulator | None" = None
+) -> CompletionResponse:
     """Run one completion with retry/backoff on transient errors.
 
     Retried: HTTP 429 (per-minute limits), 5xx, timeouts, connection errors and
-    transient provider errors reported inside a 200 response.  Exhausted quotas
-    (daily free-model cap, credits, key limit) raise ``QuotaExhausted`` without
-    retrying.
+    transient provider errors reported inside a 200 response (whose usage, if
+    billed, is recorded).  Exhausted quotas (daily free-model cap, credits, key
+    limit) raise ``QuotaExhausted`` without retrying.
     """
     attempts = _MAX_TRANSIENT_RETRIES + 1
     for attempt in range(1, attempts + 1):
         try:
             return client.complete(prompt)
         except ProviderError as exc:
+            if exc.code == 402:
+                raise QuotaExhausted(f"Credits exhausted: {exc}") from exc
             if attempt >= attempts or not exc.retryable:
                 raise
+            if exc.usage is not None:
+                _record(accumulator, exc.usage, _calculate_cost(exc.usage, client.pricing))
             error = exc
         except LLMError:
             raise
