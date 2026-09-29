@@ -131,11 +131,11 @@ Environment variables (a `.env` file in the working directory is loaded automati
 
 Defaults: `--base-url https://openrouter.ai/api/v1`, `--model nvidia/nemotron-3-super-120b-a12b:free` (free, 262k context, checked 2026-09-29).
 
-- Free models are rate-limited per day by OpenRouter, and the limit depends on your account's credit balance. Check your key's limits before a large batch, and lower `--workers` if you hit 429s.
+- Free (`:free`) models allow 20 requests per minute, and 50 per day until you've bought $10 of credits (then 1,000 per day). The preflight shows your key's spend and limits. When the daily cap or your credits run out, the run stops cleanly: queued papers are skipped, not failed, so rerun later to continue. Per-minute 429s are retried, honouring `Retry-After`.
 - Free endpoints may log prompts. That's fine for published papers; don't send unpublished work.
 - A paid fallback within a few-cents budget is `--model meta/muse-spark-1.3-contributor` (~$0.10 / $0.20 per million input/output tokens, about **$0.007** per paper).
 
-Before processing (not in `--dry-run`), the CLI checks that the backend is reachable. For OpenRouter it also checks that `LLM_API_KEY` is set and that the model id is still listed; OpenRouter does retire ids, so this fails fast instead of failing every paper.
+Before processing (not in `--dry-run`), the CLI checks that the backend is reachable. For OpenRouter it also checks that `LLM_API_KEY` is set and that the model id is still listed (OpenRouter does retire ids), and logs the key's usage and limits. Reported costs are what OpenRouter actually billed when the response includes it, and otherwise an estimate from list prices.
 
 ## CLI options
 
@@ -145,7 +145,10 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 - `--extractor {auto,docling,pypdf}`: `auto` uses docling if installed, falling back to pypdf.
 - `--output-dir DIR`: output root (default `output_summaries`).
 - `--model`, `--base-url`: backend selection.
-- `--max-chars N`: paper-text budget (default 200,000 ≈ 50k tokens). Longer text is truncated, and a warning is logged.
+- `--max-chars N`: paper-text budget (default 200,000 ≈ 50k tokens). Longer text is truncated, and a warning is logged. For models with a smaller context window (known from OpenRouter), the text is cut further so the prompt and reply fit.
+- `--strip-references` / `--no-strip-references`: drop the References/Bibliography section before sending (default on). This saves tokens and budget for the actual paper. With docling, appendices after the references are kept; with pypdf, everything after the references heading is dropped.
+- `--structured-output`: ask the backend to constrain replies to the summary's JSON schema (off by default until the evaluation shows it helps; the model must support structured outputs).
+- `--max-cost USD`: stop starting new papers once this much has been spent (papers already running still finish).
 - `--max-output-tokens N`: cap generated tokens (default: no cap). If the model hits the cap, the paper fails with a clear message instead of an unrepairable half-JSON.
 - `--workers N`: parallel papers (default 3). `--timeout S`: per-call timeout (default 120).
 - `--verbose` / `--no-verbose`: DEBUG logging (raw response excerpts on parse failures, full validation errors); off by default.
@@ -158,6 +161,7 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 - Extraction caches are per extractor (`<stem>.docling.md`, `<stem>.pypdf.md`). A legacy `<stem>.md` is still honoured by `--extractor auto`.
 - Failed papers are not recorded, so the next run retries them. The exit code is 1 if any paper failed.
 - Ctrl-C cancels queued papers (exit code 130). Finished papers are kept and skipped on the next run.
+- A run stopped by a quota or `--max-cost` exits with 1 and says why; rerunning continues where it stopped.
 - Use one run at a time per output directory.
 
 ## Evaluation
@@ -203,6 +207,8 @@ Duplicate PDFs (same content) are evaluated once. Successful LLM responses are c
 - **"output was truncated by the token limit"**: raise `--max-output-tokens`, or choose a model with a larger output budget.
 - **Poor extraction**: install the docling extra (`uv sync --extra docling`), then `--reparse`.
 - **Slow runs or timeouts**: lower `--workers`, raise `--timeout`, or reduce `--max-chars`.
+- **"Rate limit exhausted … free-models-per-day"**: the free daily cap is reached; rerun after the reset time shown, or buy credits.
+- **Errors with `--structured-output`**: the model or provider doesn't support it; run without the flag.
 
 ## Development
 
@@ -218,7 +224,7 @@ CI runs lint and tests on Python 3.12–3.14.
 ## Roadmap
 
 - Structured JSON outputs next to each summary, content-hash paper identity, DOI-based metadata.
-- JSON-schema structured outputs and leaner, type-specific prompts.
+- Leaner, type-specific prompts (and choosing the `--structured-output` default from evaluation results).
 - Decision models, i.e. fast classifiers that return calibrated probabilities (e.g. TypeSafe's Jev, or local models via Ollaya), for screening, typed field extraction and cross-checks.
 - Domain profiles, so the research field is hot-swappable.
 - Corpus-level comparison tables, BibTeX export and staged synthesis.
