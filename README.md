@@ -118,6 +118,7 @@ The authors train a recurrent LIF controller with surrogate-gradient BPTT on a s
 ├── output_summaries/             # Summaries by paper type + processed.jsonl (gitignored)
 ├── skill_data/references/        # Prompt references: JSON contract, template, field guides
 ├── collect_pdfs.sh               # Flatten nested PDF libraries
+├── eval/                         # Evaluation papers, gold labels, runs and cache (gitignored)
 └── summarizer/                   # Package source (cli, batch, pipeline, llm, parser, prompts, renderer, models)
 ```
 
@@ -159,6 +160,40 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 - Ctrl-C cancels queued papers (exit code 130). Finished papers are kept and skipped on the next run.
 - Use one run at a time per output directory.
 
+## Evaluation
+
+`summarize-papers eval` runs one or more model × extractor configurations over a folder of PDFs and writes a report. It uses its own run directory and never touches `output_summaries/` or the processed index.
+
+```bash
+mkdir -p eval/papers && cp /path/to/some/papers/*.pdf eval/papers/   # extraction caches are written next to the PDFs
+uv run summarize-papers eval --source eval/papers --init-gold          # adds unlabelled entries to eval/gold.jsonl
+# optionally fill in labels in eval/gold.jsonl, then:
+uv run summarize-papers eval --source eval/papers --models nvidia/nemotron-3-super-120b-a12b:free,qwen/qwen3.8-27b:free --workers 1
+```
+
+Each run writes `eval/runs/<timestamp>/`:
+- `report.md`: per-configuration summary, a per-paper table, every quote that wasn't found, and label accuracy per field;
+- `results.jsonl`: one row per paper × configuration, with metrics, tokens, cost, repairs, timings and provenance (git commit, reference hash, `--max-chars`);
+- `summaries/<config>/<sha256>.json`: the validated summaries.
+
+LLM responses are cached in `eval/cache/`. Re-running the same configuration is free and resumes an interrupted run.
+
+**Gold labels:** `eval/gold.jsonl` holds one `{"sha256", "file", "labels"}` object per paper. The labels are `is_research_paper`, `paper_type` (`primary`/`synthesis`/`non_research`), `synthesis_subtype`, `year`, `first_author` (surname) and `title`. `null` means not labelled, and the field is skipped.
+
+**Metrics** (a rate with nothing to count is reported as n/a):
+- **Quotes:** each `citable_snippets` quote is checked against the exact text the model saw. It counts as verbatim (after normalizing hyphenation, ligatures, quotes and whitespace), near (≥70% of its word 3-grams found), or not found.
+- **Anchor coverage:** the share of sentences with a number (not a year or a name like "Loihi 2") that carry a `Source:` anchor in the same or the next sentence.
+- **First person:** uses of "we/our/us" outside quotes, per 1k words.
+- **Word budget:** Part 1 prose words ÷ the limit (600 primary, 1000 synthesis).
+- **Evidence tags:** notable findings with exactly one allowed tag (no `Measured` for synthesis papers).
+- **Reliability and cost:** first-try validity, JSON and schema repairs, tokens, cost, parse and LLM seconds.
+- **Duplicate citation keys.**
+
+**Caveats:**
+- Zotero-style filenames ("Author - Year - Title.pdf") are part of the prompt, which inflates title, year and author accuracy. `paper_type` and `is_research_paper` are the informative labels.
+- Free models are capped at 50 requests per day (1,000 once you've bought $10 of credits); use `--workers 1` and let the cache carry runs across days.
+- With about 30 papers and one sample each, compare configurations per paper rather than by small differences in averages.
+
 ## Troubleshooting
 
 - **"Model … is not available on OpenRouter"**: pick a current id from <https://openrouter.ai/models>.
@@ -180,7 +215,6 @@ CI runs lint and tests on Python 3.12–3.14.
 
 ## Roadmap
 
-- Evaluation harness: quote faithfulness, validity and repair rates, cost per paper, labelled accuracy, model comparison.
 - Structured JSON outputs next to each summary, content-hash paper identity, DOI-based metadata.
 - JSON-schema structured outputs and leaner, type-specific prompts.
 - Decision models, i.e. fast classifiers that return calibrated probabilities (e.g. TypeSafe's Jev, or local models via Ollaya), for screening, typed field extraction and cross-checks.

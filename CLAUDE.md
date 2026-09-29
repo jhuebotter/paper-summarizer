@@ -23,6 +23,7 @@ Python >=3.12, developed on 3.14 (`.python-version`). Use uv, not pip/conda; com
 - Schema repair resends the paper only for missing content (`pipeline._needs_paper_context`).
 - Parser caches `<stem>.<extractor>.md` next to the PDF; docling is imported lazily and is an optional extra.
 - Processed index: `output_summaries/processed.jsonl` (legacy `processed.txt` is read-only for migration).
+- Evaluation: `summarize-papers eval` (`evaluation.py` runner/cache/gold/report, `metrics.py` pure metrics) calls `process_pdf` directly and must never write to `output_summaries/`.
 
 ## Conventions
 
