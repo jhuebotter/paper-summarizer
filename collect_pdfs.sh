@@ -9,6 +9,7 @@
 # Handles spaces, leading/trailing whitespace, and other odd characters in
 # names, and matches .pdf case-insensitively.
 set -euo pipefail
+unset CDPATH
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: $0 <source_dir> [dest_dir]" >&2
@@ -28,9 +29,10 @@ DEST_ABS="$(cd "$DEST" && pwd)"
 
 copied=0
 skipped=0
+failed=0
 while IFS= read -r -d '' pdf; do
     # Never re-collect files that already live in the destination.
-    case "$(cd "$(dirname "$pdf")" && pwd)" in "$DEST_ABS"*) continue ;; esac
+    case "$(cd "$(dirname "$pdf")" && pwd)" in "$DEST_ABS" | "$DEST_ABS"/*) continue ;; esac
 
     parent="$(basename "$(dirname "$pdf")")"
     filename="$(basename "$pdf")"
@@ -51,8 +53,12 @@ while IFS= read -r -d '' pdf; do
         skipped=$((skipped + 1))
         continue
     fi
-    cp -p "$pdf" "$target"
-    copied=$((copied + 1))
+    if cp -p "$pdf" "$target"; then
+        copied=$((copied + 1))
+    else
+        echo "Warning: could not copy $pdf" >&2
+        failed=$((failed + 1))
+    fi
 done < <(find "$SRC" -type f -iname '*.pdf' ! -name '._*' -print0)
 
-echo "Done. Copied $copied PDFs to $DEST ($skipped identical duplicates skipped)."
+echo "Done. Copied $copied PDFs to $DEST ($skipped identical duplicates skipped, $failed failed)."
