@@ -1,9 +1,10 @@
 """Tests for summarizer/prompts.py — reference loading and prompt building."""
 
-import pytest
 from pathlib import Path
 
-from summarizer.prompts import load_references, build_combined_prompt
+import pytest
+
+from summarizer.prompts import build_combined_prompt, load_references
 
 PROJECT_ROOT = Path(__file__).parent.parent
 REFERENCES_DIR = PROJECT_ROOT / "skill_data" / "references"
@@ -20,7 +21,7 @@ def test_load_references_returns_nonempty_string():
     assert len(content) > 100
 
 
-def test_load_references_includes_all_three_files():
+def test_load_references_includes_all_reference_files():
     content = load_references(REFERENCES_DIR)
     # Each file has unique distinctive content
     assert "Output Template" in content  # output-template.md
@@ -49,7 +50,7 @@ def test_load_references_uses_only_md_files(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# build_combined_prompt (v1.1 — single call)
+# build_combined_prompt (single call)
 # ---------------------------------------------------------------------------
 
 
@@ -175,15 +176,34 @@ def test_load_references_alphabetical_order(tmp_path):
 _PROMPT = build_combined_prompt("text", "refs", "paper.pdf")
 
 _PRIMARY_PART1_KEYS = [
-    "tldr", "problem_motivation", "core_contribution", "methods", "results",
-    "key_takeaways", "limitations", "open_problems_future_directions",
-    "critical_assessment", "notable_findings", "citable_snippets", "relevance",
+    "tldr",
+    "problem_motivation",
+    "core_contribution",
+    "methods",
+    "results",
+    "key_takeaways",
+    "limitations",
+    "open_problems_future_directions",
+    "critical_assessment",
+    "notable_findings",
+    "citable_snippets",
+    "relevance",
 ]
 _SYNTHESIS_PART1_KEYS = [
-    "tldr", "target_papers_field", "scope_coverage", "taxonomy_organization",
-    "core_argument", "synthesis_contribution", "key_claims_narrative",
-    "key_takeaways", "limitations", "open_problems_future_directions",
-    "critical_assessment", "notable_findings", "citable_snippets", "relevance",
+    "tldr",
+    "target_papers_field",
+    "scope_coverage",
+    "taxonomy_organization",
+    "core_argument",
+    "synthesis_contribution",
+    "key_claims_narrative",
+    "key_takeaways",
+    "limitations",
+    "open_problems_future_directions",
+    "critical_assessment",
+    "notable_findings",
+    "citable_snippets",
+    "relevance",
 ]
 _NON_RESEARCH_PART1_KEYS = ["paper_type", "note"]
 
@@ -229,3 +249,36 @@ def test_build_combined_prompt_mentions_output_budget_warning():
 def test_build_combined_prompt_part2_requires_full_object_for_primary():
     """Prompt requires a full Part 2 object for primary papers (not just null rules)."""
     assert "part2 must be a full Part 2 object" in _PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Regressions: taxonomy and word budgets must match the schema/templates
+# ---------------------------------------------------------------------------
+
+
+def _prompt() -> str:
+    from pathlib import Path
+
+    refs = load_references(Path(__file__).parent.parent / "skill_data" / "references")
+    return build_combined_prompt(paper_text="TEXT", references=refs, source_filename="x.pdf")
+
+
+def test_prompt_paper_types_match_schema():
+    """Regression: the prompt tail listed "survey"/"commentary" as paper types."""
+    import re
+    from typing import get_args
+
+    from summarizer.models import PaperType
+
+    rule = next(ln for ln in _prompt().splitlines() if "metadata.paper_type is exactly" in ln)
+    allowed = set(re.findall(r'"([a-z_]+)"', rule.split("(")[0]))
+    assert allowed == set(get_args(PaperType))
+
+
+def test_prompt_budget_matches_renderer_word_limits():
+    """Regression: the output budget said ≤600 words for every paper type."""
+    from summarizer.renderer import _WORD_LIMITS
+
+    prompt = _prompt()
+    for paper_type, limit in _WORD_LIMITS.items():
+        assert f"{paper_type}: ≤{limit} words" in prompt

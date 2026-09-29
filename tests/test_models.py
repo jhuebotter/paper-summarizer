@@ -1,32 +1,32 @@
 """Tests for summarizer/models.py — pydantic models, dataclass Config, exceptions."""
 
-import pytest
 from pathlib import Path
+
+import pytest
 from pydantic import ValidationError
 
 from summarizer.models import (
-    LLMResponse,
-    PaperMetadata,
-    SummaryPart1Primary,
-    SummaryPart1Synthesis,
-    SummaryPart1NonResearch,
-    SummaryPart2,
-    PaperSummary,
+    DEFAULT_BASE_URL,
+    DEFAULT_MODEL,
+    DEFAULT_SKILL_DATA_DIR,
+    BatchReport,
     Config,
     FailedPaper,
-    BatchReport,
-    ParseError,
-    LLMError,
+    LLMResponse,
+    PaperMetadata,
+    PaperSummary,
     PipelineError,
+    SummaryPart1NonResearch,
+    SummaryPart1Primary,
+    SummaryPart1Synthesis,
+    SummaryPart2,
 )
 
 # ---------------------------------------------------------------------------
 # Helpers — split the flat conftest mock dict into metadata vs. part1 keys
 # ---------------------------------------------------------------------------
 
-_METADATA_ONLY_KEYS = frozenset(
-    {"citation_key", "title", "authors", "year", "venue", "tags"}
-)
+_METADATA_ONLY_KEYS = frozenset({"citation_key", "title", "authors", "year", "venue", "tags"})
 
 
 def _meta_fields(d: dict) -> dict:
@@ -213,13 +213,14 @@ def test_paper_summary_composition(mock_part1_dict, mock_part2_dict):
 
 def test_config_defaults():
     config = Config()
-    assert config.base_url == "http://localhost:1234/v1"
-    assert config.model == "openai/gpt-oss-120b:free"
+    assert config.base_url == DEFAULT_BASE_URL == "https://openrouter.ai/api/v1"
+    assert config.model == DEFAULT_MODEL
     assert config.max_chars == 200_000
     assert config.force_summary is False
     assert config.reparse is False
     assert config.dry_run is False
-    assert config.skill_data_dir == Path("skill_data/references")
+    assert config.skill_data_dir == DEFAULT_SKILL_DATA_DIR
+    assert (config.skill_data_dir / "json-output-contract.md").exists()
     assert config.output_dir == Path("output_summaries")
     assert config.verbose is False
     assert config.api_key is None
@@ -312,7 +313,7 @@ def test_batch_report_total_cost_accepts_value():
 
 
 # ---------------------------------------------------------------------------
-# LLMResponse (v1.1 combined response model)
+# LLMResponse (combined response model)
 # ---------------------------------------------------------------------------
 
 
@@ -325,9 +326,7 @@ def test_llm_response_primary_paper(mock_part1_dict, mock_part2_dict):
     metadata["is_research_paper"] = True
     metadata["rejection_reason"] = None
     part1 = {
-        k: mock_part1_dict[k]
-        for k in mock_part1_dict
-        if k not in (meta_keys - {"paper_type"})
+        k: mock_part1_dict[k] for k in mock_part1_dict if k not in (meta_keys - {"paper_type"})
     }
     response = LLMResponse(
         metadata=metadata,

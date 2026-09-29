@@ -8,7 +8,7 @@ reporting, and runtime configuration.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal, Union
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -25,16 +25,18 @@ PaperType = Literal["primary", "synthesis"]
 
 
 class PaperMetadata(BaseModel):
-    """Bibliographic metadata extracted from the paper in LLM Call 1.
+    """Bibliographic metadata extracted from the paper.
 
     The ``citation_key`` follows the convention ``firstauthorYEARfirstword``
-    (all lowercase), e.g. ``huebotter2025spiking``.
+    (all lowercase), e.g. ``huebotter2025spiking``.  ``year`` is ``None`` only
+    when no year could be found anywhere (the key then uses ``nd``, BibTeX's
+    "no date" convention).
     """
 
     citation_key: str
     title: str
     authors: list[str]
-    year: int
+    year: int | None
     venue: str
     is_research_paper: bool
     paper_type: PaperType | None
@@ -48,18 +50,14 @@ class PaperMetadata(BaseModel):
             if self.paper_type is None:
                 raise ValueError("paper_type is required when is_research_paper=true")
             if self.rejection_reason is not None:
-                raise ValueError(
-                    "rejection_reason must be null when is_research_paper=true"
-                )
+                raise ValueError("rejection_reason must be null when is_research_paper=true")
             return self
 
         # Non-research document path
         if self.paper_type is not None:
             raise ValueError("paper_type must be null when is_research_paper=false")
         if not self.rejection_reason:
-            raise ValueError(
-                "rejection_reason is required when is_research_paper=false"
-            )
+            raise ValueError("rejection_reason is required when is_research_paper=false")
         return self
 
 
@@ -155,11 +153,7 @@ class SummaryPart1NonResearch(BaseModel):
 
 
 SummaryPart1 = Annotated[
-    Union[
-        SummaryPart1Primary,
-        SummaryPart1Synthesis,
-        SummaryPart1NonResearch,
-    ],
+    SummaryPart1Primary | SummaryPart1Synthesis | SummaryPart1NonResearch,
     Field(discriminator="paper_type"),
 ]
 """Discriminated union: pydantic selects the correct variant by ``paper_type``."""
@@ -170,11 +164,11 @@ SummaryPart1 = Annotated[
 
 
 class SummaryPart2(BaseModel):
-    """Structured extraction of SNN-specific technical fields (LLM Call 2).
+    """Structured extraction of SNN-specific technical fields.
 
     Field values should use ``"not reported"`` when a concept applies but the
     paper omits it, and ``"not applicable"`` only when the concept genuinely
-    does not apply (e.g. ``"not applicable (synthesis)"``).
+    does not apply.
 
     Part 2 is produced only for ``paper_type="primary"`` research papers.
     Synthesis and non-research documents use ``part2=null``.
@@ -201,12 +195,12 @@ class SummaryPart2(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Combined LLM response (v1.1 — single call returns all three sections)
+# Combined LLM response (single call returns all three sections)
 # ---------------------------------------------------------------------------
 
 
 class LLMResponse(BaseModel):
-    """The raw validated response from a single combined LLM call (v1.1).
+    """The validated response from the single combined LLM call.
 
     The LLM returns a JSON object with three top-level keys:
     ``metadata``, ``part1``, and ``part2``.
@@ -285,39 +279,51 @@ class BatchReport(BaseModel):
     failed: int
     failed_papers: list[FailedPaper]
     total_cost: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 # ---------------------------------------------------------------------------
 # Config (dataclass — not pydantic; holds runtime settings)
 # ---------------------------------------------------------------------------
 
-#: Estimate: 1 token ≈ 4 characters for English text.  At 200 000 chars the
-#: paper text budget is ~50 000 tokens, which leaves headroom for the
-#: references context (~2 500 tokens) and LLM output (~2 500 tokens) inside a
-#: 55 000-token context window.  Increase with ``--max-chars`` for models with
-#: larger context windows, or decrease for small local models.
+#: Estimate: 1 token ≈ 4 characters for English text.  200 000 chars of paper
+#: text is ~50 000 tokens.  The fixed prompt (references + output rules) adds
+#: ~11 000 tokens and the response ~3 000-5 000, so a call needs a context
+#: window of roughly 70 000 tokens.  Lower ``--max-chars`` for small local
+#: models.
 _DEFAULT_MAX_CHARS = 200_000
+
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+
+#: A free OpenRouter model with a 262k-token context.  Free models are
+#: rate-limited and may be retired; the CLI's preflight check reports a retired
+#: id.  Paid fallback within a few-cents budget: ``meta/muse-spark-1.3-contributor``.
+DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+
+#: Resolved from the source checkout (not the CWD) so the CLI works from any
+#: directory.  Requires an editable/source install.
+DEFAULT_SKILL_DATA_DIR = Path(__file__).resolve().parent.parent / "skill_data" / "references"
 
 
 @dataclass
 class Config:
     """Runtime configuration for the summarizer pipeline.
 
-    All fields correspond to CLI flags.  Defaults are chosen to fit comfortably
-    inside a 50k-token context window with the standard skill reference files.
+    All fields correspond to CLI flags.  The defaults need a context window of
+    roughly 70k tokens (see ``_DEFAULT_MAX_CHARS``).
 
     Attributes:
         base_url:       OpenAI-compatible API base URL.  Use
                         ``http://localhost:1234/v1`` for LM Studio or
                         ``https://openrouter.ai/api/v1`` for OpenRouter.
         model:          Model identifier passed to the API.
-        max_chars:      Maximum characters of paper markdown sent to the LLM.
-                        Default (~200k chars ≈ 50k tokens) suits models with a
-                        55k+ token context window.  Lower this for 4k/8k models.
-        force_summary:  If True, re-run summary generation even for PDFs already
-                        in processed.txt (preserves extraction cache unless
-                        ``reparse`` is set).
-        reparse:        If True, also re-run docling (ignores cached .md files).
+        max_chars:      Maximum characters of paper text sent to the LLM
+                        (~200k chars ≈ 50k tokens).  Lower this for small
+                        local models.
+        force_summary:  If True, re-summarize PDFs already in the processed
+                        index (keeps the extraction cache unless ``reparse``).
+        reparse:        If True, also re-run extraction (ignores cached text).
                         Implies summary regeneration for selected files.
         extractor:      PDF text extraction strategy: ``auto`` (docling with
                         pypdf fallback), ``docling`` (docling-only), or
@@ -327,10 +333,9 @@ class Config:
         output_dir:     Root directory for centralized summary output.
                         Subdirs ``primary/``, ``synthesis/``, and
                         ``non_research/`` are created automatically.
-        skill_data_dir: Path to the directory containing reference .md files
-                        (output-template, extraction fields, learning paradigms).
-        verbose:        If True, print context size diagnostics (chars, estimated
-                        tokens) to stderr before each LLM call.
+        skill_data_dir: Directory of reference .md files embedded in the prompt.
+        verbose:        If True, log at DEBUG level (prompt sizes, raw response
+                        excerpts on failures, full validation errors).
         api_key:        API key for the LLM backend.  ``None`` means the key is
                         read from the ``LLM_API_KEY`` environment variable; if
                         that is also unset the dummy ``"lm-studio"`` string is
@@ -346,15 +351,15 @@ class Config:
                            Each worker processes full PDFs end-to-end.
     """
 
-    base_url: str = "http://localhost:1234/v1"
-    model: str = "openai/gpt-oss-120b:free"
+    base_url: str = DEFAULT_BASE_URL
+    model: str = DEFAULT_MODEL
     max_chars: int = _DEFAULT_MAX_CHARS
     force_summary: bool = False
     reparse: bool = False
     extractor: Literal["auto", "docling", "pypdf"] = "auto"
     dry_run: bool = False
     output_dir: Path = Path("output_summaries")
-    skill_data_dir: Path = Path("skill_data/references")
+    skill_data_dir: Path = DEFAULT_SKILL_DATA_DIR
     verbose: bool = False
     api_key: str | None = None
     timeout_s: int = 120
@@ -368,7 +373,7 @@ class Config:
 
 
 class ParseError(Exception):
-    """Raised when docling fails to parse a PDF (corrupt, password-protected, etc.)."""
+    """Raised when PDF text extraction fails (corrupt, password-protected, etc.)."""
 
 
 class LLMError(Exception):

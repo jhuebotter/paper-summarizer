@@ -1,12 +1,24 @@
 """Tests for summarizer/parser.py — docling PDF-to-markdown wrapper with cache."""
 
 import logging
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+import summarizer.parser as parser_mod
 from summarizer.models import ParseError
 from summarizer.parser import parse_pdf
+
+PROJECT_ROOT = Path(__file__).parent.parent
+
+
+@pytest.fixture(autouse=True)
+def _fresh_converter_cache():
+    """The converter cache is process-wide; don't let one test reuse another's."""
+    parser_mod._CONVERTERS.clear()
+    yield
+    parser_mod._CONVERTERS.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -64,9 +76,7 @@ def test_parse_pdf_raises_parse_error_on_docling_failure(tmp_path):
     pdf.write_bytes(b"not a real pdf")
 
     with patch("summarizer.parser.DocumentConverter") as MockConverter:
-        MockConverter.return_value.convert.side_effect = Exception(
-            "docling internal error"
-        )
+        MockConverter.return_value.convert.side_effect = Exception("docling internal error")
         with pytest.raises(ParseError, match="bad.pdf"):
             parse_pdf(pdf, max_chars=40_000)
 
@@ -84,15 +94,15 @@ def test_parse_pdf_parse_error_wraps_original_exception(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Cache logic (v1.1)
+# Cache logic
 # ---------------------------------------------------------------------------
 
 
 def test_parse_pdf_writes_cache_on_fresh_parse(tmp_path):
-    """After a fresh parse, {pdf_stem}.md is created next to the PDF."""
+    """After a fresh docling parse, {pdf_stem}.docling.md is created next to the PDF."""
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake content")
-    cache = tmp_path / "paper.md"
+    cache = tmp_path / "paper.docling.md"
 
     mock_result = MagicMock()
     mock_result.document.export_to_markdown.return_value = "parsed content"
@@ -106,7 +116,7 @@ def test_parse_pdf_writes_cache_on_fresh_parse(tmp_path):
 
 
 def test_parse_pdf_reads_cache_when_present(tmp_path):
-    """When {pdf_stem}.md exists and is non-empty, docling is NOT called."""
+    """When a legacy {pdf_stem}.md exists and is non-empty, docling is NOT called."""
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake content")
     cache = tmp_path / "paper.md"
@@ -221,17 +231,14 @@ def test_parse_pdf_falls_back_to_pypdf_on_docling_failure(tmp_path):
 
     with (
         patch("summarizer.parser.DocumentConverter") as MockConverter,
-        patch(
-            "summarizer.parser._extract_text_with_pypdf", return_value="fallback text"
-        ),
+        patch("summarizer.parser._extract_text_with_pypdf", return_value="fallback text"),
     ):
-        MockConverter.return_value.convert.side_effect = Exception(
-            "PdfHyperlink url_parsing"
-        )
+        MockConverter.return_value.convert.side_effect = Exception("PdfHyperlink url_parsing")
         result = parse_pdf(pdf, max_chars=10_000)
 
     assert result == "fallback text"
-    assert (tmp_path / "paper.md").read_text(encoding="utf-8") == "fallback text"
+    assert (tmp_path / "paper.pypdf.md").read_text(encoding="utf-8") == "fallback text"
+    assert not (tmp_path / "paper.docling.md").exists()
 
 
 def test_parse_pdf_raises_parse_error_if_docling_and_fallback_fail(tmp_path):
@@ -293,3 +300,165 @@ def test_parse_real_pdf_truncation_is_applied(sample_pdf_path):
     small_limit = 500
     result = parse_pdf(sample_pdf_path, max_chars=small_limit)
     assert len(result) <= small_limit
+
+
+# ---------------------------------------------------------------------------
+# Extractor-keyed cache, lazy docling, truncation warning
+# ---------------------------------------------------------------------------
+
+
+def _fake_pdf(tmp_path: Path) -> Path:
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake content")
+    return pdf
+
+
+def test_pypdf_extractor_ignores_docling_cache(tmp_path):
+    """Regression: switching --extractor must not reuse another backend's text."""
+    pdf = _fake_pdf(tmp_path)
+    (tmp_path / "paper.docling.md").write_text("docling text", encoding="utf-8")
+    with patch("summarizer.parser._extract_text_with_pypdf", return_value="pypdf text"):
+        assert parse_pdf(pdf, extractor="pypdf") == "pypdf text"
+    assert (tmp_path / "paper.pypdf.md").read_text(encoding="utf-8") == "pypdf text"
+
+
+def test_docling_extractor_ignores_legacy_and_pypdf_cache(tmp_path):
+    (tmp_path / "paper.md").write_text("legacy", encoding="utf-8")
+    (tmp_path / "paper.pypdf.md").write_text("pypdf", encoding="utf-8")
+    assert _mocked_parse(tmp_path, "docling text", 10_000, extractor="docling") == "docling text"
+
+
+def test_auto_prefers_docling_cache_over_pypdf_cache(tmp_path):
+    pdf = _fake_pdf(tmp_path)
+    (tmp_path / "paper.docling.md").write_text("docling", encoding="utf-8")
+    (tmp_path / "paper.pypdf.md").write_text("pypdf", encoding="utf-8")
+    with patch("summarizer.parser.DocumentConverter") as MockConverter:
+        assert parse_pdf(pdf) == "docling"
+        MockConverter.assert_not_called()
+
+
+def test_unknown_extractor_raises(tmp_path):
+    with pytest.raises(ValueError, match="extractor"):
+        parse_pdf(_fake_pdf(tmp_path), extractor="ocr")
+
+
+def test_converter_is_reused_across_pdfs(tmp_path):
+    """Building a DocumentConverter loads models; it must happen once per process."""
+    a = tmp_path / "a.pdf"
+    b = tmp_path / "b.pdf"
+    a.write_bytes(b"%PDF")
+    b.write_bytes(b"%PDF")
+    with patch("summarizer.parser.DocumentConverter") as MockConverter:
+        MockConverter.return_value.convert.return_value.document.export_to_markdown.return_value = (
+            "t"
+        )
+        parse_pdf(a, extractor="docling")
+        parse_pdf(b, extractor="docling")
+    MockConverter.assert_called_once()
+
+
+def test_auto_falls_back_to_pypdf_when_docling_not_installed(tmp_path, caplog):
+    import summarizer.parser as parser_mod
+
+    pdf = _fake_pdf(tmp_path)
+    with (
+        patch.object(parser_mod, "DocumentConverter", None),
+        patch.dict("sys.modules", {"docling": None, "docling.document_converter": None}),
+        patch("summarizer.parser._extract_text_with_pypdf", return_value="pypdf text"),
+        caplog.at_level(logging.WARNING, logger="summarizer.parser"),
+    ):
+        assert parse_pdf(pdf) == "pypdf text"
+    assert any("docling is not installed" in r.message for r in caplog.records)
+
+
+def test_docling_extractor_errors_clearly_when_not_installed(tmp_path):
+    import summarizer.parser as parser_mod
+
+    with (
+        patch.object(parser_mod, "DocumentConverter", None),
+        patch.dict("sys.modules", {"docling": None, "docling.document_converter": None}),
+        pytest.raises(ParseError, match="not installed"),
+    ):
+        parse_pdf(_fake_pdf(tmp_path), extractor="docling")
+
+
+def test_importing_cli_does_not_import_docling(tmp_path):
+    """A fake ``docling`` that fails on import proves the import is lazy."""
+    import os
+    import subprocess
+    import sys
+
+    fake = tmp_path / "fake" / "docling"
+    fake.mkdir(parents=True)
+    (fake / "__init__.py").write_text("raise RuntimeError('docling imported eagerly')\n")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(fake.parent), str(PROJECT_ROOT)])}
+    result = subprocess.run(
+        [sys.executable, "-c", "import summarizer.cli"], capture_output=True, text=True, env=env
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_auto_falls_back_to_pypdf_when_docling_fails_to_start(tmp_path):
+    """Regression: a converter constructor failure bypassed the pypdf fallback."""
+    a = tmp_path / "a.pdf"
+    b = tmp_path / "b.pdf"
+    a.write_bytes(b"%PDF")
+    b.write_bytes(b"%PDF")
+    with (
+        patch("summarizer.parser.DocumentConverter", side_effect=OSError("model download")) as cls,
+        patch("summarizer.parser._extract_text_with_pypdf", return_value="pypdf text"),
+    ):
+        assert parse_pdf(a) == "pypdf text"
+        assert parse_pdf(b) == "pypdf text"
+    cls.assert_called_once()  # the failure is remembered, not retried per paper
+
+
+def test_broken_docling_import_counts_as_unavailable(tmp_path):
+    import types
+
+    import summarizer.parser as parser_mod
+
+    def _broken(name):
+        raise RuntimeError("torch: undefined symbol")
+
+    broken = types.ModuleType("docling.document_converter")
+    broken.__getattr__ = _broken
+    with (
+        patch.object(parser_mod, "DocumentConverter", None),
+        patch.dict(
+            "sys.modules",
+            {"docling": types.ModuleType("docling"), "docling.document_converter": broken},
+        ),
+        patch("summarizer.parser._extract_text_with_pypdf", return_value="pypdf text"),
+    ):
+        assert parse_pdf(_fake_pdf(tmp_path)) == "pypdf text"
+
+
+def test_cache_write_failure_is_not_fatal(tmp_path, caplog):
+    """Read-only PDF folders must not fail the paper after a successful extraction."""
+    with (
+        patch("summarizer.parser.os.replace", side_effect=PermissionError("read-only")),
+        caplog.at_level(logging.WARNING, logger="summarizer.parser"),
+    ):
+        assert _mocked_parse(tmp_path, "text", 10_000) == "text"
+    assert any("Could not write extraction cache" in r.message for r in caplog.records)
+    assert not list(tmp_path.glob("*.tmp")) and not list(tmp_path.glob(".*.tmp"))
+
+
+def test_pypdf_extractor_ignores_legacy_cache(tmp_path):
+    pdf = _fake_pdf(tmp_path)
+    (tmp_path / "paper.md").write_text("legacy", encoding="utf-8")
+    with patch("summarizer.parser._extract_text_with_pypdf", return_value="pypdf text"):
+        assert parse_pdf(pdf, extractor="pypdf") == "pypdf text"
+
+
+def test_truncation_logs_warning(tmp_path, caplog):
+    with caplog.at_level(logging.WARNING, logger="summarizer.parser"):
+        _mocked_parse(tmp_path, text="x" * 1000, max_chars=100)
+    assert any("truncated" in r.message for r in caplog.records)
+
+
+def test_no_truncation_warning_when_text_fits(tmp_path, caplog):
+    with caplog.at_level(logging.WARNING, logger="summarizer.parser"):
+        _mocked_parse(tmp_path, text="short", max_chars=100)
+    assert not any("truncated" in r.message for r in caplog.records)

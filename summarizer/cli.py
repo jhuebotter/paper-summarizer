@@ -6,17 +6,15 @@ Usage:
     summarize-papers --source DIR [options]   # batch mode
     summarize-papers --file PDF [options]     # single-file mode
 
-Key options:
-    --force-summary, --reparse, --extractor, --dry-run,
-    --output-dir, --model, --base-url, --max-chars,
-    --skill-data-dir, --verbose/--no-verbose,
-    --log-file, --timeout, --workers, --max-output-tokens.
-
 ``--source`` and ``--file`` are mutually exclusive; exactly one must be supplied.
 ``--reparse`` implies ``--force-summary``.
 
-Before processing (except in dry-run mode), the CLI performs a lightweight
-reachability check against the root host of the configured ``--base-url``.
+Before processing (except in dry-run mode), the CLI checks that the backend
+host is reachable and, for OpenRouter, that an API key is set and the model id
+is listed.
+
+Exit codes: 0 on success (or nothing to do), 1 if any paper failed or the
+input/backend is unavailable, 130 when interrupted.
 """
 
 import argparse
@@ -31,18 +29,17 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from summarizer.batch import (
-    get_output_path,
-    get_versioned_output_path,
-    load_processed_index,
-    run_batch,
-    save_processed_index,
-    should_skip,
-)
+from summarizer.batch import load_processed_index, run_batch, run_pdfs, should_skip
+from summarizer.llm import fetch_openrouter_model_ids, openrouter_listed_id
 from summarizer.log import setup_logging
-from summarizer.models import Config, PipelineError, _DEFAULT_MAX_CHARS
-from summarizer.pipeline import process_pdf
-from summarizer.renderer import render_summary
+from summarizer.models import (
+    _DEFAULT_MAX_CHARS,
+    DEFAULT_BASE_URL,
+    DEFAULT_MODEL,
+    DEFAULT_SKILL_DATA_DIR,
+    BatchReport,
+    Config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,14 +90,22 @@ def main() -> None:
         workers=args.workers,
     )
 
-    # Validate LM Studio is reachable before starting any work
+    # Validate the backend is reachable and usable before starting any work
     if not args.dry_run:
-        _check_lm_studio(config.base_url)
+        _check_backend(config.base_url)
+        _check_openrouter_config(config)
 
-    if args.file:
-        _run_single(Path(args.file), config)
-    else:
-        _run_batch(Path(args.source), config)
+    try:
+        if args.file:
+            _run_single(Path(args.file), config)
+        else:
+            _run_batch(Path(args.source), config)
+    except KeyboardInterrupt:
+        logger.warning(
+            "Interrupted: queued papers were cancelled; finished papers are saved and "
+            "skipped on the next run (in-flight calls may take a moment to end)."
+        )
+        sys.exit(130)
 
 
 # ---------------------------------------------------------------------------
@@ -109,8 +114,8 @@ def main() -> None:
 
 
 def _run_single(pdf_path: Path, config: Config) -> None:
-    """Process a single PDF and write the output to the centralized output dir."""
-    if not pdf_path.exists():
+    """Process a single PDF through the same code path as batch mode."""
+    if not pdf_path.is_file():
         logger.error("File not found: %s", pdf_path)
         sys.exit(1)
 
@@ -122,29 +127,7 @@ def _run_single(pdf_path: Path, config: Config) -> None:
         )
         sys.exit(0)
 
-    logger.info("Processing: %s", pdf_path.name)
-    try:
-        summary = process_pdf(pdf_path, config)
-    except PipelineError as exc:
-        logger.error("%s", exc)
-        sys.exit(1)
-
-    markdown = render_summary(summary)
-    paper_category = summary.metadata.paper_type or "non_research"
-    output_path = get_versioned_output_path(
-        get_output_path(
-            config.output_dir,
-            paper_category,
-            summary.metadata.citation_key,
-        )
-    )
-    output_path.write_text(markdown, encoding="utf-8")
-    abs_path = str(pdf_path.resolve())
-    if abs_path not in processed:
-        processed[abs_path] = []
-    processed[abs_path].append(str(output_path))
-    save_processed_index(config.output_dir, processed)
-    logger.info("Written: %s", output_path)
+    _report_and_exit(run_pdfs([pdf_path], config))
 
 
 # ---------------------------------------------------------------------------
@@ -154,17 +137,22 @@ def _run_single(pdf_path: Path, config: Config) -> None:
 
 def _run_batch(source_dir: Path, config: Config) -> None:
     """Scan ``source_dir`` for PDFs and process each one."""
-    if not source_dir.exists():
-        logger.error("Directory not found: %s", source_dir)
+    if not source_dir.is_dir():
+        logger.error("Not a directory: %s", source_dir)
         sys.exit(1)
 
-    report = run_batch(source_dir, config)
+    _report_and_exit(run_batch(source_dir, config))
 
+
+def _report_and_exit(report: BatchReport) -> None:
+    """Log the run summary; exit with status 1 if any paper failed."""
     logger.info(
-        "Done — processed: %d, skipped: %d, failed: %d, cost=$%.4f",
+        "Done — processed: %d, skipped: %d, failed: %d, tokens in=%d out=%d, cost=$%.4f",
         report.processed,
         report.skipped,
         report.failed,
+        report.input_tokens,
+        report.output_tokens,
         report.total_cost,
     )
 
@@ -176,12 +164,12 @@ def _run_batch(source_dir: Path, config: Config) -> None:
 
 
 # ---------------------------------------------------------------------------
-# LM Studio health check
+# Backend health check
 # ---------------------------------------------------------------------------
 
 
-def _check_lm_studio(base_url: str) -> None:
-    """Verify that the LLM backend (LM Studio or OpenRouter) is reachable."""
+def _check_backend(base_url: str) -> None:
+    """Verify that the LLM backend (OpenRouter, LM Studio, ...) is reachable."""
     parsed = urllib.parse.urlparse(base_url)
     health_url = f"{parsed.scheme}://{parsed.netloc}"
     try:
@@ -196,6 +184,33 @@ def _check_lm_studio(base_url: str) -> None:
         sys.exit(1)
 
 
+def _check_openrouter_config(config: Config) -> None:
+    """Fail fast on OpenRouter misconfiguration instead of failing every paper.
+
+    Checks that an API key is set and that the model id is still listed
+    (OpenRouter retires model ids, e.g. ``:free`` variants).
+    """
+    if "openrouter.ai" not in config.base_url:
+        return
+    if not (config.api_key or os.environ.get("LLM_API_KEY")):
+        logger.error("LLM_API_KEY is not set; OpenRouter requires an API key (see README).")
+        sys.exit(1)
+    model_ids = fetch_openrouter_model_ids(config.base_url)
+    if model_ids is not None and not _openrouter_model_listed(config.model, model_ids):
+        logger.error(
+            "Model %r is not available on OpenRouter. Pick one from "
+            "https://openrouter.ai/models and pass --model or set LLM_MODEL.",
+            config.model,
+        )
+        sys.exit(1)
+
+
+def _openrouter_model_listed(model: str, model_ids: set[str]) -> bool:
+    if model.startswith("@"):  # "@preset/..." ids aren't in the models list
+        return True
+    return openrouter_listed_id(model) in model_ids
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -205,8 +220,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="summarize-papers",
         description=(
-            "Summarise research papers using a local LLM via LM Studio. "
-            "Processes a directory of PDFs (--source) or a single PDF (--file)."
+            "Summarise research papers into structured markdown using an "
+            "OpenAI-compatible LLM backend (OpenRouter by default, or a local "
+            "server such as LM Studio). Processes a directory of PDFs (--source) "
+            "or a single PDF (--file)."
         ),
     )
 
@@ -226,7 +243,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force-summary",
         action="store_true",
         default=False,
-        help="Re-run summary generation for PDFs in processed.txt; preserves extraction cache.",
+        help="Re-summarize PDFs already in the processed index; keeps the extraction cache.",
     )
     parser.add_argument(
         "--reparse",
@@ -252,7 +269,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="output_summaries",
         help="Root directory for centralized summary output (default: output_summaries).",
     )
-    _default_model = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b:free")
+    _default_model = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
     parser.add_argument(
         "--model",
         metavar="MODEL",
@@ -262,8 +279,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--base-url",
         metavar="URL",
-        default="https://openrouter.ai/api/v1",
-        help="OpenAI-compatible API base URL (default: https://openrouter.ai/api/v1).",
+        default=DEFAULT_BASE_URL,
+        help=f"OpenAI-compatible API base URL (default: {DEFAULT_BASE_URL}).",
     )
     parser.add_argument(
         "--max-chars",
@@ -272,24 +289,27 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_DEFAULT_MAX_CHARS,
         help=(
             f"Maximum characters of paper text sent to the LLM "
-            f"(default: {_DEFAULT_MAX_CHARS:,} ≈ 50k tokens)."
+            f"(default: {_DEFAULT_MAX_CHARS:,} ≈ 50k tokens; longer text is "
+            "truncated with a warning)."
         ),
     )
     parser.add_argument(
         "--skill-data-dir",
         metavar="DIR",
-        default="skill_data/references",
+        default=str(DEFAULT_SKILL_DATA_DIR),
         help=(
-            "Directory containing reference .md files "
-            "(output-template, extraction fields, learning paradigms). "
-            "Default: skill_data/references"
+            "Directory of reference .md files embedded in the prompt. "
+            "Default: the skill_data/references folder of this checkout."
         ),
     )
     parser.add_argument(
         "--verbose",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable DEBUG-level logging (default: on). Use --no-verbose to suppress.",
+        default=False,
+        help=(
+            "DEBUG-level logging: raw response excerpts on parse failures and "
+            "full validation errors (default: off)."
+        ),
     )
     parser.add_argument(
         "--log-file",

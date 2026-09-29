@@ -1,33 +1,53 @@
-"""PDF to markdown parser — thin wrapper around docling, with disk cache.
+"""PDF to markdown parser — docling (optional) with pypdf fallback, plus disk cache.
 
-The cache file ``{pdf_stem}.md`` is written next to the source PDF after a
-successful parse and reused on subsequent runs to avoid re-running docling.
-Zero-byte cache files are treated as a cache miss and trigger a fresh parse.
+Cache files live next to the source PDF and are keyed by the extractor that
+produced them, so switching ``--extractor`` never silently reuses text from a
+different backend:
+
+* ``{pdf_stem}.docling.md`` — written by docling
+* ``{pdf_stem}.pypdf.md``   — written by pypdf (directly or as ``auto`` fallback)
+* ``{pdf_stem}.md``         — legacy cache of unknown origin; honoured only by
+  ``auto`` so existing libraries are not re-parsed
+
+Zero-byte cache files are treated as a cache miss.  Cache writes are atomic and
+best-effort: a read-only PDF folder only costs re-extraction on the next run.
+
+docling is imported lazily (it costs several seconds and pulls in torch), and
+is an optional dependency (``uv sync --extra docling``).  When it is missing or
+fails to start, ``auto`` uses pypdf.
 """
 
 import logging
+import os
 import threading
 from pathlib import Path
 
-from docling.document_converter import DocumentConverter
 from pypdf import PdfReader
 
-from summarizer.models import ParseError
+from summarizer.models import _DEFAULT_MAX_CHARS, ParseError
 
 logger = logging.getLogger(__name__)
 
+#: Resolved lazily by ``_docling_converter_class``; tests patch this name.
+DocumentConverter = None
+
 _DOCLING_LOCK = threading.Lock()
+_CONVERTERS: dict[object, object] = {}
+
+_EXTRACTORS = ("auto", "docling", "pypdf")
+
+
+class DoclingUnavailable(ParseError):
+    """Raised when docling is requested but not installed."""
 
 
 def parse_pdf(
     pdf_path: Path,
-    max_chars: int = 200_000,
+    max_chars: int = _DEFAULT_MAX_CHARS,
     reparse: bool = False,
     extractor: str = "auto",
 ) -> str:
     """Parse a PDF to markdown, using a disk cache when available.
-
-    Cache file: ``{pdf_path.stem}.md`` in the same directory as the PDF.
 
     Args:
         pdf_path:  Path to the PDF file.
@@ -40,40 +60,96 @@ def parse_pdf(
         Markdown string, truncated to ``max_chars``.
 
     Raises:
-        ParseError: if docling fails. The cache file is NOT written on failure.
+        ParseError: if extraction fails. No cache file is written on failure.
     """
-    cache_path = pdf_path.parent / f"{pdf_path.stem}.md"
+    if extractor not in _EXTRACTORS:
+        raise ValueError(f"Unknown extractor {extractor!r}; expected one of {_EXTRACTORS}")
 
-    if not reparse and cache_path.exists() and cache_path.stat().st_size > 0:
-        cached = cache_path.read_text(encoding="utf-8")
-        logger.info(
-            "Docling cache found: %s (%s chars)", cache_path.name, f"{len(cached):,}"
-        )
-        return cached[:max_chars]
+    if not reparse:
+        cached = _read_cache(pdf_path, extractor)
+        if cached is not None:
+            return _truncate(cached, max_chars, pdf_path)
 
     logger.info("Running %s extraction on: %s", extractor, pdf_path.name)
-    text = _extract_text(pdf_path, extractor=extractor)
-    cache_path.write_text(text, encoding="utf-8")
-    logger.info("Extraction complete: %s chars", f"{len(text):,}")
+    text, used = _extract_text(pdf_path, extractor=extractor)
+    _write_cache(_cache_path(pdf_path, used), text)
+    logger.info("Extraction complete (%s): %s chars", used, f"{len(text):,}")
+    return _truncate(text, max_chars, pdf_path)
+
+
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+
+
+def _cache_path(pdf_path: Path, extractor: str) -> Path:
+    return pdf_path.parent / f"{pdf_path.stem}.{extractor}.md"
+
+
+def _cache_candidates(pdf_path: Path, extractor: str) -> list[Path]:
+    if extractor == "docling":
+        return [_cache_path(pdf_path, "docling")]
+    if extractor == "pypdf":
+        return [_cache_path(pdf_path, "pypdf")]
+    # auto: prefer docling output, then a previous pypdf fallback, then legacy.
+    return [
+        _cache_path(pdf_path, "docling"),
+        _cache_path(pdf_path, "pypdf"),
+        pdf_path.parent / f"{pdf_path.stem}.md",
+    ]
+
+
+def _read_cache(pdf_path: Path, extractor: str) -> str | None:
+    for path in _cache_candidates(pdf_path, extractor):
+        if path.exists() and path.stat().st_size > 0:
+            cached = path.read_text(encoding="utf-8")
+            logger.info("Extraction cache found: %s (%s chars)", path.name, f"{len(cached):,}")
+            return cached
+    return None
+
+
+def _write_cache(path: Path, text: str) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        logger.warning("Could not write extraction cache %s: %s", path, exc)
+
+
+def _truncate(text: str, max_chars: int, pdf_path: Path) -> str:
+    if len(text) > max_chars:
+        logger.warning(
+            "Paper text truncated for %s: keeping %s of %s chars (raise --max-chars to keep more)",
+            pdf_path.name,
+            f"{max_chars:,}",
+            f"{len(text):,}",
+        )
     return text[:max_chars]
 
 
-def _extract_text(pdf_path: Path, extractor: str) -> str:
+# ---------------------------------------------------------------------------
+# Extraction
+# ---------------------------------------------------------------------------
+
+
+def _extract_text(pdf_path: Path, extractor: str) -> tuple[str, str]:
+    """Return ``(text, extractor_actually_used)``."""
     if extractor == "docling":
-        with _DOCLING_LOCK:
-            return _run_docling(pdf_path)
+        return _run_docling(pdf_path), "docling"
     if extractor == "pypdf":
-        return _extract_text_with_pypdf(pdf_path)
+        return _extract_text_with_pypdf(pdf_path), "pypdf"
     return _run_docling_with_fallback(pdf_path)
 
 
-def _run_docling_with_fallback(pdf_path: Path) -> str:
+def _run_docling_with_fallback(pdf_path: Path) -> tuple[str, str]:
     """Run docling, then fall back to pypdf text extraction on failure."""
     try:
-        # Docling parsing is not always thread-safe under heavy parallel runs.
-        # Serialize parse calls while keeping LLM steps parallel.
-        with _DOCLING_LOCK:
-            return _run_docling(pdf_path)
+        return _run_docling(pdf_path), "docling"
+    except DoclingUnavailable as exc:
+        logger.warning("%s; using pypdf for %s", exc, pdf_path.name)
+        return _extract_text_with_pypdf(pdf_path), "pypdf"
     except ParseError as docling_exc:
         logger.warning(
             "Docling parse failed for %s; attempting pypdf fallback: %s",
@@ -93,25 +169,64 @@ def _run_docling_with_fallback(pdf_path: Path) -> str:
             pdf_path.name,
             f"{len(text):,}",
         )
-        return text
+        return text, "pypdf"
+
+
+def _docling_converter_class():
+    """Return docling's ``DocumentConverter`` class, importing it on first use."""
+    global DocumentConverter
+    if DocumentConverter is None:
+        try:
+            from docling.document_converter import DocumentConverter as _DC
+        except ImportError as exc:
+            raise DoclingUnavailable("docling is not installed (uv sync --extra docling)") from exc
+        except Exception as exc:  # e.g. a broken torch install
+            raise DoclingUnavailable(f"docling failed to import: {exc}") from exc
+        DocumentConverter = _DC
+    return DocumentConverter
+
+
+def _get_converter():
+    """Return a process-wide converter; building one loads docling's models.
+
+    Raises:
+        DoclingUnavailable: if docling is missing or its models fail to load
+            (the failure is remembered, so later papers skip straight to pypdf).
+    """
+    cls = _docling_converter_class()
+    converter = _CONVERTERS.get(cls)
+    if converter is None:
+        try:
+            converter = cls()
+        except Exception as exc:
+            converter = DoclingUnavailable(f"docling failed to start: {exc}")
+        _CONVERTERS[cls] = converter
+    if isinstance(converter, DoclingUnavailable):
+        raise converter
+    return converter
 
 
 def _run_docling(pdf_path: Path) -> str:
     """Run docling on *pdf_path* and return the full markdown string.
 
+    Calls are serialized: docling is not reliably thread-safe under parallel
+    batch runs, while LLM calls stay parallel.
+
     Raises:
+        DoclingUnavailable: if docling is not installed.
         ParseError: wrapping any exception raised by docling.
     """
-    try:
-        converter = DocumentConverter()
-        result = converter.convert(str(pdf_path))
-        return result.document.export_to_markdown()
-    except Exception as e:
-        raise ParseError(f"Failed to parse {pdf_path}: {e}") from e
+    with _DOCLING_LOCK:
+        converter = _get_converter()
+        try:
+            result = converter.convert(str(pdf_path))
+            return result.document.export_to_markdown()
+        except Exception as e:
+            raise ParseError(f"Failed to parse {pdf_path}: {e}") from e
 
 
 def _extract_text_with_pypdf(pdf_path: Path) -> str:
-    """Extract text with pypdf as a robust fallback path."""
+    """Extract plain text with pypdf (no layout/markdown structure)."""
     try:
         reader = PdfReader(str(pdf_path))
         pages: list[str] = []
@@ -124,6 +239,4 @@ def _extract_text_with_pypdf(pdf_path: Path) -> str:
     except ParseError:
         raise
     except Exception as e:
-        raise ParseError(
-            f"Failed to parse {pdf_path}: pypdf fallback error: {e}"
-        ) from e
+        raise ParseError(f"Failed to parse {pdf_path}: pypdf error: {e}") from e

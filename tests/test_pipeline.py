@@ -1,16 +1,17 @@
 """Tests for summarizer/pipeline.py — end-to-end per-paper orchestration (mocked LLM)."""
 
 import json
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from summarizer.llm import CostAccumulator, ModelPricing, UsageStats
-from summarizer.models import Config, LLMError, ParseError, PipelineError, PaperSummary
+from summarizer.models import Config, PaperSummary, ParseError, PipelineError
 from summarizer.pipeline import (
-    process_pdf,
-    _sanitize_citation_key,
     _author_surname_token,
+    _sanitize_citation_key,
+    process_pdf,
 )
 
 # ---------------------------------------------------------------------------
@@ -51,9 +52,7 @@ def _make_combined_dict(part1_dict: dict, part2_dict: dict) -> dict:
     metadata = {k: part1_dict[k] for k in meta_keys}
     metadata["is_research_paper"] = True
     metadata["rejection_reason"] = None
-    part1 = {
-        k: part1_dict[k] for k in part1_dict if k not in (meta_keys - {"paper_type"})
-    }
+    part1 = {k: part1_dict[k] for k in part1_dict if k not in (meta_keys - {"paper_type"})}
     return {"metadata": metadata, "part1": part1, "part2": part2_dict}
 
 
@@ -61,9 +60,7 @@ def _mock_llm_combined(combined_dict: dict):
     """Return a patcher that makes call_llm return the combined dict once."""
     mock_client = MagicMock()
     mock_client.complete.return_value = MagicMock(text=json.dumps(combined_dict))
-    return patch(
-        "summarizer.pipeline.create_client", return_value=mock_client
-    ), mock_client
+    return patch("summarizer.pipeline.create_client", return_value=mock_client), mock_client
 
 
 # ---------------------------------------------------------------------------
@@ -71,9 +68,7 @@ def _mock_llm_combined(combined_dict: dict):
 # ---------------------------------------------------------------------------
 
 
-def test_process_pdf_returns_paper_summary(
-    fake_pdf, config, mock_part1_dict, mock_part2_dict
-):
+def test_process_pdf_returns_paper_summary(fake_pdf, config, mock_part1_dict, mock_part2_dict):
     """Full pipeline run returns a validated PaperSummary for a primary paper."""
     combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
     client_patcher, mock_client = _mock_llm_combined(combined)
@@ -88,9 +83,7 @@ def test_process_pdf_returns_paper_summary(
     assert summary.part2.neuron_model == mock_part2_dict["neuron_model"]
 
 
-def test_process_pdf_makes_exactly_one_llm_call(
-    fake_pdf, config, mock_part1_dict, mock_part2_dict
-):
+def test_process_pdf_makes_exactly_one_llm_call(fake_pdf, config, mock_part1_dict, mock_part2_dict):
     """Exactly one LLM call is made per paper (combined call)."""
     combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
     client_patcher, mock_client = _mock_llm_combined(combined)
@@ -101,9 +94,7 @@ def test_process_pdf_makes_exactly_one_llm_call(
     assert mock_client.complete.call_count == 1
 
 
-def test_process_pdf_prompt_contains_paper_text(
-    fake_pdf, config, mock_part1_dict, mock_part2_dict
-):
+def test_process_pdf_prompt_contains_paper_text(fake_pdf, config, mock_part1_dict, mock_part2_dict):
     """The single prompt contains the paper text."""
     combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
     client_patcher, mock_client = _mock_llm_combined(combined)
@@ -215,9 +206,9 @@ def test_sanitize_citation_key(value, expected):
 @pytest.mark.parametrize(
     "author_name, expected",
     [
-        ("F. Paredes-Vallés", "valles"),   # "First. Surname" → last token is surname
-        ("Müller J.", "j"),                # "Surname I." → last token is initial (by design)
-        ("J. Müller", "muller"),           # "I. Surname" → last token is surname
+        ("F. Paredes-Vallés", "valles"),  # "First. Surname" → last token is surname
+        ("Müller J.", "j"),  # "Surname I." → last token is initial (by design)
+        ("J. Müller", "muller"),  # "I. Surname" → last token is surname
         ("Travis DeWolf", "dewolf"),
         ("Smith", "smith"),
     ],
@@ -268,12 +259,22 @@ def test_process_pdf_non_research(fake_pdf, config):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("config_attr,config_value,kwarg_name,expected", [
-    ("reparse", True, "reparse", True),
-    ("extractor", "pypdf", "extractor", "pypdf"),
-])
+@pytest.mark.parametrize(
+    "config_attr,config_value,kwarg_name,expected",
+    [
+        ("reparse", True, "reparse", True),
+        ("extractor", "pypdf", "extractor", "pypdf"),
+    ],
+)
 def test_process_pdf_forwards_parser_config(
-    fake_pdf, config, mock_part1_dict, mock_part2_dict, config_attr, config_value, kwarg_name, expected
+    fake_pdf,
+    config,
+    mock_part1_dict,
+    mock_part2_dict,
+    config_attr,
+    config_value,
+    kwarg_name,
+    expected,
 ):
     """Config parser flags are forwarded to parse_pdf as keyword arguments."""
     setattr(config, config_attr, config_value)
@@ -307,10 +308,13 @@ def test_process_pdf_parse_error_raises_pipeline_error(fake_pdf, config):
 _BAD_RESPONSE_JSON = json.dumps({"metadata": {"paper_type": "primary"}, "part1": {}, "part2": {}})
 
 
-@pytest.mark.parametrize("side_effect,return_text,expected_calls", [
-    (Exception("connection refused"), None, 1),
-    (None, _BAD_RESPONSE_JSON, 3),
-])
+@pytest.mark.parametrize(
+    "side_effect,return_text,expected_calls",
+    [
+        (Exception("connection refused"), None, 1),
+        (None, _BAD_RESPONSE_JSON, 3),
+    ],
+)
 def test_process_pdf_llm_errors_raise_pipeline_error(
     fake_pdf, config, side_effect, return_text, expected_calls
 ):
@@ -380,9 +384,7 @@ def test_process_pdf_creates_client_when_none_provided(
     mock_create.assert_called_once_with(config)
 
 
-def test_process_pdf_accumulator_is_updated(
-    fake_pdf, config, mock_part1_dict, mock_part2_dict
-):
+def test_process_pdf_accumulator_is_updated(fake_pdf, config, mock_part1_dict, mock_part2_dict):
     """When accumulator is provided, it is updated after the LLM call."""
     combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
     mock_client = _make_mock_client_for_combined(combined)
@@ -398,3 +400,157 @@ def test_process_pdf_accumulator_is_updated(
     assert acc.total_input_tokens == 500
     assert acc.total_output_tokens == 200
     assert acc.total_cost > 0
+
+
+# ---------------------------------------------------------------------------
+# Regressions: schema repair context, unknown year
+# ---------------------------------------------------------------------------
+
+
+def test_schema_repair_without_missing_fields_does_not_resend_paper(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    """Regression: every repair resent ~50k tokens of paper text.
+
+    A wrong enum value (paper_type="survey") is fixable from the contract alone.
+    """
+    broken = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    broken["metadata"]["paper_type"] = "survey"
+    fixed = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = [
+        MagicMock(text=json.dumps(broken)),
+        MagicMock(text=json.dumps(fixed)),
+    ]
+    with (
+        _mock_parse("UNIQUE_PAPER_TEXT_XYZ"),
+        patch("summarizer.pipeline.create_client", return_value=mock_client),
+    ):
+        process_pdf(fake_pdf, config)
+
+    repair_prompt = mock_client.complete.call_args_list[1].args[0]
+    assert "UNIQUE_PAPER_TEXT_XYZ" not in repair_prompt
+    assert "Expected JSON contract" in repair_prompt
+    assert "metadata.paper_type" in repair_prompt
+
+
+def test_schema_repair_with_missing_fields_includes_paper(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    broken = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    broken["part1"].pop("results")
+    fixed = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = [
+        MagicMock(text=json.dumps(broken)),
+        MagicMock(text=json.dumps(fixed)),
+    ]
+    with (
+        _mock_parse("UNIQUE_PAPER_TEXT_XYZ"),
+        patch("summarizer.pipeline.create_client", return_value=mock_client),
+    ):
+        process_pdf(fake_pdf, config)
+
+    assert "UNIQUE_PAPER_TEXT_XYZ" in mock_client.complete.call_args_list[1].args[0]
+
+
+def test_schema_repair_for_missing_part2_includes_paper(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    """part2=None on a primary paper fails a model validator, not a 'missing' error."""
+    broken = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    broken["part2"] = None
+    fixed = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = [
+        MagicMock(text=json.dumps(broken)),
+        MagicMock(text=json.dumps(fixed)),
+    ]
+    with (
+        _mock_parse("UNIQUE_PAPER_TEXT_XYZ"),
+        patch("summarizer.pipeline.create_client", return_value=mock_client),
+    ):
+        process_pdf(fake_pdf, config)
+
+    assert "UNIQUE_PAPER_TEXT_XYZ" in mock_client.complete.call_args_list[1].args[0]
+
+
+def test_unknown_year_becomes_none_and_key_uses_nd(
+    tmp_path, config, mock_part1_dict, mock_part2_dict
+):
+    """Regression: an unresolvable year became 0 (keys like 'smith0spiking')."""
+    pdf = tmp_path / "no_year_here.pdf"
+    pdf.write_bytes(b"%PDF")
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    combined["metadata"]["year"] = "not reported"
+    combined["metadata"]["title"] = "Spiking Control"
+    combined["metadata"]["citation_key"] = "not reported"
+    client_patcher, _ = _mock_llm_combined(combined)
+
+    with _mock_parse("text"), client_patcher:
+        summary = process_pdf(pdf, config)
+
+    assert summary.metadata.year is None
+    assert summary.metadata.citation_key == "huebotterndspiking"
+
+
+def test_process_pdf_uses_provided_references(fake_pdf, config, mock_part1_dict, mock_part2_dict):
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    client_patcher, mock_client = _mock_llm_combined(combined)
+    with (
+        _mock_parse("text"),
+        client_patcher,
+        patch("summarizer.pipeline.load_references") as mock_load,
+    ):
+        process_pdf(fake_pdf, config, references="CUSTOM_REFERENCES_ABC")
+    mock_load.assert_not_called()
+    assert "CUSTOM_REFERENCES_ABC" in mock_client.complete.call_args[0][0]
+
+
+def test_integral_float_year_is_kept(tmp_path, config, mock_part1_dict, mock_part2_dict):
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    combined["metadata"]["year"] = 2021.0
+    client_patcher, _ = _mock_llm_combined(combined)
+    with _mock_parse("text"), client_patcher:
+        summary = process_pdf(tmp_path / "x.pdf", config)
+    assert summary.metadata.year == 2021
+
+
+def test_citation_key_is_stripped_and_capped(tmp_path, config, mock_part1_dict, mock_part2_dict):
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    combined["metadata"]["citation_key"] = "  smith2020" + "x" * 300 + "\n"
+    client_patcher, _ = _mock_llm_combined(combined)
+    with _mock_parse("text"), client_patcher:
+        key = process_pdf(tmp_path / "x.pdf", config).metadata.citation_key
+    assert key.startswith("smith2020") and key == key.strip() and len(key) <= 64
+
+
+def test_schema_repair_for_null_field_includes_paper(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    """A required string returned as null needs content, not just a type fix."""
+    broken = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    broken["part2"] = {**broken["part2"], "neuron_model": None}
+    fixed = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = [
+        MagicMock(text=json.dumps(broken)),
+        MagicMock(text=json.dumps(fixed)),
+    ]
+    with (
+        _mock_parse("UNIQUE_PAPER_TEXT_XYZ"),
+        patch("summarizer.pipeline.create_client", return_value=mock_client),
+    ):
+        process_pdf(fake_pdf, config)
+    assert "UNIQUE_PAPER_TEXT_XYZ" in mock_client.complete.call_args_list[1].args[0]
+
+
+def test_repair_field_hints_cover_every_model_field():
+    from summarizer.models import SummaryPart1Synthesis, SummaryPart2
+    from summarizer.pipeline import _PRIMARY_PART2_FIELDS, _SYNTHESIS_PART1_FIELDS
+
+    assert all(f in _PRIMARY_PART2_FIELDS for f in SummaryPart2.model_fields)
+    assert all(f in _SYNTHESIS_PART1_FIELDS for f in SummaryPart1Synthesis.model_fields)

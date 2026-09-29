@@ -25,6 +25,9 @@ htmlcov/
 # Editor
 .vscode/
 
+# Local notes, incl. the project's to-do list (notes/todo.md)
+notes/
+
 # Claude agent memory
 .claude/
 .specify/

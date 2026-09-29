@@ -3,16 +3,18 @@
 These tests make real HTTP calls to the OpenRouter API.
 They are skipped automatically when ``LLM_API_KEY`` is not set.
 
-The model used is the default OSS free-tier model from ``Config``.
+The model used is ``LLM_MODEL`` or ``summarizer.models.DEFAULT_MODEL``.
+Run with ``pytest -m integration``.
 """
 
-import json
 import os
-import pytest
 
+import pytest
 from dotenv import load_dotenv
 
 load_dotenv()
+
+pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
@@ -25,7 +27,9 @@ def api_key():
 
 @pytest.fixture
 def model():
-    return os.environ.get("LLM_MODEL", "openai/gpt-oss-120b:free")
+    from summarizer.models import DEFAULT_MODEL
+
+    return os.environ.get("LLM_MODEL", DEFAULT_MODEL)
 
 
 @pytest.fixture
@@ -47,9 +51,10 @@ def test_fetch_model_pricing_returns_real_data(api_key, model, base_url):
     # context_length should be a positive integer for any real model
     assert pricing.context_length > 0, f"Expected context_length > 0, got {pricing.context_length}"
     print(f"\nPricing for {model}:")
-    print(f"  prompt=$%.2e  completion=$%.2e  reasoning=$%.2e  request=$%.2e  ctx={pricing.context_length}" % (
-        pricing.prompt, pricing.completion, pricing.reasoning, pricing.request
-    ))
+    print(
+        f"  prompt=$%.2e  completion=$%.2e  reasoning=$%.2e  request=$%.2e  ctx={pricing.context_length}"
+        % (pricing.prompt, pricing.completion, pricing.reasoning, pricing.request)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -59,13 +64,12 @@ def test_fetch_model_pricing_returns_real_data(api_key, model, base_url):
 
 def test_real_completion_returns_usage(api_key, model, base_url):
     """A real completion returns token counts in response.usage."""
+    from summarizer.llm import create_client
     from summarizer.models import Config
-    from summarizer.llm import create_client, CostAccumulator
 
     config = Config(base_url=base_url, model=model, api_key=api_key)
     client = create_client(config)
 
-    acc = CostAccumulator()
     prompt = '{"greeting": "hello"}'
     response = client.complete(prompt)
 
@@ -83,8 +87,9 @@ def test_real_completion_returns_usage(api_key, model, base_url):
 def test_real_call_llm_logs_cost(api_key, model, base_url, caplog):
     """call_llm with a real OpenRouter client logs token counts and cost."""
     import logging
+
+    from summarizer.llm import CostAccumulator, call_llm, create_client
     from summarizer.models import Config
-    from summarizer.llm import create_client, call_llm, CostAccumulator
 
     config = Config(base_url=base_url, model=model, api_key=api_key)
     client = create_client(config)
@@ -111,8 +116,8 @@ def test_real_call_llm_logs_cost(api_key, model, base_url, caplog):
 
 def test_real_batch_accumulates_cost(api_key, model, base_url):
     """Two consecutive call_llm calls accumulate cost in the CostAccumulator."""
+    from summarizer.llm import CostAccumulator, call_llm, create_client
     from summarizer.models import Config
-    from summarizer.llm import create_client, call_llm, CostAccumulator
 
     config = Config(base_url=base_url, model=model, api_key=api_key)
     client = create_client(config)

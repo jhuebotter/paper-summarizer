@@ -1,15 +1,13 @@
 """Tests for summarizer/cli.py — argument parsing and high-level CLI behaviour."""
 
-import sys
 import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from summarizer.cli import _build_parser, _check_lm_studio, main
-from summarizer.models import Config, PaperSummary
-
+from summarizer.cli import _build_parser, _check_backend, main
+from summarizer.models import DEFAULT_MODEL, DEFAULT_SKILL_DATA_DIR, Config
 
 # ---------------------------------------------------------------------------
 # Argument parser
@@ -38,15 +36,16 @@ def test_parser_defaults():
         os.environ.pop("LLM_MODEL", None)
         parser = _build_parser()
         args = parser.parse_args(["--source", "/tmp"])
-    assert args.model == "openai/gpt-oss-120b:free"
+    assert args.model == DEFAULT_MODEL
     assert args.base_url == "https://openrouter.ai/api/v1"
     assert args.max_chars == 200_000
-    assert args.skill_data_dir == "skill_data/references"
+    assert Path(args.skill_data_dir) == DEFAULT_SKILL_DATA_DIR
+    assert Path(args.skill_data_dir).is_dir()
     assert args.output_dir == "output_summaries"
     assert args.force_summary is False
     assert args.reparse is False
     assert args.dry_run is False
-    assert args.verbose is True
+    assert args.verbose is False
     assert args.timeout == 120
     assert args.workers == 3
     assert args.extractor == "auto"
@@ -72,11 +71,14 @@ def test_parser_model_cli_overrides_env():
     assert args.model == "my-cli-model"
 
 
-@pytest.mark.parametrize("cli_flag,cli_value,config_attr,expected", [
-    ("--timeout", "300", "timeout_s", 300),
-    ("--workers", "6", "workers", 6),
-    ("--extractor", "pypdf", "extractor", "pypdf"),
-])
+@pytest.mark.parametrize(
+    "cli_flag,cli_value,config_attr,expected",
+    [
+        ("--timeout", "300", "timeout_s", 300),
+        ("--workers", "6", "workers", 6),
+        ("--extractor", "pypdf", "extractor", "pypdf"),
+    ],
+)
 def test_main_cli_flag_propagates_to_config(tmp_path, cli_flag, cli_value, config_attr, expected):
     """CLI flags are forwarded as the corresponding Config fields."""
     (tmp_path / "paper.pdf").write_bytes(b"%PDF")
@@ -136,43 +138,41 @@ def test_parser_custom_flags():
 
 
 # ---------------------------------------------------------------------------
-# LM Studio health check
+# Backend health check
 # ---------------------------------------------------------------------------
 
 
-def test_check_lm_studio_succeeds_when_reachable():
-    """_check_lm_studio does not exit when the server responds."""
+def test_check_backend_succeeds_when_reachable():
+    """_check_backend does not exit when the server responds."""
     with patch("urllib.request.urlopen") as mock_urlopen:
-        _check_lm_studio("http://localhost:1234/v1")  # should not raise
+        _check_backend("http://localhost:1234/v1")  # should not raise
     # Must hit the root host, not /v1 or /api
     called_url = mock_urlopen.call_args[0][0]
     assert called_url == "http://localhost:1234"
 
 
 def test_check_backend_strips_to_root_for_openrouter():
-    """_check_lm_studio strips to scheme://netloc for OpenRouter URLs."""
+    """_check_backend strips to scheme://netloc for OpenRouter URLs."""
     with patch("urllib.request.urlopen") as mock_urlopen:
-        _check_lm_studio("https://openrouter.ai/api/v1")
+        _check_backend("https://openrouter.ai/api/v1")
     called_url = mock_urlopen.call_args[0][0]
     assert called_url == "https://openrouter.ai"
 
 
 def test_check_backend_http_error_is_treated_as_reachable():
     """A 403/404 HTTP response means the server is up (cloud backends need auth)."""
-    http_err = urllib.error.HTTPError(
-        url=None, code=403, msg="Forbidden", hdrs=None, fp=None
-    )
+    http_err = urllib.error.HTTPError(url=None, code=403, msg="Forbidden", hdrs=None, fp=None)
     with patch("urllib.request.urlopen", side_effect=http_err):
-        _check_lm_studio("https://openrouter.ai/api/v1")  # should not raise
+        _check_backend("https://openrouter.ai/api/v1")  # should not raise
 
 
-def test_check_lm_studio_exits_when_unreachable():
-    """_check_lm_studio calls sys.exit(1) when the server is not reachable."""
+def test_check_backend_exits_when_unreachable():
+    """_check_backend calls sys.exit(1) when the server is not reachable."""
     with (
         patch("urllib.request.urlopen", side_effect=OSError("connection refused")),
         pytest.raises(SystemExit) as exc_info,
     ):
-        _check_lm_studio("http://localhost:9999/v1")
+        _check_backend("http://localhost:9999/v1")
     assert exc_info.value.code == 1
 
 
@@ -204,6 +204,7 @@ def test_main_dry_run_batch(tmp_path, capsys):
 def test_run_single_force_summary_creates_versioned_file(tmp_path):
     """--force-summary on a single file creates _v2.md instead of overwriting."""
     from unittest.mock import MagicMock
+
     from summarizer.cli import _run_single
 
     output_dir = tmp_path / "output_summaries"
@@ -212,9 +213,7 @@ def test_run_single_force_summary_creates_versioned_file(tmp_path):
     existing.write_text("# original", encoding="utf-8")
 
     abs_pdf = str((tmp_path / "paper.pdf").resolve())
-    (output_dir / "processed.txt").write_text(
-        f"{abs_pdf}, {existing}\n", encoding="utf-8"
-    )
+    (output_dir / "processed.txt").write_text(f"{abs_pdf}, {existing}\n", encoding="utf-8")
 
     config = Config(
         base_url="http://localhost:1234/v1",
@@ -230,8 +229,9 @@ def test_run_single_force_summary_creates_versioned_file(tmp_path):
     mock_summary.metadata.citation_key = "dewolf2021spiking"
 
     with (
-        patch("summarizer.cli.process_pdf", return_value=mock_summary),
-        patch("summarizer.cli.render_summary", return_value="# new"),
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", return_value=mock_summary),
+        patch("summarizer.batch.render_summary", return_value="# new"),
     ):
         _run_single(pdf, config)
 
@@ -242,16 +242,14 @@ def test_run_single_force_summary_creates_versioned_file(tmp_path):
 
 
 def test_main_single_file_skips_when_in_processed_index(tmp_path, capsys):
-    """main() --file skips and exits 0 when the PDF is already in processed.txt."""
+    """main() --file skips and exits 0 when the PDF is in the (legacy) processed.txt."""
     pdf = tmp_path / "huebotter2025spiking.pdf"
     pdf.write_bytes(b"%PDF")
 
     # Create output_dir and populate processed.txt
     output_dir = tmp_path / "output_summaries"
     output_dir.mkdir()
-    (output_dir / "processed.txt").write_text(
-        str(pdf.resolve()) + "\n", encoding="utf-8"
-    )
+    (output_dir / "processed.txt").write_text(str(pdf.resolve()) + "\n", encoding="utf-8")
 
     with (
         patch(
@@ -264,7 +262,8 @@ def test_main_single_file_skips_when_in_processed_index(tmp_path, capsys):
                 str(output_dir),
             ],
         ),
-        patch("summarizer.cli._check_lm_studio"),
+        patch("summarizer.cli._check_backend"),
+        patch("summarizer.cli._check_openrouter_config"),
         pytest.raises(SystemExit) as exc_info,
     ):
         main()
@@ -300,8 +299,9 @@ def test_parser_log_file_default_is_none():
 def test_run_batch_done_log_includes_cost(tmp_path, caplog):
     """_run_batch logs 'cost=' in the Done summary line."""
     import logging
+
     from summarizer.cli import _run_batch
-    from summarizer.models import Config, BatchReport
+    from summarizer.models import BatchReport, Config
 
     config = Config(
         base_url="http://localhost:1234/v1",
@@ -320,3 +320,151 @@ def test_run_batch_done_log_includes_cost(tmp_path, caplog):
     assert done_lines, "Expected a 'Done' log line"
     assert "cost=" in done_lines[0]
     assert "0.0345" in done_lines[0]
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter preflight and single-file path
+# ---------------------------------------------------------------------------
+
+
+def _or_config(**kwargs):
+    return Config(base_url="https://openrouter.ai/api/v1", model="meta/some-model", **kwargs)
+
+
+def test_openrouter_preflight_exits_without_api_key(monkeypatch):
+    from summarizer.cli import _check_openrouter_config
+
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    with pytest.raises(SystemExit) as exc_info:
+        _check_openrouter_config(_or_config())
+    assert exc_info.value.code == 1
+
+
+def test_openrouter_preflight_exits_when_model_not_listed(monkeypatch):
+    """Regression: a retired default model id made every paper fail one by one."""
+    from summarizer.cli import _check_openrouter_config
+
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    with (
+        patch("summarizer.cli.fetch_openrouter_model_ids", return_value={"other/model"}),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        _check_openrouter_config(_or_config())
+    assert exc_info.value.code == 1
+
+
+def test_openrouter_preflight_passes_for_listed_model(monkeypatch):
+    from summarizer.cli import _check_openrouter_config
+
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    with patch("summarizer.cli.fetch_openrouter_model_ids", return_value={"meta/some-model"}):
+        _check_openrouter_config(_or_config())  # no exit
+
+
+def test_openrouter_preflight_tolerates_unreachable_model_list(monkeypatch):
+    from summarizer.cli import _check_openrouter_config
+
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    with patch("summarizer.cli.fetch_openrouter_model_ids", return_value=None):
+        _check_openrouter_config(_or_config())  # no exit
+
+
+def test_preflight_is_noop_for_local_backends(monkeypatch):
+    from summarizer.cli import _check_openrouter_config
+
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    with patch("summarizer.cli.fetch_openrouter_model_ids") as mock_ids:
+        _check_openrouter_config(Config(base_url="http://localhost:1234/v1"))
+    mock_ids.assert_not_called()
+
+
+def test_run_single_reports_cost_and_exits_1_on_failure(tmp_path, caplog):
+    """Single-file mode now shares the batch path: cost is logged, failures exit 1."""
+    import logging
+
+    from summarizer.cli import _run_single
+    from summarizer.models import PipelineError
+
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF")
+    config = Config(base_url="http://localhost:1234/v1", model="m", output_dir=tmp_path / "out")
+    with (
+        caplog.at_level(logging.INFO, logger="summarizer.cli"),
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", side_effect=PipelineError(pdf, Exception("boom"))),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        _run_single(pdf, config)
+    assert exc_info.value.code == 1
+    assert any("cost=" in r.message for r in caplog.records if "Done" in r.message)
+
+
+def test_run_single_missing_file_exits_1(tmp_path):
+    from summarizer.cli import _run_single
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run_single(tmp_path / "nope.pdf", Config(output_dir=tmp_path))
+    assert exc_info.value.code == 1
+
+
+@pytest.mark.parametrize(
+    "model,listed",
+    [
+        ("meta/some-model", True),
+        ("meta/some-model:nitro", True),
+        ("meta/some-model:floor", True),
+        ("meta/some-model:online", True),
+        ("meta/some-model:exacto", True),
+        ("meta/some-model:free", False),  # retired :free variants must be caught
+        ("meta/other", False),
+        ("@preset/my-preset", True),  # presets aren't in the models list
+    ],
+)
+def test_openrouter_model_listed(model, listed):
+    from summarizer.cli import _openrouter_model_listed
+
+    assert _openrouter_model_listed(model, {"meta/some-model"}) is listed
+
+
+def test_main_works_from_another_directory(tmp_path, monkeypatch):
+    """Regression: the default references path was relative to the CWD."""
+    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    monkeypatch.chdir(tmp_path)
+    with (
+        patch("sys.argv", ["summarize-papers", "--file", "paper.pdf"]),
+        patch("summarizer.cli._check_backend"),
+        patch("summarizer.cli._check_openrouter_config"),
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.pipeline.parse_pdf", return_value="text"),
+        patch("summarizer.pipeline.call_llm", side_effect=RuntimeError("stop after prompt")),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main()
+    # Fails at the (mocked) LLM step, not with "References directory not found".
+    assert exc_info.value.code == 1
+    log = next((tmp_path / "logs").glob("run_*.log")).read_text()
+    assert "References directory not found" not in log
+    assert "stop after prompt" in log
+
+
+def test_source_must_be_a_directory(tmp_path):
+    from summarizer.cli import _run_batch
+
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF")
+    with pytest.raises(SystemExit) as exc_info:
+        _run_batch(pdf, Config(output_dir=tmp_path / "out"))
+    assert exc_info.value.code == 1
+
+
+def test_keyboard_interrupt_exits_130(tmp_path):
+    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    with (
+        patch("sys.argv", ["summarize-papers", "--source", str(tmp_path)]),
+        patch("summarizer.cli._check_backend"),
+        patch("summarizer.cli._check_openrouter_config"),
+        patch("summarizer.cli.run_batch", side_effect=KeyboardInterrupt),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main()
+    assert exc_info.value.code == 130

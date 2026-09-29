@@ -1,14 +1,11 @@
 """Render a validated PaperSummary to the final markdown string.
 
-The output format matches the ``output-template.md`` reference exactly.
-No file I/O is performed here — the caller (``batch.py`` / ``cli.py``) is
-responsible for writing the returned string to disk.
+The layout follows the ``output-template.md`` reference.  No file I/O is
+performed here; ``batch.py`` writes the returned string to disk.
 """
 
 import logging
-from typing import Sequence
-
-logger = logging.getLogger(__name__)
+from collections.abc import Sequence
 
 from summarizer.models import (
     CitableSnippet,
@@ -21,6 +18,8 @@ from summarizer.models import (
     SummaryPart1Synthesis,
     SummaryPart2,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Word-limit constants (per output-template.md)
@@ -45,14 +44,15 @@ def render_summary(summary: PaperSummary) -> str:
 
     Dispatches to the appropriate variant renderer based on ``paper_type``.
     If Part 1 prose exceeds the per-type word limit by more than 50%, a
-    warning is printed to stderr (but rendering continues unchanged — no
-    truncation is applied).
+    warning is logged (but rendering continues unchanged — no truncation is
+    applied).
 
     Args:
         summary: A fully validated ``PaperSummary`` produced by the pipeline.
 
     Returns:
-        The complete markdown content ready to be written to ``<citation_key>.md``.
+        The complete markdown content, written by the caller to
+        ``<output_dir>/<paper_type>/<citation_key>_summary.md``.
     """
     paper_type = summary.metadata.paper_type
 
@@ -79,7 +79,7 @@ def _count_words(*texts: str) -> int:
 
 
 def _check_word_limit(paper_type: str, word_count: int) -> None:
-    """Emit a stderr warning if ``word_count`` is >50% over the type limit."""
+    """Log a warning if ``word_count`` is >50% over the type limit."""
     limit = _WORD_LIMITS.get(paper_type)
     if limit is None:
         return
@@ -98,7 +98,7 @@ def _check_word_limit(paper_type: str, word_count: int) -> None:
 
 
 def _render_header(meta: PaperMetadata) -> str:
-    """Render the YAML-style metadata header block."""
+    """Render the title and bold-label metadata lines."""
     if meta.paper_type == "primary":
         paper_type_label = "primary research"
     elif meta.paper_type == "synthesis":
@@ -109,13 +109,16 @@ def _render_header(meta: PaperMetadata) -> str:
     else:
         paper_type_label = "non-research"
 
+    year = meta.year if meta.year is not None else "not reported"
+    # Trailing double spaces are markdown hard line breaks; without them the
+    # header lines collapse into one paragraph when rendered.
     return (
         f"# {meta.title}\n\n"
-        f"**Citation key:** {meta.citation_key}\n"
-        f"**Authors:** {', '.join(meta.authors)}\n"
-        f"**Year:** {meta.year}\n"
-        f"**Venue:** {meta.venue}\n"
-        f"**Paper Type:** {paper_type_label}\n"
+        f"**Citation key:** {meta.citation_key}  \n"
+        f"**Authors:** {', '.join(meta.authors)}  \n"
+        f"**Year:** {year}  \n"
+        f"**Venue:** {meta.venue}  \n"
+        f"**Paper Type:** {paper_type_label}  \n"
         f"**Tags:** {', '.join(meta.tags)}"
     )
 
@@ -219,8 +222,8 @@ def _render_primary(
     _check_word_limit("primary", prose_words)
 
     open_problems = _render_open_problems_primary(part1.open_problems_future_directions)
-    notable = _render_bullets(part1.notable_findings)
-    citable = _render_citable_snippets(part1.citable_snippets)
+    notable = _render_bullets(part1.notable_findings) or "not reported"
+    citable = _render_citable_snippets(part1.citable_snippets) or "not reported"
 
     return (
         f"{_render_header(meta)}\n\n"
@@ -265,8 +268,8 @@ def _render_synthesis(
     _check_word_limit("synthesis", prose_words)
 
     open_problems = _render_open_problems_synthesis(part1.open_problems_future_directions)
-    notable = _render_bullets(part1.notable_findings)
-    citable = _render_citable_snippets(part1.citable_snippets)
+    notable = _render_bullets(part1.notable_findings) or "not reported"
+    citable = _render_citable_snippets(part1.citable_snippets) or "not reported"
 
     return (
         f"{_render_header(meta)}\n\n"
