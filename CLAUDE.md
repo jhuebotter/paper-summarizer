@@ -10,6 +10,7 @@ CLI that turns research PDFs into structured markdown summaries via an OpenAI-co
 - Tests: `uv run pytest` — unit tests block network access (`tests/conftest.py::_no_network`); `uv run pytest -m integration` for real PDFs/OpenRouter
 - Lint/format: `uv run ruff check . && uv run ruff format .`
 - Run: `uv run summarize-papers --source DIR | --file PDF [--dry-run]`
+- Evaluate: `uv run summarize-papers eval --source DIR [--models A,B] [--extractors pypdf,docling]` (outputs in `eval/runs/`)
 
 Python >=3.12, developed on 3.14 (`.python-version`). Use uv, not pip/conda; commit `uv.lock` changes.
 
@@ -23,6 +24,7 @@ Python >=3.12, developed on 3.14 (`.python-version`). Use uv, not pip/conda; com
 - Schema repair resends the paper only for missing content (`pipeline._needs_paper_context`).
 - Parser caches `<stem>.<extractor>.md` next to the PDF; docling is imported lazily and is an optional extra.
 - Processed index: `output_summaries/processed.jsonl` (legacy `processed.txt` is read-only for migration).
+- Evaluation: `summarize-papers eval` (`evaluation.py` runner/cache/gold/report, `metrics.py` pure metrics) calls `process_pdf` directly and must never write to `output_summaries/`.
 
 ## Conventions
 

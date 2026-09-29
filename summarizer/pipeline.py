@@ -166,6 +166,8 @@ def _validate_with_schema_repair(
                 validation_errors=compact,
                 contract=contract,
             )
+            if accumulator is not None:
+                accumulator.note_schema_repair()
             current = call_llm(client, repair_prompt, accumulator=accumulator)
 
     raise RuntimeError("Schema validation retry loop exhausted unexpectedly")
@@ -362,7 +364,7 @@ def _build_citation_key(metadata: dict, pdf_path: Path) -> str:
     authors = metadata.get("authors")
     first_author_token = "paper"
     if isinstance(authors, list) and authors:
-        first_author_token = _author_surname_token(str(authors[0])) or first_author_token
+        first_author_token = author_surname_token(str(authors[0])) or first_author_token
 
     title = metadata.get("title")
     title_token = _first_alnum_token(str(title)) if title else "paper"
@@ -381,7 +383,7 @@ def _first_alnum_token(value: str) -> str:
     return ""
 
 
-def _author_surname_token(author_name: str) -> str:
+def author_surname_token(author_name: str) -> str:
     """Extract a surname-like token from an author name string.
 
     Normalizes Unicode (NFKD) before splitting so that accented characters
