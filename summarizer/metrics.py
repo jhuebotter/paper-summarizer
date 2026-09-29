@@ -10,10 +10,11 @@ from collections import Counter
 from dataclasses import dataclass
 
 from summarizer.models import PaperSummary, SummaryPart1Primary, SummaryPart1Synthesis
-from summarizer.renderer import _WORD_LIMITS, part1_prose
+from summarizer.renderer import WORD_LIMITS, _count_words, part1_prose
 
 _NGRAM = 3
 _NEAR_THRESHOLD = 0.7  # share of a quote's word 3-grams found in the paper
+_MIN_FRAGMENT_WORDS = 3
 
 
 @dataclass(frozen=True)
@@ -33,25 +34,27 @@ class Rate:
 # Quote faithfulness
 # ---------------------------------------------------------------------------
 
-_DASHES = dict.fromkeys(map(ord, "-\u2010\u2011\u2012\u2013\u2014\u2015\u2212"), " ")
-_QUOTES = str.maketrans(
-    {"\u2018": "'", "\u2019": "'", "\u201c": "", "\u201d": "", '"': "", "\u00ad": ""}
-)
-_LINE_BREAK_HYPHEN = re.compile(r"[-\u2010\u2011\u00ad]\s*\n\s*")
+_HYPHEN = re.compile(r"[-‐‑­]\s*")  # joined, incl. across line breaks
+_SPACED_DASHES = dict.fromkeys(map(ord, "‒–—―−"), " ")
+_NUMERIC_CITATION = re.compile(r"\[\s*\d+(?:\s*[,;–-]\s*\d+)*\s*\]")
 _ELLIPSIS = re.compile(r"\[\s*(?:\.\.\.|…)\s*\]|\.\.\.|…")
+_WORD = re.compile(r"\w+")
 
 
 def normalize_text(text: str) -> str:
     """Normalize for quote matching.
 
-    Applies NFKC (ligatures), joins words hyphenated across line breaks, turns
-    other dashes into spaces, drops double quotes and markdown emphasis,
-    collapses whitespace and casefolds.
+    NFKC (ligatures, fullwidth forms), numeric citation brackets removed,
+    hyphenated words joined (also across line breaks), other dashes turned into
+    spaces, casefolded.
     """
     text = unicodedata.normalize("NFKC", text)
-    text = _LINE_BREAK_HYPHEN.sub("", text).translate(_DASHES).translate(_QUOTES)
-    text = re.sub(r"[*_`]+", "", text)
-    return re.sub(r"\s+", " ", text).casefold().strip()
+    text = _NUMERIC_CITATION.sub(" ", text).translate(_SPACED_DASHES)
+    return _HYPHEN.sub("", text).casefold()
+
+
+def _tokens(text: str) -> list[str]:
+    return _WORD.findall(normalize_text(text))
 
 
 def _ngrams(words: list[str], n: int) -> set[tuple[str, ...]]:
@@ -59,42 +62,48 @@ def _ngrams(words: list[str], n: int) -> set[tuple[str, ...]]:
 
 
 class _PaperText:
-    """Normalized paper text with lazily built word n-gram sets."""
+    """Tokenized paper text with its word 3-grams."""
 
     def __init__(self, text: str) -> None:
-        self.norm = normalize_text(text)
-        self._words = self.norm.split()
-        self._grams: dict[int, set[tuple[str, ...]]] = {}
-
-    def ngrams(self, n: int) -> set[tuple[str, ...]]:
-        if n not in self._grams:
-            self._grams[n] = _ngrams(self._words, n)
-        return self._grams[n]
+        tokens = _tokens(text)
+        self.joined = " " + " ".join(tokens) + " "
+        self.ngrams = _ngrams(tokens, _NGRAM)
 
 
 def quote_status(quote: str, paper: _PaperText) -> str:
     """Classify one quote as ``verbatim``, ``near`` or ``not_found``.
 
-    Ellipses split a quote into fragments that must each match.
+    Words are compared after normalization (punctuation ignored).  Ellipses split
+    a quote into fragments that must appear in order; fragments shorter than
+    three words can't be checked, so a quote with any of them is at best
+    ``near``.
     """
-    fragments = [normalize_text(f) for f in _ELLIPSIS.split(quote)]
-    fragments = [f for f in fragments if f]
-    if not fragments:
+    fragments = [f for f in (_tokens(part) for part in _ELLIPSIS.split(quote)) if f]
+    checkable = [f for f in fragments if len(f) >= _MIN_FRAGMENT_WORDS]
+    if not checkable:
         return "not_found"
-    if all(f in paper.norm for f in fragments):
-        return "verbatim"
-    for fragment in fragments:
-        words = fragment.split()
-        n = min(_NGRAM, len(words))
-        grams = _ngrams(words, n)
-        if len(grams & paper.ngrams(n)) / len(grams) < _NEAR_THRESHOLD:
+
+    position = 0
+    for fragment in checkable:
+        found = paper.joined.find(" " + " ".join(fragment) + " ", position)
+        if found < 0:
+            break
+        position = found + 1
+    else:
+        return "verbatim" if len(checkable) == len(fragments) else "near"
+
+    if all(" " + " ".join(f) + " " in paper.joined for f in checkable):
+        return "not_found"  # every fragment is verbatim but they're stitched out of order
+    for fragment in checkable:
+        grams = _ngrams(fragment, _NGRAM)
+        if len(grams & paper.ngrams) / len(grams) < _NEAR_THRESHOLD:
             return "not_found"
     return "near"
 
 
 def quote_faithfulness(summary: PaperSummary, paper_text: str) -> dict:
     """Check every citable-snippet quote against the text the model was given."""
-    quotes = [s.quote for s in getattr(summary.part1, "citable_snippets", []) if s.quote]
+    quotes = [s.quote for s in summary.part1.citable_snippets if s.quote]
     paper = _PaperText(paper_text)
     statuses = [quote_status(q, paper) for q in quotes]
     counts = Counter(statuses)
@@ -104,7 +113,7 @@ def quote_faithfulness(summary: PaperSummary, paper_text: str) -> dict:
         "not_found": counts["not_found"],
         "total": len(quotes),
         "not_found_quotes": [
-            q for q, st in zip(quotes, statuses, strict=True) if st == "not_found"
+            q for q, status in zip(quotes, statuses, strict=True) if status == "not_found"
         ],
     }
 
@@ -114,16 +123,25 @@ def quote_faithfulness(summary: PaperSummary, paper_text: str) -> dict:
 # ---------------------------------------------------------------------------
 
 _ABBREVIATIONS = re.compile(
-    r"\b(Secs?|Figs?|Tbls?|Tabs?|Eqs?|Apps?|Refs?|No|approx|vs|al|e\.g|i\.e|cf)\.", re.I
+    r"\b(Secs?|Sects?|Figs?|Tbls?|Tabs?|Eqs?|Apps?|Algs?|Refs?|Ch|Suppl|No|pp?|approx|vs|al"
+    r"|e\.g|i\.e|cf)\.",
+    re.I,
 )
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[\"'(\[A-Z0-9])")
 _ANCHOR = re.compile(r"\(?\s*Source:[^)]*\)?", re.I)
-_NUMBER = re.compile(r"(?<![\w.])\d+(?:[.,]\d+)?")
-# A number right after a capitalized word mid-sentence is a name ("Loihi 2", "Table 3").
-_NAMED_NUMBER = re.compile(r"(?<=\S\s)[A-Z][\w-]*\s+\d+(?:\.\d+)?\b")
-_YEAR = re.compile(r"^(19|20)\d{2}$")
-_QUOTED = re.compile(r"\"[^\"]*\"|“[^”]*”")
-_FIRST_PERSON = re.compile(r"\b(?:[Ww]e|[Oo]urs?|us)\b")
+# References and names followed by a number: "Table 3", "Phase 2", "Loihi 2".
+_NAMED_NUMBER = re.compile(
+    r"\b(?:Tables?|Tbls?|Tabs?|Figs?|Figures?|Secs?|Sects?|Sections?|Eqs?|Equations?|Apps?"
+    r"|Appendix|Algs?|Algorithms?|Chapters?|Parts?|Phases?|Stages?|Steps?|Versions?|Levels?"
+    r"|Loihi|SpiNNaker|BrainScaleS|TrueNorth)\.?\s*\d+(?:\.\d+)?",
+    re.I,
+)
+_YEAR_MENTION = re.compile(
+    r"(?:\(|,\s*|\b(?:in|since|from|until|by|al\.)\s+)(?:19|20)\d{2}\b(?:[a-z]\b)?", re.I
+)
+_NUMBER = re.compile(r"(?<![\w.-])\d+(?:[.,]\d+)?(?![A-Z]\b)")
+_QUOTED = re.compile(r"\"[^\"]*\"|“[^”]*”|‘[^’]*’")
+_FIRST_PERSON = re.compile(r"\b(?:[Ww]e|[Oo]urs?)\b|(?<!\d)(?<!\d )\bus\b")
 _EVIDENCE_TAG = re.compile(r"\((Measured|Reported|Claimed|Attributed)\b")
 
 
@@ -133,14 +151,17 @@ def split_sentences(text: str) -> list[str]:
 
 
 def _needs_anchor(sentence: str) -> bool:
-    stripped = _NAMED_NUMBER.sub(" ", _ANCHOR.sub(" ", sentence))
-    return any(not _YEAR.match(num) for num in _NUMBER.findall(stripped))
+    stripped = _ANCHOR.sub(" ", sentence)
+    stripped = _YEAR_MENTION.sub(" ", _NAMED_NUMBER.sub(" ", stripped))
+    return bool(_NUMBER.search(stripped))
 
 
 def anchor_coverage(texts: list[str]) -> Rate:
     """Share of number-bearing sentences with a ``Source:`` anchor in or right after them.
 
-    Years and numbers that belong to names ("Loihi 2") don't count as numbers.
+    Years in citation/date context, references ("Table 3") and chip names
+    ("Loihi 2") don't count as numbers; neither do numbers inside identifiers
+    ("CIFAR-10", "3D").  "7-DOF" and "3x" do count.
     """
     needing = covered = 0
     for text in texts:
@@ -157,19 +178,15 @@ def anchor_coverage(texts: list[str]) -> Rate:
 def first_person_count(texts: list[str]) -> tuple[int, int]:
     """Return (first-person-plural uses outside quoted segments, words checked)."""
     unquoted = [_QUOTED.sub(" ", t) for t in texts]
-    return (
-        sum(len(_FIRST_PERSON.findall(t)) for t in unquoted),
-        sum(len(t.split()) for t in unquoted),
-    )
+    return sum(len(_FIRST_PERSON.findall(t)) for t in unquoted), _count_words(*unquoted)
 
 
 def evidence_tags(summary: PaperSummary) -> Rate:
     """Share of notable findings with exactly one allowed evidence tag."""
-    part1 = summary.part1
-    findings = getattr(part1, "notable_findings", [])
     allowed = {"Measured", "Reported", "Claimed", "Attributed"}
-    if isinstance(part1, SummaryPart1Synthesis):
+    if isinstance(summary.part1, SummaryPart1Synthesis):
         allowed.discard("Measured")
+    findings = summary.part1.notable_findings
     valid = 0
     for finding in findings:
         tags = _EVIDENCE_TAG.findall(finding)
@@ -180,10 +197,8 @@ def evidence_tags(summary: PaperSummary) -> Rate:
 def _analytic_texts(summary: PaperSummary) -> list[str]:
     """Prose written by the model (not verbatim quotes)."""
     part1 = summary.part1
-    if not isinstance(part1, SummaryPart1Primary | SummaryPart1Synthesis):
-        return []
     texts = part1_prose(part1) + list(part1.notable_findings)
-    texts += [s.cite_for for s in part1.citable_snippets]
+    texts += [f"{s.cite_for} (Source: {s.source})" for s in part1.citable_snippets]
     for items in part1.open_problems_future_directions.model_dump().values():
         texts += items
     if summary.part2 is not None:
@@ -198,8 +213,8 @@ def compute_metrics(summary: PaperSummary, paper_text: str) -> dict:
         return {}
     texts = _analytic_texts(summary)
     voice, words = first_person_count(texts)
-    prose_words = sum(len(t.split()) for t in part1_prose(part1))
-    limit = _WORD_LIMITS[part1.paper_type]
+    prose_words = _count_words(*part1_prose(part1))
+    limit = WORD_LIMITS[part1.paper_type]
     return {
         "quotes": quote_faithfulness(summary, paper_text),
         "anchors": anchor_coverage(texts).as_dict(),
