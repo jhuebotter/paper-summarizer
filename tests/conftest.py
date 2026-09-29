@@ -53,6 +53,16 @@ def _no_network(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_env(request, monkeypatch):
+    """Unit tests must not see the developer's ``.env`` (API key, model override)."""
+    if request.node.get_closest_marker("integration"):
+        return
+    monkeypatch.setattr("summarizer.cli.load_dotenv", lambda *args, **kwargs: False)
+    for var in ("LLM_API_KEY", "LLM_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _default_log_dir_in_tmp(tmp_path, monkeypatch):
     """``main()`` writes ``logs/run_<ts>.log`` relative to the CWD by default.
 

@@ -18,6 +18,8 @@ from summarizer.models import (
     LLMResponse,
     PaperSummary,
     PipelineError,
+    SummaryPart1Synthesis,
+    SummaryPart2,
 )
 from summarizer.parser import parse_pdf
 from summarizer.prompts import build_combined_prompt, load_references
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_SCHEMA_REPAIR_RETRIES = 2
 _CONTRACT_FILENAME = "json-output-contract.md"
+_MAX_CITATION_KEY_LEN = 64  # keeps output filenames well below OS limits
 
 
 def process_pdf(
@@ -169,9 +172,12 @@ def _validate_with_schema_repair(
 
 
 def _needs_paper_context(exc: ValidationError) -> bool:
-    """True when repair must *add content* (missing fields / a required part2)."""
+    """True when repair must *add content*: missing or null fields, or a required part2."""
     for err in exc.errors():
-        if err.get("type") == "missing" or "is required" in str(err.get("msg", "")):
+        err_type = str(err.get("type", ""))
+        if err_type == "missing" or "is required" in str(err.get("msg", "")):
+            return True
+        if err_type.endswith("_type") and err.get("input", "") is None:
             return True
     return False
 
@@ -186,20 +192,8 @@ def _compact_validation_errors(exc: ValidationError) -> list[str]:
     return compact
 
 
-_PRIMARY_PART2_FIELDS = (
-    "neuron_model, network_architecture, model_scale, simulator_framework, "
-    "hardware_training, controller_hardware_inference, control_task, task_type, "
-    "task_complexity_scale, simulation_environment, spike_encoding, action_decoding, "
-    "learning_mechanism, credit_assignment_scope, online_vs_offline, data_collection, "
-    "key_training_details, comparison_to_baselines"
-)
-
-_SYNTHESIS_PART1_FIELDS = (
-    "paper_type, tldr, target_papers_field, scope_coverage, taxonomy_organization, "
-    "core_argument, synthesis_contribution, key_claims_narrative, key_takeaways, "
-    "limitations, open_problems_future_directions, critical_assessment, notable_findings, "
-    "citable_snippets, relevance"
-)
+_PRIMARY_PART2_FIELDS = ", ".join(SummaryPart2.model_fields)
+_SYNTHESIS_PART1_FIELDS = ", ".join(SummaryPart1Synthesis.model_fields)
 
 
 def _build_schema_repair_prompt(
@@ -267,6 +261,9 @@ def _normalize_metadata_year(raw: dict, pdf_path: Path) -> dict:
     year = metadata.get("year")
     if isinstance(year, int):
         return raw
+    if isinstance(year, float) and year.is_integer():
+        metadata["year"] = int(year)
+        return raw
 
     normalized = _extract_year_candidate(year)
     source = "metadata.year"
@@ -316,6 +313,7 @@ def _normalize_citation_key(raw: dict, pdf_path: Path) -> dict:
 
     citation_key = metadata.get("citation_key")
     if _is_valid_citation_key(citation_key):
+        metadata["citation_key"] = citation_key.strip()[:_MAX_CITATION_KEY_LEN]
         return raw
 
     # Try lightweight sanitization first (strips accents, hyphens, spaces).
@@ -328,7 +326,7 @@ def _normalize_citation_key(raw: dict, pdf_path: Path) -> dict:
                 citation_key,
                 sanitized,
             )
-            metadata["citation_key"] = sanitized
+            metadata["citation_key"] = sanitized[:_MAX_CITATION_KEY_LEN]
             return raw
 
     repaired = _build_citation_key(metadata, pdf_path)
@@ -337,7 +335,7 @@ def _normalize_citation_key(raw: dict, pdf_path: Path) -> dict:
         citation_key,
         repaired,
     )
-    metadata["citation_key"] = repaired
+    metadata["citation_key"] = repaired[:_MAX_CITATION_KEY_LEN]
     return raw
 
 

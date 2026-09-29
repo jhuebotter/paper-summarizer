@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import threading
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -800,55 +801,75 @@ def test_pipeline_schema_repair_tokens_added_to_accumulator():
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
 def _client_returning(sdk_response, **config_kwargs):
+    """Yield ``(client, mock_openai)`` for a real LLMClient over a mocked SDK."""
     config = Config(base_url="http://localhost:1234/v1", model="m", **config_kwargs)
-    patcher = patch("summarizer.llm._openai.OpenAI")
-    mock_openai = patcher.start()
-    mock_openai.return_value.chat.completions.create.return_value = sdk_response
-    client = create_client(config)
-    return client, mock_openai, patcher
+    with patch("summarizer.llm._openai.OpenAI") as mock_openai:
+        mock_openai.return_value.chat.completions.create.return_value = sdk_response
+        yield create_client(config), mock_openai
 
 
-def _sdk_response(content='{"k": "v"}', finish_reason="stop"):
+def _sdk_response(content='{"k": "v"}', finish_reason="stop", usage=None, choices=True):
     return MagicMock(
-        choices=[MagicMock(message=MagicMock(content=content), finish_reason=finish_reason)],
-        usage=None,
+        choices=[MagicMock(message=MagicMock(content=content), finish_reason=finish_reason)]
+        if choices
+        else [],
+        usage=usage,
     )
 
 
 def test_sdk_retries_are_disabled():
     """Regression: SDK retries (2x) stacked with ours (2x) gave up to 9 attempts."""
-    client, mock_openai, patcher = _client_returning(_sdk_response())
-    patcher.stop()
-    assert mock_openai.call_args.kwargs["max_retries"] == 0
+    with _client_returning(_sdk_response()) as (_, mock_openai):
+        assert mock_openai.call_args.kwargs["max_retries"] == 0
 
 
-def test_complete_raises_on_none_content():
+@pytest.mark.parametrize("content", [None, "", "   \n"])
+def test_complete_raises_on_empty_content(content):
     """Regression: content=None (reasoning models, refusals) crashed with TypeError."""
-    client, _, patcher = _client_returning(_sdk_response(content=None))
-    try:
+    with _client_returning(_sdk_response(content=content)) as (client, _):
         with pytest.raises(LLMError, match="no content"):
             client.complete("hello")
-    finally:
-        patcher.stop()
+
+
+def test_complete_raises_when_response_has_no_choices():
+    with _client_returning(_sdk_response(choices=False)) as (client, _):
+        with pytest.raises(LLMError, match="no choices"):
+            client.complete("hello")
 
 
 def test_complete_raises_on_length_truncation():
     """Regression: truncated JSON was sent to a repair call that cannot recover it."""
-    client, _, patcher = _client_returning(_sdk_response(content='{"a": ', finish_reason="length"))
-    try:
+    with _client_returning(_sdk_response(content='{"a": ', finish_reason="length")) as (client, _):
         with pytest.raises(LLMError, match="truncated"):
             client.complete("hello")
-    finally:
-        patcher.stop()
 
 
 def test_call_llm_does_not_retry_or_repair_truncated_output():
-    mock_client = MagicMock()
-    mock_client.complete.side_effect = LLMError("LLM output was truncated by the token limit")
-    with patch("summarizer.llm.time.sleep"), pytest.raises(LLMError, match="truncated"):
-        call_llm(mock_client, "prompt")
-    assert mock_client.complete.call_count == 1
+    with (
+        _client_returning(_sdk_response(content='{"a": ', finish_reason="length")) as (
+            client,
+            mock_openai,
+        ),
+        patch("summarizer.llm.time.sleep"),
+        pytest.raises(LLMError, match="truncated"),
+    ):
+        call_llm(client, "prompt")
+    assert mock_openai.return_value.chat.completions.create.call_count == 1
+
+
+def test_call_llm_counts_usage_of_rejected_completion():
+    """A truncated reply is billed, so its tokens must reach the accumulator."""
+    sdk_usage = MagicMock(prompt_tokens=100, completion_tokens=50, completion_tokens_details=None)
+    response = _sdk_response(content='{"a": ', finish_reason="length", usage=sdk_usage)
+    acc = CostAccumulator()
+    with (
+        _client_returning(response) as (client, _),
+        pytest.raises(LLMError),
+    ):
+        call_llm(client, "prompt", accumulator=acc)
+    assert (acc.total_input_tokens, acc.total_output_tokens) == (100, 50)
 
 
 def test_call_llm_retries_on_timeout():
@@ -901,3 +922,34 @@ def test_fetch_openrouter_model_ids_returns_none_when_unreachable():
     from summarizer.llm import fetch_openrouter_model_ids
 
     assert fetch_openrouter_model_ids("https://openrouter.ai/api/v1") is None
+
+
+@pytest.mark.parametrize("body", [b"[]", b"null", b'{"data": null}', b"not json"])
+def test_malformed_model_list_is_treated_as_unknown(body):
+    from summarizer.llm import fetch_openrouter_model_ids
+
+    with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)):
+        assert fetch_openrouter_model_ids("https://openrouter.ai/api/v1") is None
+        assert fetch_model_pricing("a/b", "k", "https://openrouter.ai/api/v1") == ModelPricing()
+
+
+def test_model_list_skips_malformed_entries():
+    from summarizer.llm import fetch_openrouter_model_ids
+
+    body = json.dumps({"data": ["x", {"no_id": 1}, {"id": "a/b"}]}).encode()
+    with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)):
+        assert fetch_openrouter_model_ids("https://openrouter.ai/api/v1") == {"a/b"}
+
+
+def test_pricing_null_fields_do_not_crash():
+    body = json.dumps({"data": [{"id": "a/b", "pricing": None, "context_length": None}]}).encode()
+    with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)):
+        assert fetch_model_pricing("a/b", "k", "https://openrouter.ai/api/v1") == ModelPricing()
+
+
+def test_pricing_lookup_strips_routing_suffix():
+    """`x/y:nitro` is billed as `x/y`; the lookup must not fall back to $0."""
+    body = json.dumps({"data": [{"id": "a/b", "pricing": {"prompt": "0.000001"}}]}).encode()
+    with patch("summarizer.llm.urllib.request.urlopen", _make_urlopen_mock(body)):
+        pricing = fetch_model_pricing("a/b:nitro", "k", "https://openrouter.ai/api/v1")
+    assert pricing.prompt == 1e-6

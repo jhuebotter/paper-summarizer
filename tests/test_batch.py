@@ -530,3 +530,105 @@ def test_run_batch_nothing_to_do_creates_no_client(tmp_path, config):
         report = run_batch(tmp_path, config)
     mock_create.assert_not_called()
     assert report.processed == 0
+
+
+def test_keyboard_interrupt_cancels_queued_papers(tmp_path, config):
+    """Regression: Ctrl-C used to wait for (and pay for) every queued paper."""
+    import threading
+
+    for i in range(6):
+        (tmp_path / f"p{i}.pdf").write_bytes(b"%PDF")
+    config.workers = 1
+    release = threading.Event()
+    calls = []
+
+    def fake_process(pdf_path, *args, **kwargs):
+        calls.append(pdf_path.name)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        release.wait(5)
+        return _make_summary(pdf_path.stem)
+
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", side_effect=fake_process),
+        patch("summarizer.batch.render_summary", return_value="# md"),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        run_batch(tmp_path, config)
+    release.set()
+    assert len(calls) <= 2  # the interrupted paper plus at most one already in flight
+
+
+def test_index_line_without_pdf_path_is_ignored(tmp_path):
+    (tmp_path / "processed.jsonl").write_text(
+        '{"outputs": []}\n[1, 2]\n{"pdf_path": "/a.pdf", "outputs": null}\n', encoding="utf-8"
+    )
+    assert load_processed_index(tmp_path) == {"/a.pdf": []}
+
+
+def test_failed_index_write_keeps_previous_index(tmp_path):
+    save_processed_index(tmp_path, {"/a.pdf": []})
+    with (
+        patch("summarizer.batch.os.replace", side_effect=OSError("disk full")),
+        pytest.raises(OSError),
+    ):
+        save_processed_index(tmp_path, {"/b.pdf": []})
+    assert load_processed_index(tmp_path) == {"/a.pdf": []}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["processed.jsonl"]
+
+
+def test_legacy_index_is_migrated_on_save(tmp_path, config):
+    pdf = tmp_path / "Doe, J - 2024 - Spikes, Robots.pdf"
+    pdf.write_bytes(b"%PDF")
+    config.output_dir.mkdir(parents=True)
+    legacy = config.output_dir / "processed.txt"
+    legacy.write_text(f"{pdf.resolve()}, /out/doe2024spikes_summary.md\n", encoding="utf-8")
+    (tmp_path / "new.pdf").write_bytes(b"%PDF")
+
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", return_value=_make_summary("new2024x")) as proc,
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        run_batch(tmp_path, config)
+
+    assert proc.call_count == 1  # the legacy entry (comma path) was skipped
+    migrated = load_processed_index(config.output_dir)
+    assert migrated[str(pdf.resolve())] == ["/out/doe2024spikes_summary.md"]
+    assert (config.output_dir / "processed.jsonl").exists()
+    assert legacy.exists()
+
+
+@pytest.mark.parametrize(
+    "line,expected",
+    [
+        ("/no/pdf/here", ("/no/pdf/here", [])),
+        (
+            "/a.pdf, /out/a_summary.md, /out/trailing",
+            ("/a.pdf", ["/out/a_summary.md", "/out/trailing"]),
+        ),
+    ],
+)
+def test_parse_legacy_line_edge_cases(line, expected):
+    from summarizer.batch import _parse_legacy_line
+
+    assert _parse_legacy_line(line) == expected
+
+
+def test_run_batch_report_includes_token_totals(tmp_path, config):
+    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+
+    def fake_process(pdf_path, config, client, accumulator, references):
+        from summarizer.llm import UsageStats
+
+        accumulator.add(UsageStats(input_tokens=1000, output_tokens=200), 0.0)
+        return _make_summary("a2020x")
+
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.process_pdf", side_effect=fake_process),
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        report = run_batch(tmp_path, config)
+    assert (report.input_tokens, report.output_tokens) == (1000, 200)

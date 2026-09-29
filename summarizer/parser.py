@@ -6,23 +6,25 @@ different backend:
 
 * ``{pdf_stem}.docling.md`` — written by docling
 * ``{pdf_stem}.pypdf.md``   — written by pypdf (directly or as ``auto`` fallback)
-* ``{pdf_stem}.md``         — legacy (pre-0.2) cache of unknown origin; still
-  honoured by ``auto`` so existing libraries are not re-parsed
+* ``{pdf_stem}.md``         — legacy cache of unknown origin; honoured only by
+  ``auto`` so existing libraries are not re-parsed
 
-Zero-byte cache files are treated as a cache miss.
+Zero-byte cache files are treated as a cache miss.  Cache writes are atomic and
+best-effort: a read-only PDF folder only costs re-extraction on the next run.
 
 docling is imported lazily (it costs several seconds and pulls in torch), and
-is an optional dependency: ``pip install paper-summarizer[docling]``.  When it
-is not installed, ``auto`` uses pypdf.
+is an optional dependency (``uv sync --extra docling``).  When it is missing or
+fails to start, ``auto`` uses pypdf.
 """
 
 import logging
+import os
 import threading
 from pathlib import Path
 
 from pypdf import PdfReader
 
-from summarizer.models import ParseError
+from summarizer.models import _DEFAULT_MAX_CHARS, ParseError
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +43,7 @@ class DoclingUnavailable(ParseError):
 
 def parse_pdf(
     pdf_path: Path,
-    max_chars: int = 200_000,
+    max_chars: int = _DEFAULT_MAX_CHARS,
     reparse: bool = False,
     extractor: str = "auto",
 ) -> str:
@@ -70,7 +72,7 @@ def parse_pdf(
 
     logger.info("Running %s extraction on: %s", extractor, pdf_path.name)
     text, used = _extract_text(pdf_path, extractor=extractor)
-    _cache_path(pdf_path, used).write_text(text, encoding="utf-8")
+    _write_cache(_cache_path(pdf_path, used), text)
     logger.info("Extraction complete (%s): %s chars", used, f"{len(text):,}")
     return _truncate(text, max_chars, pdf_path)
 
@@ -104,6 +106,16 @@ def _read_cache(pdf_path: Path, extractor: str) -> str | None:
             logger.info("Extraction cache found: %s (%s chars)", path.name, f"{len(cached):,}")
             return cached
     return None
+
+
+def _write_cache(path: Path, text: str) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        logger.warning("Could not write extraction cache %s: %s", path, exc)
 
 
 def _truncate(text: str, max_chars: int, pdf_path: Path) -> str:
@@ -167,20 +179,30 @@ def _docling_converter_class():
         try:
             from docling.document_converter import DocumentConverter as _DC
         except ImportError as exc:
-            raise DoclingUnavailable(
-                "docling is not installed (pip install 'paper-summarizer[docling]')"
-            ) from exc
+            raise DoclingUnavailable("docling is not installed (uv sync --extra docling)") from exc
+        except Exception as exc:  # e.g. a broken torch install
+            raise DoclingUnavailable(f"docling failed to import: {exc}") from exc
         DocumentConverter = _DC
     return DocumentConverter
 
 
 def _get_converter():
-    """Return a process-wide converter; building one loads docling's models."""
+    """Return a process-wide converter; building one loads docling's models.
+
+    Raises:
+        DoclingUnavailable: if docling is missing or its models fail to load
+            (the failure is remembered, so later papers skip straight to pypdf).
+    """
     cls = _docling_converter_class()
     converter = _CONVERTERS.get(cls)
     if converter is None:
-        converter = cls()
+        try:
+            converter = cls()
+        except Exception as exc:
+            converter = DoclingUnavailable(f"docling failed to start: {exc}")
         _CONVERTERS[cls] = converter
+    if isinstance(converter, DoclingUnavailable):
+        raise converter
     return converter
 
 

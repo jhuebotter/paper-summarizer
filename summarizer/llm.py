@@ -78,6 +78,14 @@ class CostAccumulator:
 # ---------------------------------------------------------------------------
 
 
+class RejectedCompletion(LLMError):
+    """A reply that was received (and billed) but is unusable; carries its usage."""
+
+    def __init__(self, message: str, usage: "UsageStats | None") -> None:
+        super().__init__(message)
+        self.usage = usage
+
+
 class _CompletionResponse:
     """Thin wrapper presenting an openai chat response as ``response.text``."""
 
@@ -125,9 +133,10 @@ class LLMClient:
         """Send a chat completion request and return the model's reply.
 
         Raises:
-            LLMError: if the reply is empty (``content is None``) or was cut off
-                by the output-token limit (``finish_reason == "length"``) —
-                a truncated JSON object cannot be repaired, so fail fast.
+            LLMError: if the response has no choices.
+            RejectedCompletion: if the reply is empty or was cut off by the
+                output-token limit (``finish_reason == "length"``); a truncated
+                JSON object cannot be repaired, so fail fast.
         """
         kwargs: dict = dict(
             model=self.model,
@@ -138,21 +147,56 @@ class LLMClient:
             kwargs["max_tokens"] = self.max_output_tokens
         response = self._client.chat.completions.create(**kwargs)
         usage = _extract_usage(response)
+        if not getattr(response, "choices", None):
+            raise LLMError("LLM response contains no choices")
         choice = response.choices[0]
         if choice.finish_reason == "length":
-            raise LLMError(
+            raise RejectedCompletion(
                 "LLM output was truncated by the token limit (finish_reason=length); "
-                "raise --max-output-tokens or use a model with a larger output budget"
+                "raise --max-output-tokens or use a model with a larger output budget",
+                usage,
             )
         text = choice.message.content
-        if text is None:
-            raise LLMError(f"LLM returned no content (finish_reason={choice.finish_reason!r})")
+        if text is None or not text.strip():
+            raise RejectedCompletion(
+                f"LLM returned no content (finish_reason={choice.finish_reason!r})", usage
+            )
         return _CompletionResponse(text=text, usage=usage)
 
 
 # ---------------------------------------------------------------------------
 # Pricing helpers
 # ---------------------------------------------------------------------------
+
+
+#: OpenRouter routing shortcuts that are valid on any listed model but are not
+#: themselves listed.  Other suffixes (notably ``:free``) are distinct model ids.
+OPENROUTER_ROUTING_SUFFIXES = frozenset({"nitro", "floor", "online", "exacto"})
+
+
+def openrouter_listed_id(model: str) -> str:
+    """Return the id under which ``model`` appears in OpenRouter's models list."""
+    base, sep, suffix = model.rpartition(":")
+    return base if sep and suffix in OPENROUTER_ROUTING_SUFFIXES else model
+
+
+def _fetch_openrouter_models(base_url: str, api_key: str | None = None) -> list[dict] | None:
+    """Return OpenRouter's model entries, or ``None`` if unavailable or malformed."""
+    parsed = urllib.parse.urlparse(base_url)
+    models_url = f"{parsed.scheme}://{parsed.netloc}/api/v1/models"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(models_url, headers=headers), timeout=10
+        ) as resp:
+            body = json.loads(resp.read())
+        data = body["data"]
+        if not isinstance(data, list):
+            raise TypeError("'data' is not a list")
+    except Exception as exc:
+        logger.warning("Could not list models from %s: %s", models_url, exc)
+        return None
+    return [m for m in data if isinstance(m, dict) and isinstance(m.get("id"), str)]
 
 
 def fetch_model_pricing(model_id: str, api_key: str, base_url: str) -> ModelPricing:
@@ -166,30 +210,22 @@ def fetch_model_pricing(model_id: str, api_key: str, base_url: str) -> ModelPric
         api_key:  OpenRouter API key for the Authorization header.
         base_url: Base URL of the API, e.g. ``"https://openrouter.ai/api/v1"``.
     """
-    # Derive models endpoint from base_url (strip trailing path components)
-    parsed = urllib.parse.urlparse(base_url)
-    models_url = f"{parsed.scheme}://{parsed.netloc}/api/v1/models"
-
-    req = urllib.request.Request(
-        models_url,
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = json.loads(resp.read())
-    except Exception as exc:
-        logger.warning("Failed to fetch model pricing from %s: %s — using $0.00", models_url, exc)
+    models = _fetch_openrouter_models(base_url, api_key)
+    if models is None:
+        logger.warning("Model pricing unavailable — using $0.00")
         return ModelPricing()
 
-    data = body.get("data", [])
-    model_info = next((m for m in data if m.get("id") == model_id), None)
+    listed_id = openrouter_listed_id(model_id)
+    model_info = next((m for m in models if m["id"] == listed_id), None)
     if model_info is None:
         logger.warning(
             "Model %r not found in OpenRouter models list — using $0.00 pricing", model_id
         )
         return ModelPricing()
 
-    p = model_info.get("pricing", {})
+    p = model_info.get("pricing")
+    if not isinstance(p, dict):
+        p = {}
     context_length = model_info.get("context_length", 0)
 
     def _f(key: str) -> float:
@@ -204,7 +240,7 @@ def fetch_model_pricing(model_id: str, api_key: str, base_url: str) -> ModelPric
         completion=_f("completion"),
         reasoning=_f("internal_reasoning"),
         request=_f("request"),
-        context_length=int(context_length) if context_length else 0,
+        context_length=int(context_length) if isinstance(context_length, int) else 0,
     )
     logger.info(
         "Model pricing fetched: %s  in=$%.2e  out=$%.2e  reason=$%.2e  ctx=%d",
@@ -220,18 +256,12 @@ def fetch_model_pricing(model_id: str, api_key: str, base_url: str) -> ModelPric
 def fetch_openrouter_model_ids(base_url: str) -> set[str] | None:
     """Return the set of model ids OpenRouter currently serves.
 
-    The models endpoint is public.  Returns ``None`` if it cannot be reached,
-    so callers can distinguish "unknown" from "not listed".
+    The models endpoint is public.  Returns ``None`` if it cannot be reached
+    or returns something unexpected, so callers can distinguish "unknown" from
+    "not listed".
     """
-    parsed = urllib.parse.urlparse(base_url)
-    models_url = f"{parsed.scheme}://{parsed.netloc}/api/v1/models"
-    try:
-        with urllib.request.urlopen(models_url, timeout=10) as resp:
-            body = json.loads(resp.read())
-    except Exception as exc:
-        logger.warning("Could not list models from %s: %s", models_url, exc)
-        return None
-    return {m.get("id") for m in body.get("data", []) if m.get("id")}
+    models = _fetch_openrouter_models(base_url)
+    return None if models is None else {m["id"] for m in models}
 
 
 def _extract_usage(response) -> "UsageStats | None":
@@ -331,7 +361,11 @@ def call_llm(
     logger.info("Calling LLM  model=%s  backend=%s", client.model, client.base_url)
     logger.info("Awaiting response...")
     t0 = time.monotonic()
-    completion = _complete_with_retries(client, prompt)
+    try:
+        completion = _complete_with_retries(client, prompt)
+    except RejectedCompletion as exc:
+        _record(accumulator, exc.usage, _calculate_cost(exc.usage, client.pricing))
+        raise
     elapsed = time.monotonic() - t0
 
     usage = completion.usage
@@ -355,12 +389,7 @@ def call_llm(
             cost,
         )
 
-    if accumulator is not None:
-        if usage is not None:
-            accumulator.add(usage, cost)
-        else:
-            # Only the flat request fee applies; use zero usage stats
-            accumulator.add(UsageStats(), cost)
+    _record(accumulator, usage, cost)
 
     try:
         return _extract_json(completion.text)
@@ -418,7 +447,11 @@ def _repair_json_once(
         "Payload to repair:\n"
         f"{bad_text}"
     )
-    response = client.complete(repair_prompt)
+    try:
+        response = client.complete(repair_prompt)
+    except RejectedCompletion as exc:
+        _record(accumulator, exc.usage, _calculate_cost(exc.usage, client.pricing))
+        raise
     usage = response.usage
     cost = _calculate_cost(usage, client.pricing)
     if usage is not None:
@@ -429,9 +462,13 @@ def _repair_json_once(
             usage.reasoning_tokens,
             cost,
         )
+    _record(accumulator, usage, cost)
+    return response.text
+
+
+def _record(accumulator: "CostAccumulator | None", usage: "UsageStats | None", cost: float) -> None:
     if accumulator is not None:
         accumulator.add(usage if usage is not None else UsageStats(), cost)
-    return response.text
 
 
 def _complete_with_retries(client: LLMClient, prompt: str) -> _CompletionResponse:

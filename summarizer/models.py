@@ -168,7 +168,7 @@ class SummaryPart2(BaseModel):
 
     Field values should use ``"not reported"`` when a concept applies but the
     paper omits it, and ``"not applicable"`` only when the concept genuinely
-    does not apply (e.g. ``"not applicable (synthesis)"``).
+    does not apply.
 
     Part 2 is produced only for ``paper_type="primary"`` research papers.
     Synthesis and non-research documents use ``part2=null``.
@@ -279,6 +279,8 @@ class BatchReport(BaseModel):
     failed: int
     failed_papers: list[FailedPaper]
     total_cost: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -292,39 +294,36 @@ class BatchReport(BaseModel):
 #: models.
 _DEFAULT_MAX_CHARS = 200_000
 
-#: Default backend and model.  A free OpenRouter model (checked 2026-09-29):
-#: 262k context, supports structured outputs, served by NVIDIA.  Free models
-#: are rate-limited and may be retired; the CLI's preflight check reports a
-#: retired id.  Paid fallback within budget: ``meta/muse-spark-1.3-contributor``
-#: (~$0.007/paper).
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
-#: Resolved from the source checkout (not the CWD) so the CLI works from any
-#: directory.  Assumes an editable/source install; packaging the references as
-#: package data is part of the planned domain-profiles work.
-DEFAULT_SKILL_DATA_DIR = Path(__file__).resolve().parent.parent / "skill_data" / "references"
+#: A free OpenRouter model with a 262k-token context.  Free models are
+#: rate-limited and may be retired; the CLI's preflight check reports a retired
+#: id.  Paid fallback within a few-cents budget: ``meta/muse-spark-1.3-contributor``.
 DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+
+#: Resolved from the source checkout (not the CWD) so the CLI works from any
+#: directory.  Requires an editable/source install.
+DEFAULT_SKILL_DATA_DIR = Path(__file__).resolve().parent.parent / "skill_data" / "references"
 
 
 @dataclass
 class Config:
     """Runtime configuration for the summarizer pipeline.
 
-    All fields correspond to CLI flags.  Defaults are chosen to fit comfortably
-    inside a 50k-token context window with the standard skill reference files.
+    All fields correspond to CLI flags.  The defaults need a context window of
+    roughly 70k tokens (see ``_DEFAULT_MAX_CHARS``).
 
     Attributes:
         base_url:       OpenAI-compatible API base URL.  Use
                         ``http://localhost:1234/v1`` for LM Studio or
                         ``https://openrouter.ai/api/v1`` for OpenRouter.
         model:          Model identifier passed to the API.
-        max_chars:      Maximum characters of paper markdown sent to the LLM.
-                        Default (~200k chars ≈ 50k tokens) suits models with a
-                        55k+ token context window.  Lower this for 4k/8k models.
-        force_summary:  If True, re-run summary generation even for PDFs already
-                        in processed.txt (preserves extraction cache unless
-                        ``reparse`` is set).
-        reparse:        If True, also re-run docling (ignores cached .md files).
+        max_chars:      Maximum characters of paper text sent to the LLM
+                        (~200k chars ≈ 50k tokens).  Lower this for small
+                        local models.
+        force_summary:  If True, re-summarize PDFs already in the processed
+                        index (keeps the extraction cache unless ``reparse``).
+        reparse:        If True, also re-run extraction (ignores cached text).
                         Implies summary regeneration for selected files.
         extractor:      PDF text extraction strategy: ``auto`` (docling with
                         pypdf fallback), ``docling`` (docling-only), or
@@ -334,8 +333,7 @@ class Config:
         output_dir:     Root directory for centralized summary output.
                         Subdirs ``primary/``, ``synthesis/``, and
                         ``non_research/`` are created automatically.
-        skill_data_dir: Path to the directory containing reference .md files
-                        (output-template, extraction fields, learning paradigms).
+        skill_data_dir: Directory of reference .md files embedded in the prompt.
         verbose:        If True, log at DEBUG level (prompt sizes, raw response
                         excerpts on failures, full validation errors).
         api_key:        API key for the LLM backend.  ``None`` means the key is

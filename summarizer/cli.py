@@ -6,20 +6,15 @@ Usage:
     summarize-papers --source DIR [options]   # batch mode
     summarize-papers --file PDF [options]     # single-file mode
 
-Key options:
-    --force-summary, --reparse, --extractor, --dry-run,
-    --output-dir, --model, --base-url, --max-chars,
-    --skill-data-dir, --verbose/--no-verbose,
-    --log-file, --timeout, --workers, --max-output-tokens.
-
 ``--source`` and ``--file`` are mutually exclusive; exactly one must be supplied.
 ``--reparse`` implies ``--force-summary``.
 
-Before processing (except in dry-run mode), the CLI performs a lightweight
-reachability check against the root host of the configured ``--base-url``.
+Before processing (except in dry-run mode), the CLI checks that the backend
+host is reachable and, for OpenRouter, that an API key is set and the model id
+is listed.
 
 Exit codes: 0 on success (or nothing to do), 1 if any paper failed or the
-input/backend is unavailable.
+input/backend is unavailable, 130 when interrupted.
 """
 
 import argparse
@@ -35,7 +30,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from summarizer.batch import load_processed_index, run_batch, run_pdfs, should_skip
-from summarizer.llm import fetch_openrouter_model_ids
+from summarizer.llm import fetch_openrouter_model_ids, openrouter_listed_id
 from summarizer.log import setup_logging
 from summarizer.models import (
     _DEFAULT_MAX_CHARS,
@@ -100,10 +95,17 @@ def main() -> None:
         _check_backend(config.base_url)
         _check_openrouter_config(config)
 
-    if args.file:
-        _run_single(Path(args.file), config)
-    else:
-        _run_batch(Path(args.source), config)
+    try:
+        if args.file:
+            _run_single(Path(args.file), config)
+        else:
+            _run_batch(Path(args.source), config)
+    except KeyboardInterrupt:
+        logger.warning(
+            "Interrupted: queued papers were cancelled; finished papers are saved and "
+            "skipped on the next run (in-flight calls may take a moment to end)."
+        )
+        sys.exit(130)
 
 
 # ---------------------------------------------------------------------------
@@ -135,8 +137,8 @@ def _run_single(pdf_path: Path, config: Config) -> None:
 
 def _run_batch(source_dir: Path, config: Config) -> None:
     """Scan ``source_dir`` for PDFs and process each one."""
-    if not source_dir.exists():
-        logger.error("Directory not found: %s", source_dir)
+    if not source_dir.is_dir():
+        logger.error("Not a directory: %s", source_dir)
         sys.exit(1)
 
     _report_and_exit(run_batch(source_dir, config))
@@ -145,10 +147,12 @@ def _run_batch(source_dir: Path, config: Config) -> None:
 def _report_and_exit(report: BatchReport) -> None:
     """Log the run summary; exit with status 1 if any paper failed."""
     logger.info(
-        "Done — processed: %d, skipped: %d, failed: %d, cost=$%.4f",
+        "Done — processed: %d, skipped: %d, failed: %d, tokens in=%d out=%d, cost=$%.4f",
         report.processed,
         report.skipped,
         report.failed,
+        report.input_tokens,
+        report.output_tokens,
         report.total_cost,
     )
 
@@ -201,16 +205,10 @@ def _check_openrouter_config(config: Config) -> None:
         sys.exit(1)
 
 
-#: OpenRouter routing shortcuts that are valid on any listed model but are not
-#: themselves listed.  Other suffixes (notably ``:free``) are distinct model ids.
-_OPENROUTER_ROUTING_SUFFIXES = frozenset({"nitro", "floor", "online", "exacto"})
-
-
 def _openrouter_model_listed(model: str, model_ids: set[str]) -> bool:
-    if model in model_ids:
+    if model.startswith("@"):  # "@preset/..." ids aren't in the models list
         return True
-    base, sep, suffix = model.rpartition(":")
-    return bool(sep) and suffix in _OPENROUTER_ROUTING_SUFFIXES and base in model_ids
+    return openrouter_listed_id(model) in model_ids
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +243,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force-summary",
         action="store_true",
         default=False,
-        help="Re-run summary generation for PDFs in processed.txt; preserves extraction cache.",
+        help="Re-summarize PDFs already in the processed index; keeps the extraction cache.",
     )
     parser.add_argument(
         "--reparse",
@@ -300,8 +298,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         default=str(DEFAULT_SKILL_DATA_DIR),
         help=(
-            "Directory containing reference .md files "
-            "(output-template, extraction fields, learning paradigms). "
+            "Directory of reference .md files embedded in the prompt. "
             "Default: the skill_data/references folder of this checkout."
         ),
     )

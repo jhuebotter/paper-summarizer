@@ -413,8 +413,11 @@ def test_run_single_missing_file_exits_1(tmp_path):
         ("meta/some-model", True),
         ("meta/some-model:nitro", True),
         ("meta/some-model:floor", True),
+        ("meta/some-model:online", True),
+        ("meta/some-model:exacto", True),
         ("meta/some-model:free", False),  # retired :free variants must be caught
         ("meta/other", False),
+        ("@preset/my-preset", True),  # presets aren't in the models list
     ],
 )
 def test_openrouter_model_listed(model, listed):
@@ -442,3 +445,26 @@ def test_main_works_from_another_directory(tmp_path, monkeypatch):
     log = next((tmp_path / "logs").glob("run_*.log")).read_text()
     assert "References directory not found" not in log
     assert "stop after prompt" in log
+
+
+def test_source_must_be_a_directory(tmp_path):
+    from summarizer.cli import _run_batch
+
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF")
+    with pytest.raises(SystemExit) as exc_info:
+        _run_batch(pdf, Config(output_dir=tmp_path / "out"))
+    assert exc_info.value.code == 1
+
+
+def test_keyboard_interrupt_exits_130(tmp_path):
+    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    with (
+        patch("sys.argv", ["summarize-papers", "--source", str(tmp_path)]),
+        patch("summarizer.cli._check_backend"),
+        patch("summarizer.cli._check_openrouter_config"),
+        patch("summarizer.cli.run_batch", side_effect=KeyboardInterrupt),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main()
+    assert exc_info.value.code == 130

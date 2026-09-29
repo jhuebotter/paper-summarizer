@@ -11,10 +11,10 @@ Two independent skip conditions:
 
 Processed index
 ---------------
-One JSON object per line: ``{"pdf_path": ..., "outputs": [...]}``.  The
-pre-0.2 ``processed.txt`` (comma-separated, which broke on paths containing
-commas) is still read when no ``processed.jsonl`` exists; the next save writes
-the new format.  Writes are atomic (temp file + rename).
+One JSON object per line: ``{"pdf_path": ..., "outputs": [...]}``.  A legacy
+comma-separated ``processed.txt`` is read when no ``processed.jsonl`` exists;
+the next save writes the new format.  Writes are atomic (temp file + rename).
+Only one run should use an output directory at a time.
 
 Output location
 ---------------
@@ -83,9 +83,11 @@ def load_processed_index(output_dir: Path) -> dict[str, list[str]]:
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
+                entry = None
+            if not isinstance(entry, dict) or not isinstance(entry.get("pdf_path"), str):
                 logger.warning("Ignoring malformed line %d in %s", lineno, index_path)
                 continue
-            result[entry["pdf_path"]] = list(entry.get("outputs", []))
+            result[entry["pdf_path"]] = list(entry.get("outputs") or [])
         return result
 
     legacy_path = output_dir / LEGACY_INDEX_FILENAME
@@ -109,10 +111,10 @@ def _load_legacy_index(path: Path) -> dict[str, list[str]]:
 
 
 def _parse_legacy_line(line: str) -> tuple[str, list[str]]:
-    """Parse ``pdf_path, summary1, summary2`` where paths may contain ", ".
+    """Parse a legacy ``pdf_path, summary1, summary2`` line.
 
-    The old writer joined fields with ", ", so segments are re-joined until
-    they end in ``.pdf`` (the source) or ``.md`` (each summary).
+    Fields are joined with ", ", which may also occur inside paths, so segments
+    are re-joined until they end in ``.pdf`` (the source) or ``.md`` (each summary).
     """
     parts = line.strip().split(", ")
     i = next((n for n, part in enumerate(parts) if part.lower().endswith(".pdf")), None)
@@ -298,15 +300,11 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
     references = load_references(config.skill_data_dir)
 
     show_progress = sys.stderr.isatty()
-    futures_to_path: dict = {}
-
-    with (
-        logging_redirect_tqdm(loggers=[logging.getLogger("summarizer")]),
-        ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="worker") as executor,
-    ):
-        run_total = len(jobs)
-        for run_idx, pdf_path in enumerate(jobs, start=1):
-            future = executor.submit(
+    run_total = len(jobs)
+    executor = ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="worker")
+    try:
+        futures_to_path = {
+            executor.submit(
                 _process_one_pdf,
                 pdf_path,
                 config,
@@ -315,16 +313,19 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
                 client,
                 accumulator,
                 references,
-            )
-            futures_to_path[future] = (pdf_path, run_idx)
-
-        with tqdm(
-            total=run_total,
-            desc="Process",
-            unit="pdf",
-            disable=not show_progress,
-            leave=True,
-        ) as progress:
+            ): (pdf_path, run_idx)
+            for run_idx, pdf_path in enumerate(jobs, start=1)
+        }
+        with (
+            logging_redirect_tqdm(loggers=[logging.getLogger("summarizer")]),
+            tqdm(
+                total=run_total,
+                desc="Process",
+                unit="pdf",
+                disable=not show_progress,
+                leave=True,
+            ) as progress,
+        ):
             for future in as_completed(futures_to_path):
                 pdf_path, run_idx = futures_to_path[future]
                 abs_path = str(pdf_path.resolve())
@@ -355,6 +356,11 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
                         failed=n_failed,
                         cost=f"${accumulator.total_cost:.4f}",
                     )
+    except BaseException:
+        # Ctrl-C or a crash: cancel queued papers instead of running (and paying for) them.
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    executor.shutdown()
 
     return BatchReport(
         processed=n_processed,
@@ -362,4 +368,6 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
         failed=n_failed,
         failed_papers=failed_papers,
         total_cost=accumulator.total_cost,
+        input_tokens=accumulator.total_input_tokens,
+        output_tokens=accumulator.total_output_tokens,
     )

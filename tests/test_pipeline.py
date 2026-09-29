@@ -508,3 +508,49 @@ def test_process_pdf_uses_provided_references(fake_pdf, config, mock_part1_dict,
         process_pdf(fake_pdf, config, references="CUSTOM_REFERENCES_ABC")
     mock_load.assert_not_called()
     assert "CUSTOM_REFERENCES_ABC" in mock_client.complete.call_args[0][0]
+
+
+def test_integral_float_year_is_kept(tmp_path, config, mock_part1_dict, mock_part2_dict):
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    combined["metadata"]["year"] = 2021.0
+    client_patcher, _ = _mock_llm_combined(combined)
+    with _mock_parse("text"), client_patcher:
+        summary = process_pdf(tmp_path / "x.pdf", config)
+    assert summary.metadata.year == 2021
+
+
+def test_citation_key_is_stripped_and_capped(tmp_path, config, mock_part1_dict, mock_part2_dict):
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    combined["metadata"]["citation_key"] = "  smith2020" + "x" * 300 + "\n"
+    client_patcher, _ = _mock_llm_combined(combined)
+    with _mock_parse("text"), client_patcher:
+        key = process_pdf(tmp_path / "x.pdf", config).metadata.citation_key
+    assert key.startswith("smith2020") and key == key.strip() and len(key) <= 64
+
+
+def test_schema_repair_for_null_field_includes_paper(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    """A required string returned as null needs content, not just a type fix."""
+    broken = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    broken["part2"] = {**broken["part2"], "neuron_model": None}
+    fixed = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = [
+        MagicMock(text=json.dumps(broken)),
+        MagicMock(text=json.dumps(fixed)),
+    ]
+    with (
+        _mock_parse("UNIQUE_PAPER_TEXT_XYZ"),
+        patch("summarizer.pipeline.create_client", return_value=mock_client),
+    ):
+        process_pdf(fake_pdf, config)
+    assert "UNIQUE_PAPER_TEXT_XYZ" in mock_client.complete.call_args_list[1].args[0]
+
+
+def test_repair_field_hints_cover_every_model_field():
+    from summarizer.models import SummaryPart1Synthesis, SummaryPart2
+    from summarizer.pipeline import _PRIMARY_PART2_FIELDS, _SYNTHESIS_PART1_FIELDS
+
+    assert all(f in _PRIMARY_PART2_FIELDS for f in SummaryPart2.model_fields)
+    assert all(f in _SYNTHESIS_PART1_FIELDS for f in SummaryPart1Synthesis.model_fields)
