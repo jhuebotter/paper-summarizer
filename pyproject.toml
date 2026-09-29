@@ -4,15 +4,37 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paper-summarizer"
-version = "0.1.0"
-requires-python = ">=3.11"
+version = "0.2.0.dev0"
+description = "Turn research PDFs into structured, critical markdown summaries via an OpenAI-compatible LLM."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "License :: OSI Approved :: MIT License",
+]
 dependencies = [
-    "docling>=2.0.0",
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
     "pypdf>=4.0.0",
     "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+# docling gives much better markdown (tables, sections) but pulls in torch (~1 GB).
+# Without it, --extractor auto falls back to pypdf.
+docling = ["docling>=2.0.0"]
+
+[dependency-groups]
+# Installed by default with `uv sync`; not part of the published package.
+dev = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.12.0",
+    "ruff>=0.6.0",
 ]
 
 [project.scripts]
@@ -27,10 +49,10 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 python_classes = ["Test*"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -m 'not integration'"
 pythonpath = ["."]
 markers = [
-    "integration: marks tests that require real external resources (PDFs, LM Studio)",
+    "integration: needs real external resources (sample PDFs, network, API key); run with -m integration",
 ]
 
 [tool.ruff]
