@@ -21,9 +21,9 @@ Python >=3.12, developed on 3.14 (`.python-version`). Use uv, not pip/conda; com
 
 - `skill_data/references/*.md` is the domain source of truth and is embedded verbatim in every prompt (~11k tokens). `json-output-contract.md` must agree with `models.py` (including the `Classification` label vocabularies; `test_classification_vocabularies_match_the_references` guards them), `prompts.py` (tail rules), `pipeline._PRIMARY_PART2_FIELDS`/`_SYNTHESIS_PART1_FIELDS` and `renderer.py`. Drift between these has caused bugs, and `tests/test_prompts.py` guards part of it.
 - `paper_type` is exactly `primary | synthesis` (or `null` for non-research); subtypes go in `synthesis_subtype`.
-- Retries live only in `llm._complete_with_retries` (the SDK has `max_retries=0`). `finish_reason == "length"` and empty content raise `RejectedCompletion` (no repair). Daily caps / credit exhaustion raise `QuotaExhausted`, which stops `run_pdfs` and `run_eval` cleanly (worker-side `batch.StopSignal`, shared with eval); `--max-cost` uses the same stop.
+- Retries live only in `llm._complete_with_retries` (the SDK has `max_retries=0`); OpenRouter provider errors inside a 200 response raise `ProviderError` (a billed `RejectedCompletion`) and are retried when transient. `finish_reason == "length"` and empty content raise `RejectedCompletion` (no repair). Daily caps / credit exhaustion raise `QuotaExhausted`, which stops `run_pdfs` and `run_eval` cleanly (worker-side `batch.StopSignal`, shared with eval); `--max-cost` uses the same stop.
 - Schema repair resends the paper only for missing content (`pipeline._needs_paper_context`).
-- Parser caches `$XDG_CACHE_HOME/paper-summarizer/<sha256>.<extractor>.md` (old caches next to the PDF are still read; tests point `XDG_CACHE_HOME` at `tmp_path`); docling is imported lazily and is an optional extra.
+- Parser caches `$XDG_CACHE_HOME/paper-summarizer/<sha256>.<extractor>.md` (old caches next to the PDF are still read; tests point `XDG_CACHE_HOME` at `tmp_path`); docling is imported lazily, is an optional extra, and runs without OCR unless most pages have no text (scans).
 - Processed index: `output_summaries/processed.jsonl`, keyed by PDF sha256 (path-only entries and legacy `processed.txt` still match by path). Each summary gets a `.json` sidecar (`PaperSummary` with `provenance`); `summarize-papers render` rebuilds markdown from them. `batch.output_dir_lock` prevents concurrent runs on one output dir.
 - Evaluation: `summarize-papers eval` (`evaluation.py` runner/cache/gold/report, `metrics.py` pure metrics) calls `process_pdf` directly and must never write to `output_summaries/`.
 
@@ -31,4 +31,4 @@ Python >=3.12, developed on 3.14 (`.python-version`). Use uv, not pip/conda; com
 
 - Match the existing style: module docstrings explain the why, `logger = logging.getLogger(__name__)`, `# ---` section banners.
 - Every bug fix gets a regression test.
-- Don't assemble a PDF dataset (gold/eval/baseline) without asking the owner first; the real Zotero library (~150 papers) lives on another machine.
+- Real papers: the owner's library is in `input_papers/` (148 PDFs) and `test_pdfs/` (both gitignored); build eval/gold/baseline sets from it, and ask the owner before fetching PDFs from anywhere else. Gold labels need owner review.
