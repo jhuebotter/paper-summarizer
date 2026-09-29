@@ -73,6 +73,37 @@ def render_summary(summary: PaperSummary) -> str:
 # ---------------------------------------------------------------------------
 
 
+def part1_prose(part1: SummaryPart1Primary | SummaryPart1Synthesis) -> list[str]:
+    """Return the Part 1 prose fields that count towards the word limit."""
+    if isinstance(part1, SummaryPart1Primary):
+        fields = (
+            part1.tldr,
+            part1.problem_motivation,
+            part1.core_contribution,
+            part1.methods,
+            part1.results,
+            part1.key_takeaways,
+            part1.limitations,
+            part1.critical_assessment,
+            part1.relevance,
+        )
+    else:
+        fields = (
+            part1.tldr,
+            part1.target_papers_field,
+            part1.scope_coverage,
+            part1.taxonomy_organization,
+            part1.core_argument,
+            part1.synthesis_contribution,
+            part1.key_claims_narrative,
+            part1.key_takeaways,
+            part1.limitations,
+            part1.critical_assessment,
+            part1.relevance,
+        )
+    return list(fields)
+
+
 def _count_words(*texts: str) -> int:
     """Return the total word count across all provided strings."""
     return sum(len(t.split()) for t in texts)
@@ -208,18 +239,7 @@ def _render_primary(
     part2: SummaryPart2,
 ) -> str:
     """Render a primary research paper (≤600 words for Part 1 prose)."""
-    prose_words = _count_words(
-        part1.tldr,
-        part1.problem_motivation,
-        part1.core_contribution,
-        part1.methods,
-        part1.results,
-        part1.key_takeaways,
-        part1.limitations,
-        part1.critical_assessment,
-        part1.relevance,
-    )
-    _check_word_limit("primary", prose_words)
+    _check_word_limit("primary", _count_words(*part1_prose(part1)))
 
     open_problems = _render_open_problems_primary(part1.open_problems_future_directions)
     notable = _render_bullets(part1.notable_findings) or "not reported"
@@ -252,20 +272,7 @@ def _render_synthesis(
     part1: SummaryPart1Synthesis,
 ) -> str:
     """Render a synthesis paper (≤1000 words for Part 1 prose)."""
-    prose_words = _count_words(
-        part1.tldr,
-        part1.target_papers_field,
-        part1.scope_coverage,
-        part1.taxonomy_organization,
-        part1.core_argument,
-        part1.synthesis_contribution,
-        part1.key_claims_narrative,
-        part1.key_takeaways,
-        part1.limitations,
-        part1.critical_assessment,
-        part1.relevance,
-    )
-    _check_word_limit("synthesis", prose_words)
+    _check_word_limit("synthesis", _count_words(*part1_prose(part1)))
 
     open_problems = _render_open_problems_synthesis(part1.open_problems_future_directions)
     notable = _render_bullets(part1.notable_findings) or "not reported"

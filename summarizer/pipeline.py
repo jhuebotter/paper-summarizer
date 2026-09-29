@@ -166,6 +166,8 @@ def _validate_with_schema_repair(
                 validation_errors=compact,
                 contract=contract,
             )
+            if accumulator is not None:
+                accumulator.note_repair("schema")
             current = call_llm(client, repair_prompt, accumulator=accumulator)
 
     raise RuntimeError("Schema validation retry loop exhausted unexpectedly")

@@ -56,7 +56,7 @@ class UsageStats:
 
 
 class CostAccumulator:
-    """Thread-safe running total of tokens and USD cost across all calls."""
+    """Thread-safe running totals of tokens, USD cost, completions and repairs."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -64,13 +64,26 @@ class CostAccumulator:
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
         self.total_reasoning_tokens: int = 0
+        self.calls: int = 0
+        self.json_repairs: int = 0
+        self.schema_repairs: int = 0
 
     def add(self, usage: UsageStats, cost: float) -> None:
+        """Record one completion (including repair calls)."""
         with self._lock:
+            self.calls += 1
             self.total_cost += cost
             self.total_input_tokens += usage.input_tokens
             self.total_output_tokens += usage.output_tokens
             self.total_reasoning_tokens += usage.reasoning_tokens
+
+    def note_repair(self, kind: str) -> None:
+        """Count a repair attempt; ``kind`` is ``"json"`` or ``"schema"``."""
+        with self._lock:
+            if kind == "json":
+                self.json_repairs += 1
+            else:
+                self.schema_repairs += 1
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +408,8 @@ def call_llm(
         return _extract_json(completion.text)
     except LLMError as parse_exc:
         logger.warning("Initial JSON parse failed; running one syntax-repair retry")
+        if accumulator is not None:
+            accumulator.note_repair("json")
         logger.debug("Unparseable response (first 500 chars): %r", completion.text[:500])
         try:
             repaired = _repair_json_once(client, completion.text, accumulator=accumulator)

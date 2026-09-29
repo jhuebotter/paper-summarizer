@@ -554,3 +554,20 @@ def test_repair_field_hints_cover_every_model_field():
 
     assert all(f in _PRIMARY_PART2_FIELDS for f in SummaryPart2.model_fields)
     assert all(f in _SYNTHESIS_PART1_FIELDS for f in SummaryPart1Synthesis.model_fields)
+
+
+def test_accumulator_counts_calls_and_repairs(fake_pdf, config, mock_part1_dict, mock_part2_dict):
+    broken = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    broken["metadata"]["paper_type"] = "survey"
+    fixed = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    mock_client = MagicMock()
+    mock_client.pricing = ModelPricing()
+    mock_client.complete.side_effect = [
+        MagicMock(text="not json", usage=None),
+        MagicMock(text=json.dumps(broken), usage=None),  # JSON repair output
+        MagicMock(text=json.dumps(fixed), usage=None),  # schema repair output
+    ]
+    acc = CostAccumulator()
+    with _mock_parse("text"):
+        process_pdf(fake_pdf, config, client=mock_client, accumulator=acc)
+    assert (acc.calls, acc.json_repairs, acc.schema_repairs) == (3, 1, 1)
