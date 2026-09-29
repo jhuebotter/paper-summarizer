@@ -188,7 +188,7 @@ def _run(tmp_path, pdfs, reply, configs=None, paper_text=PAPER_TEXT, max_chars=2
         patch("summarizer.pipeline.parse_pdf", return_value=paper_text[:max_chars]),
         patch("summarizer.evaluation.create_client", return_value=_inner_client(reply)),
     ):
-        return run_eval(
+        rows, _ = run_eval(
             pdfs,
             config,
             configs or [EvalConfig(model="m", extractor="pypdf")],
@@ -196,6 +196,7 @@ def _run(tmp_path, pdfs, reply, configs=None, paper_text=PAPER_TEXT, max_chars=2
             cache_dir=tmp_path / "cache",
             **kw,
         )
+        return rows
 
 
 def test_run_eval_writes_results_report_and_summaries(tmp_path, pdfs, good):
@@ -235,14 +236,14 @@ def test_parse_failure_row(tmp_path, pdfs):
         patch("summarizer.evaluation.parse_pdf", side_effect=RuntimeError("corrupt")),
         patch("summarizer.evaluation.create_client", return_value=_inner_client(lambda p: "")),
     ):
-        rows = run_eval(
+        rows, _ = run_eval(
             pdfs[:1],
             config,
             [EvalConfig(model="m", extractor="pypdf")],
             out_dir=tmp_path / "run",
             cache_dir=tmp_path / "cache",
         )
-    assert rows[0]["ok"] is False and rows[0]["error"].startswith("parse failed")
+    assert rows[0]["ok"] is False and rows[0]["error"].startswith("text preparation failed")
     assert rows[0].get("first_try_valid", False) is False
 
 
@@ -336,7 +337,7 @@ def test_cli_eval_dispatch(tmp_path, pdfs):
         patch("summarizer.cli._check_backend"),
         patch("summarizer.cli._check_openrouter_config") as check,
         patch("summarizer.cli.importlib.util.find_spec", return_value=True),
-        patch("summarizer.cli.run_eval") as run,
+        patch("summarizer.cli.run_eval", return_value=([], None)) as run,
     ):
         main(
             [
@@ -425,15 +426,74 @@ def test_non_eval_invocations_route_to_run(tmp_path, argv):
     run_eval_mock.assert_not_called()
 
 
-def test_quota_exhaustion_stops_eval_without_scoring_failures(tmp_path, pdfs, good):
+def test_quota_exhaustion_stops_eval_without_scoring_failures(tmp_path, good):
     from summarizer.llm import QuotaExhausted
 
+    papers = tmp_path / "papers"
+    papers.mkdir()
+    for name in ("a.pdf", "b.pdf", "c.pdf", "d.pdf"):
+        (papers / name).write_bytes(f"%PDF {name}".encode())
+    calls = []
+
     def reply(prompt):
+        calls.append(prompt)
         if "a.pdf" in prompt:
             return good
         raise QuotaExhausted("free-models-per-day")
 
-    rows = _run(tmp_path, pdfs, reply)
+    config = Config(base_url="http://localhost:1234/v1", skill_data_dir=REFERENCES_DIR, workers=1)
+    with (
+        patch("summarizer.evaluation.parse_pdf", return_value=PAPER_TEXT),
+        patch("summarizer.pipeline.parse_pdf", return_value=PAPER_TEXT),
+        patch("summarizer.evaluation.create_client", return_value=_inner_client(reply)),
+    ):
+        rows, reason = run_eval(
+            sorted(papers.iterdir()),
+            config,
+            [EvalConfig("m", "pypdf"), EvalConfig("n", "pypdf")],
+            out_dir=tmp_path / "run",
+            cache_dir=tmp_path / "cache",
+        )
+    assert reason == "free-models-per-day"
+    assert [r["file"] for r in rows] == ["a.pdf"]  # the second config never ran
+    assert len(calls) == 2  # a.pdf, then the quota hit; c.pdf and d.pdf never started
+    assert "Stopped early: free-models-per-day" in (tmp_path / "run" / "report.md").read_text()
+
+
+def test_max_cost_stops_eval(tmp_path, pdfs, good):
+    client = _inner_client(_replies((".pdf", good)))
+    client.complete.side_effect = lambda prompt: CompletionResponse(
+        text=good, usage=UsageStats(input_tokens=1, cost=0.01)
+    )
+    config = Config(
+        base_url="http://localhost:1234/v1", skill_data_dir=REFERENCES_DIR, workers=1, max_cost=0.01
+    )
+    with (
+        patch("summarizer.evaluation.parse_pdf", return_value=PAPER_TEXT),
+        patch("summarizer.pipeline.parse_pdf", return_value=PAPER_TEXT),
+        patch("summarizer.evaluation.create_client", return_value=client),
+    ):
+        rows, reason = run_eval(
+            pdfs,
+            config,
+            [EvalConfig("m", "pypdf")],
+            out_dir=tmp_path / "run",
+            cache_dir=tmp_path / "cache",
+        )
     assert [r["file"] for r in rows] == ["a.pdf"]
-    report = (tmp_path / "run" / "report.md").read_text()
-    assert "Stopped early: free-models-per-day" in report
+    assert reason == "--max-cost $0.01 reached"
+
+
+def test_eval_applies_strip_and_context_fit(tmp_path, pdfs, good):
+    with patch("summarizer.evaluation.fit_to_context", side_effect=lambda t, *a: t) as fit:
+        _run(tmp_path, pdfs[:1], _replies(("a.pdf", good)))
+    fit.assert_called_once()
+
+
+def test_cache_key_covers_structured_output(tmp_path):
+    inner = _inner_client(lambda p: '{"a": 1}')
+    inner.response_format = None
+    CachingClient(inner, tmp_path).complete("prompt")
+    inner.response_format = {"type": "json_schema"}
+    CachingClient(inner, tmp_path).complete("prompt")
+    assert inner.complete.call_count == 2

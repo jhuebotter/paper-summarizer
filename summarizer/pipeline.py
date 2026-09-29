@@ -31,6 +31,7 @@ _CONTRACT_FILENAME = "json-output-contract.md"
 _MAX_CITATION_KEY_LEN = 64  # keeps output filenames well below OS limits
 _CHARS_PER_TOKEN = 3  # conservative: maths-heavy text tokenizes densely
 _OUTPUT_RESERVE_TOKENS = 16_000
+_MIN_CONTEXT_SHARE = 0.2
 
 
 def process_pdf(
@@ -129,14 +130,21 @@ def fit_to_context(
     Uses a conservative ~3 characters per token and reserves
     ``max_output_tokens`` (or 16k tokens) for the reply.  Unknown context
     lengths leave the text unchanged.
+
+    Raises:
+        ValueError: if less than 20% of the text would fit; a summary of the
+            first pages would be misleading and would never be retried.
     """
     if not isinstance(context_length, int) or context_length <= 0:
         return paper_text
     overhead = len(build_combined_prompt("", references, source_filename)) // _CHARS_PER_TOKEN
     reserve = config.max_output_tokens or _OUTPUT_RESERVE_TOKENS
     budget = (context_length - overhead - reserve) * _CHARS_PER_TOKEN
-    if budget <= 0:
-        raise ValueError(f"The prompt alone exceeds the model's {context_length:,}-token context")
+    if budget < _MIN_CONTEXT_SHARE * len(paper_text):
+        raise ValueError(
+            f"The model's {context_length:,}-token context holds only "
+            f"{max(budget, 0):,} of {len(paper_text):,} chars of paper text; use a larger model"
+        )
     if len(paper_text) > budget:
         logger.warning(
             "Paper text cut to %s chars to fit the model's %s-token context",

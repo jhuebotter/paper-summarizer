@@ -8,7 +8,9 @@ The public interface is ``LLMClient.complete(prompt)`` returning an object
 with ``.text`` and ``.usage`` attributes.
 
 Retries live in exactly one place (``_complete_with_retries``); the SDK's own
-retry loop is disabled so attempts don't multiply.
+retry loop is disabled so attempts don't multiply.  Exhausted quotas (daily
+free-model cap, credits, key limits) raise ``QuotaExhausted`` instead, so runs
+can stop cleanly.
 """
 
 import json
@@ -45,7 +47,6 @@ class ModelPricing:
     reasoning: float = 0.0  # per reasoning token
     request: float = 0.0  # flat per-request fee
     context_length: int = 0  # max context in tokens
-    structured_outputs: bool = False  # the model accepts a JSON-schema response_format
 
 
 @dataclass
@@ -60,9 +61,14 @@ class UsageStats:
 
 
 class CostAccumulator:
-    """Thread-safe running totals of tokens, USD cost, completions and repairs."""
+    """Thread-safe running totals of tokens, USD cost, completions and repairs.
 
-    def __init__(self) -> None:
+    With a ``parent``, every update is also applied to it, so a per-paper
+    accumulator can feed a run-wide total.
+    """
+
+    def __init__(self, parent: "CostAccumulator | None" = None) -> None:
+        self._parent = parent
         self._lock = threading.Lock()
         self.total_cost: float = 0.0
         self.total_input_tokens: int = 0
@@ -80,14 +86,20 @@ class CostAccumulator:
             self.total_input_tokens += usage.input_tokens
             self.total_output_tokens += usage.output_tokens
             self.total_reasoning_tokens += usage.reasoning_tokens
+        if self._parent is not None:
+            self._parent.add(usage, cost)
 
     def note_json_repair(self) -> None:
         with self._lock:
             self.json_repairs += 1
+        if self._parent is not None:
+            self._parent.note_json_repair()
 
     def note_schema_repair(self) -> None:
         with self._lock:
             self.schema_repairs += 1
+        if self._parent is not None:
+            self._parent.note_schema_repair()
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +211,8 @@ class LLMClient:
 
 
 def is_openrouter(base_url: str) -> bool:
-    return urllib.parse.urlparse(base_url).netloc.endswith("openrouter.ai")
+    host = urllib.parse.urlparse(base_url).hostname or ""
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
 
 
 def fetch_openrouter_key_info(base_url: str, api_key: str) -> dict | None:
@@ -290,7 +303,6 @@ def fetch_model_pricing(model_id: str, api_key: str, base_url: str) -> ModelPric
         reasoning=_f("internal_reasoning"),
         request=_f("request"),
         context_length=int(context_length) if isinstance(context_length, int) else 0,
-        structured_outputs="structured_outputs" in (model_info.get("supported_parameters") or []),
     )
     logger.info(
         "Model pricing fetched: %s  in=$%.2e  out=$%.2e  reason=$%.2e  ctx=%d",
@@ -301,17 +313,6 @@ def fetch_model_pricing(model_id: str, api_key: str, base_url: str) -> ModelPric
         pricing.context_length,
     )
     return pricing
-
-
-def fetch_openrouter_model_ids(base_url: str) -> set[str] | None:
-    """Return the set of model ids OpenRouter currently serves.
-
-    The models endpoint is public.  Returns ``None`` if it cannot be reached
-    or returns something unexpected, so callers can distinguish "unknown" from
-    "not listed".
-    """
-    models = fetch_openrouter_models(base_url)
-    return None if models is None else {m["id"] for m in models}
 
 
 def _extract_usage(response) -> "UsageStats | None":
@@ -407,7 +408,7 @@ def create_client(config: Config) -> LLMClient:
             "json_schema": {
                 "name": "paper_summary",
                 "strict": False,
-                "schema": LLMResponse.model_json_schema(),
+                "schema": portable_schema(LLMResponse.model_json_schema()),
             },
         }
 
@@ -422,6 +423,30 @@ def create_client(config: Config) -> LLMClient:
         response_format=response_format,
         extra_body=extra_body,
     )
+
+
+def portable_schema(schema: dict) -> dict:
+    """Inline ``$ref``s and use ``anyOf`` instead of ``oneOf``/``discriminator``.
+
+    Many providers support only a JSON Schema subset without references or
+    OpenAPI's ``discriminator`` keyword.
+    """
+    defs = schema.get("$defs", {})
+
+    def resolve(node):
+        if isinstance(node, dict):
+            if "$ref" in node:
+                return resolve(defs[node["$ref"].rsplit("/", 1)[-1]])
+            return {
+                ("anyOf" if key == "oneOf" else key): resolve(value)
+                for key, value in node.items()
+                if key not in ("$defs", "discriminator")
+            }
+        if isinstance(node, list):
+            return [resolve(item) for item in node]
+        return node
+
+    return resolve(schema)
 
 
 def call_llm(
@@ -481,6 +506,8 @@ def call_llm(
         logger.debug("Unparseable response (first 500 chars): %r", completion.text[:500])
         try:
             repaired = _repair_json_once(client, completion.text, accumulator=accumulator)
+        except QuotaExhausted:
+            raise
         except Exception:
             raise parse_exc from None
         try:
@@ -531,7 +558,7 @@ def _repair_json_once(
         f"{bad_text}"
     )
     try:
-        response = client.complete(repair_prompt)
+        response = _complete_with_retries(client, repair_prompt)
     except RejectedCompletion as exc:
         _record(accumulator, exc.usage, _calculate_cost(exc.usage, client.pricing))
         raise
@@ -572,14 +599,6 @@ def _complete_with_retries(client: LLMClient, prompt: str) -> CompletionResponse
             if quota:
                 raise QuotaExhausted(quota) from exc
             if attempt >= attempts or not _is_retryable_status_error(exc):
-                if getattr(client, "response_format", None) and _extract_status_code(exc) in (
-                    400,
-                    404,
-                ):
-                    raise LLMError(
-                        f"LLM call failed: {exc} (the backend may not support structured "
-                        "output for this model; retry without --structured-output)"
-                    ) from exc
                 raise LLMError(f"LLM call failed: {exc}") from exc
 
             delay_s = _retry_delay_seconds(attempt, exc)
@@ -618,13 +637,15 @@ def _error_details(exc: Exception) -> tuple[str, dict]:
 
 
 def _quota_exhausted_message(exc: Exception) -> str | None:
-    """Describe an exhausted quota (402, or a 429 that won't clear within minutes)."""
+    """Describe an exhausted quota: 402 (credits), 403 key limit, or a 429 that won't clear soon."""
     status = _extract_status_code(exc)
-    if status not in (402, 429):
+    if status not in (402, 403, 429):
         return None
     message, headers = _error_details(exc)
     if status == 402:
-        return f"Credits or key limit exhausted: {message}"
+        return f"Credits exhausted: {message}"
+    if status == 403:
+        return f"Key limit exhausted: {message}" if "key limit" in message.lower() else None
     lowered = message.lower()
     reset_ms = headers.get("X-RateLimit-Reset")
     try:

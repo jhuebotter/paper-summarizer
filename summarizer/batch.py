@@ -221,6 +221,27 @@ def get_versioned_output_path(path: Path) -> Path:
         version += 1
 
 
+class StopSignal:
+    """Thread-safe "start no new papers" flag that keeps the first reason given."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reason: str | None = None
+
+    def trip(self, reason: str) -> None:
+        with self._lock:
+            if self.reason is None:
+                self.reason = reason
+                logger.warning("Stopping: %s", reason)
+
+    def is_set(self) -> bool:
+        return self.reason is not None
+
+    def check_budget(self, accumulator: CostAccumulator, max_cost: float | None) -> None:
+        if max_cost is not None and accumulator.total_cost >= max_cost:
+            self.trip(f"--max-cost ${max_cost:g} reached")
+
+
 class _Stopped(Exception):
     """The run was stopped (quota or --max-cost) before this paper started."""
 
@@ -233,11 +254,10 @@ def _process_one_pdf(
     client,
     accumulator: CostAccumulator,
     references: str,
-    stop: threading.Event,
+    stop: StopSignal,
 ) -> dict:
     """Worker task: process one PDF and return renderable artifacts."""
-    if config.max_cost is not None and accumulator.total_cost >= config.max_cost:
-        stop.set()
+    stop.check_budget(accumulator, config.max_cost)
     if stop.is_set():
         raise _Stopped
     logger.info("  Processing [%d/%d]: %s", run_idx, run_total, pdf_path.name)
@@ -247,7 +267,7 @@ def _process_one_pdf(
         )
     except PipelineError as exc:
         if isinstance(exc.cause, QuotaExhausted):
-            stop.set()
+            stop.trip(str(exc.cause))
         raise
     markdown = render_summary(summary)
     return {
@@ -328,8 +348,7 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
 
     show_progress = sys.stderr.isatty()
     run_total = len(jobs)
-    stopped_reason: str | None = None
-    stop = threading.Event()
+    stop = StopSignal()
     executor = ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="worker")
     try:
         futures_to_path = {
@@ -377,15 +396,9 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
                     n_processed += 1
                 except _Stopped:
                     n_skipped += 1
-                    if stopped_reason is None:
-                        stopped_reason = f"--max-cost ${config.max_cost:g} reached"
-                        logger.warning("Stopping: %s", stopped_reason)
                 except Exception as exc:
                     if isinstance(getattr(exc, "cause", None), QuotaExhausted):
                         n_skipped += 1
-                        if stopped_reason is None:
-                            stopped_reason = str(exc.cause)
-                            logger.warning("Stopping: %s", stopped_reason)
                         continue
                     logger.error("  [%d/%d] Failed: %s", run_idx, run_total, exc)
                     n_failed += 1
@@ -411,5 +424,5 @@ def run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
         total_cost=accumulator.total_cost,
         input_tokens=accumulator.total_input_tokens,
         output_tokens=accumulator.total_output_tokens,
-        stopped_reason=stopped_reason,
+        stopped_reason=stop.reason,
     )

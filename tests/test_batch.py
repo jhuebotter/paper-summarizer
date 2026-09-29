@@ -662,7 +662,7 @@ def test_quota_exhaustion_stops_the_batch_without_failing_papers(tmp_path, confi
     assert report.stopped_reason == "free-models-per-day"
     assert (report.processed, report.failed) == (1, 0)
     assert report.skipped == 3
-    assert len(calls) <= 3  # queued papers were cancelled, not all attempted
+    assert len(calls) == 2  # the rest never started
     assert len(load_processed_index(config.output_dir)) == 1
 
 
@@ -675,7 +675,7 @@ def test_max_cost_stops_starting_new_papers(tmp_path, config):
     config.max_cost = 0.01
 
     def fake_process(pdf_path, config, client, accumulator, references):
-        accumulator.add(UsageStats(), 0.006)
+        accumulator.add(UsageStats(), 0.005)
         return _make_summary(pdf_path.stem)
 
     with (
@@ -686,5 +686,28 @@ def test_max_cost_stops_starting_new_papers(tmp_path, config):
         report = run_batch(tmp_path, config)
 
     assert report.stopped_reason == "--max-cost $0.01 reached"
-    assert report.processed + report.skipped == 4
-    assert 2 <= report.processed <= 3  # stops after the budget is crossed (+ one in flight)
+    assert (report.processed, report.skipped) == (2, 2)  # 0.005 + 0.005 reaches 0.01
+
+
+def test_stop_signal_keeps_first_reason_and_quota_race_is_safe(tmp_path, config):
+    """Regression: a _Stopped seen before the quota error crashed on max_cost=None."""
+    from summarizer.batch import StopSignal
+
+    stop = StopSignal()
+    stop.trip("daily cap")
+    stop.trip("--max-cost $1 reached")
+    assert stop.reason == "daily cap"
+
+    for i in range(3):
+        (tmp_path / f"p{i}.pdf").write_bytes(b"%PDF")
+    config.workers = 2
+    with (
+        patch("summarizer.batch.create_client"),
+        patch(
+            "summarizer.batch.process_pdf",
+            side_effect=lambda p, *a, **k: (_ for _ in ()).throw(_quota_error(p)),
+        ),
+    ):
+        report = run_batch(tmp_path, config)
+    assert report.stopped_reason == "free-models-per-day"
+    assert (report.processed, report.failed, report.skipped) == (0, 0, 3)

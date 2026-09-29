@@ -578,12 +578,51 @@ def test_fit_to_context_cuts_for_small_context_models(config):
 
     refs = "R" * 3000
     overhead = len(build_combined_prompt("", refs, "x.pdf")) // 3
-    context = overhead + 16_000 + 100  # room for 100 tokens of paper
-    assert len(fit_to_context("p" * 10_000, refs, "x.pdf", context, config)) == 300
+    context = overhead + 16_000 + 1000  # room for 1000 tokens (3000 chars) of paper
+    assert len(fit_to_context("p" * 10_000, refs, "x.pdf", context, config)) == 3000
     assert fit_to_context("p" * 10_000, refs, "x.pdf", 0, config) == "p" * 10_000
     assert fit_to_context("p" * 10, refs, "x.pdf", MagicMock(), config) == "p" * 10
-    with pytest.raises(ValueError, match="exceeds"):
-        fit_to_context("p", refs, "x.pdf", overhead, config)
+
+
+def test_fit_to_context_reserve_follows_max_output_tokens(config):
+    from dataclasses import replace
+
+    from summarizer.pipeline import build_combined_prompt, fit_to_context
+
+    refs = "R" * 3000
+    overhead = len(build_combined_prompt("", refs, "x.pdf")) // 3
+    small_reply = replace(config, max_output_tokens=4000)
+    context = overhead + 4000 + 1000
+    assert len(fit_to_context("p" * 4000, refs, "x.pdf", context, small_reply)) == 3000
+
+
+def test_fit_to_context_refuses_when_under_20_percent_fits(config):
+    from summarizer.pipeline import build_combined_prompt, fit_to_context
+
+    refs = "R" * 3000
+    overhead = len(build_combined_prompt("", refs, "x.pdf")) // 3
+    context = overhead + 16_000 + 100  # 300 chars of 10,000
+    with pytest.raises(ValueError, match="use a larger model"):
+        fit_to_context("p" * 10_000, refs, "x.pdf", context, config)
+
+
+def test_process_pdf_prompt_contains_only_the_fitted_text(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    from summarizer.pipeline import build_combined_prompt
+    from summarizer.prompts import load_references
+
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    mock_client = MagicMock()
+    mock_client.complete.return_value = MagicMock(text=json.dumps(combined))
+    overhead = (
+        len(build_combined_prompt("", load_references(config.skill_data_dir), fake_pdf.name)) // 3
+    )
+    mock_client.pricing = ModelPricing(context_length=overhead + 16_000 + 1000)  # 3000 chars
+    with _mock_parse("A" * 3000 + "B" * 3000):
+        process_pdf(fake_pdf, config, client=mock_client)
+    prompt = mock_client.complete.call_args.args[0]
+    assert "A" * 3000 in prompt and "B" * 3000 not in prompt
 
 
 def test_process_pdf_passes_strip_references_to_parser(

@@ -488,21 +488,79 @@ def test_preflight_rejects_structured_output_for_unsupported_model(monkeypatch):
         _check_openrouter_config(_or_config(structured_output=True))  # no exit
 
 
-def test_preflight_warns_about_free_tier_daily_cap(monkeypatch, caplog):
+@pytest.mark.parametrize("model,warned", [("meta/m:free", True), ("meta/m", False)])
+def test_key_info_warns_about_free_tier_daily_cap(monkeypatch, caplog, model, warned):
     import logging
 
-    from summarizer.cli import _check_openrouter_config
+    from summarizer.cli import _log_key_info
 
     monkeypatch.setenv("LLM_API_KEY", "k")
     info = {"usage": 0.0, "limit": None, "limit_remaining": None, "is_free_tier": True}
-    config = Config(base_url="https://openrouter.ai/api/v1", model="meta/some-model:free")
     with (
-        patch("summarizer.cli.fetch_openrouter_models", return_value=[{"id": config.model}]),
         patch("summarizer.cli.fetch_openrouter_key_info", return_value=info),
         caplog.at_level(logging.INFO, logger="summarizer.cli"),
     ):
-        _check_openrouter_config(config)
-    assert any("50 requests/day" in r.message for r in caplog.records)
+        _log_key_info(Config(base_url="https://openrouter.ai/api/v1", model=model))
+    assert any("50 requests/day" in r.message for r in caplog.records) is warned
+
+
+def test_structured_output_preflight_with_routing_suffix(monkeypatch):
+    from summarizer.cli import _check_openrouter_config
+
+    monkeypatch.setenv("LLM_API_KEY", "k")
+    models = [{"id": "a/b", "supported_parameters": ["structured_outputs"]}]
+    config = Config(
+        base_url="https://openrouter.ai/api/v1", model="a/b:nitro", structured_output=True
+    )
+    with patch("summarizer.cli.fetch_openrouter_models", return_value=models):
+        _check_openrouter_config(config)  # no exit
+
+
+def test_eval_flags_propagate(tmp_path):
+    (tmp_path / "p.pdf").write_bytes(b"%PDF")
+    with (
+        patch("summarizer.cli._check_backend"),
+        patch("summarizer.cli._check_openrouter_config"),
+        patch("summarizer.cli.run_eval", return_value=([], None)) as run,
+    ):
+        main(
+            [
+                "eval",
+                "--source",
+                str(tmp_path),
+                "--extractors",
+                "pypdf",
+                "--no-strip-references",
+                "--max-cost",
+                "0.5",
+                "--out",
+                str(tmp_path / "run"),
+            ]
+        )
+    config = run.call_args.args[1]
+    assert (config.strip_references, config.max_cost) == (False, 0.5)
+
+
+def test_stopped_eval_exits_1(tmp_path):
+    (tmp_path / "p.pdf").write_bytes(b"%PDF")
+    with (
+        patch("summarizer.cli._check_backend"),
+        patch("summarizer.cli._check_openrouter_config"),
+        patch("summarizer.cli.run_eval", return_value=([], "daily cap")),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main(
+            [
+                "eval",
+                "--source",
+                str(tmp_path),
+                "--extractors",
+                "pypdf",
+                "--out",
+                str(tmp_path / "r"),
+            ]
+        )
+    assert exc_info.value.code == 1
 
 
 def test_stopped_run_exits_1(caplog):

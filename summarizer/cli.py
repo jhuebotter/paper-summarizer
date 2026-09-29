@@ -102,6 +102,7 @@ def main(argv: list[str] | None = None) -> None:
     if not args.dry_run:
         _check_backend(config.base_url)
         _check_openrouter_config(config)
+        _log_key_info(config)
 
     try:
         if args.file:
@@ -174,15 +175,17 @@ def _eval_main(argv: list[str]) -> None:
         workers=args.workers,
         strip_references=args.strip_references,
         structured_output=args.structured_output,
+        max_cost=args.max_cost,
     )
     _check_backend(config.base_url)
     for model in models:
         _check_openrouter_config(replace(config, model=model))
+    _log_key_info(config)
     setup_logging(verbose=args.verbose, log_file=Path(args.log_file or out_dir / "eval.log"))
 
     configs = [EvalConfig(model=m, extractor=e) for m in models for e in extractors]
     try:
-        run_eval(
+        _, stopped_reason = run_eval(
             pdfs,
             config,
             configs,
@@ -194,6 +197,9 @@ def _eval_main(argv: list[str]) -> None:
         logger.warning("Interrupted; rerun with the same --cache-dir to resume cheaply.")
         sys.exit(130)
     logger.info("Report: %s", out_dir / "report.md")
+    if stopped_reason:
+        logger.warning("Stopped early (%s); rerun later to finish.", stopped_reason)
+        sys.exit(1)
 
 
 def _build_eval_parser() -> argparse.ArgumentParser:
@@ -356,11 +362,13 @@ def _check_openrouter_config(config: Config) -> None:
         ):
             logger.error("Model %r does not support --structured-output.", config.model)
             sys.exit(1)
-    _log_key_info(config, api_key)
 
 
-def _log_key_info(config: Config, api_key: str) -> None:
+def _log_key_info(config: Config) -> None:
     """Log the OpenRouter key's spend and limits; warn about the free-model daily cap."""
+    api_key = config.api_key or os.environ.get("LLM_API_KEY")
+    if not is_openrouter(config.base_url) or not api_key:
+        return
     info = fetch_openrouter_key_info(config.base_url, api_key)
     if info is None:
         return
@@ -372,8 +380,8 @@ def _log_key_info(config: Config, api_key: str) -> None:
     )
     if info.get("is_free_tier") and config.model.endswith(":free"):
         logger.warning(
-            "Free-tier key: free models allow 50 requests/day (~35 papers with repairs); "
-            "the run stops cleanly at the cap. $10 of credits raises it to 1,000/day."
+            "Free-tier key: free models allow 50 requests/day; the run stops cleanly at the "
+            "cap. $10 of credits raises it to 1,000/day."
         )
 
 
@@ -449,16 +457,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_default_model,
         help=f"LLM model identifier (default: LLM_MODEL env var, currently {_default_model!r}).",
     )
-    parser.add_argument(
-        "--max-cost",
-        metavar="USD",
-        type=float,
-        default=None,
-        help=(
-            "Stop starting new papers once this much has been spent (papers already "
-            "running still finish)."
-        ),
-    )
     _add_backend_args(parser, log_default="logs/run_TIMESTAMP.log")
     return parser
 
@@ -529,6 +527,16 @@ def _add_backend_args(parser: argparse.ArgumentParser, log_default: str) -> None
             "Maximum tokens the LLM may generate per call. "
             "Default: no limit (model stops on its own). "
             "Set when the backend enforces a cap or to bound cost."
+        ),
+    )
+    parser.add_argument(
+        "--max-cost",
+        metavar="USD",
+        type=float,
+        default=None,
+        help=(
+            "Stop starting new papers once this much has been spent (papers already "
+            "running still finish)."
         ),
     )
     parser.add_argument(

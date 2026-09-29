@@ -86,29 +86,37 @@ def parse_pdf(
 # ---------------------------------------------------------------------------
 
 _REFERENCE_HEADING = re.compile(
-    r"^[ \t]*(?:#{1,6}[ \t]*)?(?:\d+\.?[ \t]*)?(?:\*\*)?"
-    r"(?:references|bibliography|literature cited|works cited|reference list)"
-    r"(?:\*\*)?[ \t]*:?[ \t]*$",
+    r"^[ \t]*(?:#{1,6}[ \t]*)?(?:(?:\d+|[IVXLC]+)[ \t]*\.?[ \t]*)?(?:\*\*)?"
+    r"(?:references(?:[ \t]+(?:and[ \t]+notes|cited))?|bibliography|literature(?:[ \t]+cited)?"
+    r"|works[ \t]+cited|reference[ \t]+list)"
+    r"(?:\*\*)?[ \t]*:?[ \t]*#*[ \t]*$",
     re.I | re.M,
 )
 _MARKDOWN_HEADING = re.compile(r"^#{1,6}[ \t]+\S", re.M)
+# Sections that commonly follow the reference list in plain (pypdf) text.
+_PLAIN_SECTION_AFTER = re.compile(
+    r"^[ \t]*(?:[A-Z]\.?|\d+\.?)?[ \t]*(?:appendix|appendices|supplementary|supplemental"
+    r"|(?:online[ \t]+)?methods|materials[ \t]+and[ \t]+methods|acknowledg(?:e)?ments?)\b.{0,80}$",
+    re.I | re.M,
+)
 
 
 def strip_reference_section(text: str, name: str = "") -> str:
     """Remove the References/Bibliography section.
 
     Takes the last heading-only line named References (or a variant) in the
-    second half of the text and cuts to the next markdown heading (docling keeps
-    appendices after the references), or to the end of the text (pypdf output
-    has no headings, so appendices after the references are dropped too).
-    Text without such a heading is returned unchanged.
+    second half of the text and cuts to the next markdown heading, or, in
+    plain text without markdown headings, to the next Appendix / Supplementary /
+    Methods / Acknowledgements line, or to the end.  Text without such a heading
+    is returned unchanged.
     """
     matches = [m for m in _REFERENCE_HEADING.finditer(text) if m.start() >= len(text) / 2]
     if not matches:
         return text
     start = matches[-1].start()
-    next_heading = _MARKDOWN_HEADING.search(text, matches[-1].end())
-    end = next_heading.start() if next_heading else len(text)
+    following = _MARKDOWN_HEADING if _MARKDOWN_HEADING.search(text) else _PLAIN_SECTION_AFTER
+    next_section = following.search(text, matches[-1].end())
+    end = next_section.start() if next_section else len(text)
     logger.info(
         "Removed reference section of %s (%s chars)", name or "document", f"{end - start:,}"
     )
