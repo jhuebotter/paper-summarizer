@@ -208,7 +208,7 @@ def test_call_llm_raises_llm_error_on_complete_failure():
 
 
 def test_call_llm_retries_on_429_then_succeeds():
-    """429 responses are retried with backoff, then succeed."""
+    """429s without a reset hint (free models throttled upstream) back off from 5 s."""
     data = {"ok": True}
     mock_client = MagicMock()
     mock_client.complete.side_effect = [
@@ -224,7 +224,7 @@ def test_call_llm_retries_on_429_then_succeeds():
 
     assert result == data
     assert mock_client.complete.call_count == 2
-    mock_sleep.assert_called_once_with(1.0)
+    mock_sleep.assert_called_once_with(5.0)
 
 
 def test_call_llm_retries_on_5xx_then_succeeds():
@@ -861,9 +861,10 @@ def test_provider_error_in_a_200_response_is_retried(finish_reason):
     with _client_returning(_provider_failure(502, finish_reason)) as (client, mock_openai):
         create = mock_openai.return_value.chat.completions.create
         create.side_effect = [_provider_failure(502, finish_reason), _sdk_response('{"ok": 1}')]
-        with patch("summarizer.llm.time.sleep"):
+        with patch("summarizer.llm.time.sleep") as sleep:
             assert call_llm(client, "prompt") == {"ok": 1}
     assert create.call_count == 2
+    sleep.assert_called_once()  # backs off like any transient error
 
 
 def test_non_transient_provider_error_is_not_retried_and_reports_the_reason():
@@ -1191,7 +1192,7 @@ def test_long_retry_after_falls_back_to_backoff():
 
     exc = _api_error(429)
     exc.response = MagicMock(headers={"retry-after": "3600"})
-    assert _retry_delay_seconds(1, exc) <= 1.5
+    assert 2.5 <= _retry_delay_seconds(1, exc) <= 7.5  # the 429 backoff, not the hour
 
 
 def test_quota_during_json_repair_propagates():

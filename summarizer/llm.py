@@ -621,6 +621,7 @@ def _complete_with_retries(client: LLMClient, prompt: str) -> CompletionResponse
         except ProviderError as exc:
             if attempt >= attempts or not exc.retryable:
                 raise
+            error = exc
         except LLMError:
             raise
         except Exception as exc:
@@ -629,16 +630,17 @@ def _complete_with_retries(client: LLMClient, prompt: str) -> CompletionResponse
                 raise QuotaExhausted(quota) from exc
             if attempt >= attempts or not _is_retryable_status_error(exc):
                 raise LLMError(f"LLM call failed: {exc}") from exc
+            error = exc
 
-            delay_s = _retry_delay_seconds(attempt, exc)
-            logger.warning(
-                "Transient LLM error on attempt %d/%d (%s); retrying in %.1fs",
-                attempt,
-                attempts,
-                exc,
-                delay_s,
-            )
-            time.sleep(delay_s)
+        delay_s = _retry_delay_seconds(attempt, error)
+        logger.warning(
+            "Transient LLM error on attempt %d/%d (%s); retrying in %.1fs",
+            attempt,
+            attempts,
+            error,
+            delay_s,
+        )
+        time.sleep(delay_s)
 
     raise LLMError("LLM call failed after retries")
 
@@ -646,7 +648,8 @@ def _complete_with_retries(client: LLMClient, prompt: str) -> CompletionResponse
 def _retry_delay_seconds(attempt: int, exc: Exception | None = None) -> float:
     """Wait for a short ``Retry-After`` or rate-limit reset, else jittered exponential backoff.
 
-    OpenRouter's per-minute 429s carry the reset time (epoch ms) in the error body.
+    OpenRouter's per-minute 429s carry the reset time (epoch ms) in the error body;
+    other 429s (free models throttled upstream) back off from 5 s rather than 1 s.
     """
     response = getattr(exc, "response", None)
     try:
@@ -662,7 +665,8 @@ def _retry_delay_seconds(attempt: int, exc: Exception | None = None) -> float:
             pass
     if retry_after is not None and 0 < retry_after <= 60:
         return retry_after + random.uniform(0, 1)  # spread workers waiting for the same reset
-    return 2 ** (attempt - 1) * random.uniform(0.5, 1.5)
+    base = 5 if exc is not None and _extract_status_code(exc) == 429 else 1
+    return base * 2 ** (attempt - 1) * random.uniform(0.5, 1.5)
 
 
 def _error_details(exc: Exception) -> tuple[str, dict]:
