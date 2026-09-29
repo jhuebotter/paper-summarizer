@@ -35,6 +35,16 @@ def _fresh_converter_cache():
     parser_mod._CONVERTERS.clear()
 
 
+@pytest.fixture(autouse=True)
+def _no_docling_options(request):
+    """Unit tests mock DocumentConverter and must not need docling installed."""
+    if "integration" in request.keywords:
+        yield
+        return
+    with patch("summarizer.parser._pdf_format_options", return_value={}) as options:
+        yield options
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -369,6 +379,21 @@ def test_converter_is_reused_across_pdfs(tmp_path):
         parse_pdf(a, extractor="docling")
         parse_pdf(b, extractor="docling")
     MockConverter.assert_called_once()
+
+
+def test_docling_runs_without_ocr(tmp_path, _no_docling_options):
+    """OCR made docling ~14x slower on born-digital papers for ~0.1% more text."""
+    assert _mocked_parse(tmp_path, "text layer", 10_000, extractor="docling") == "text layer"
+    _no_docling_options.assert_called_once_with(False)
+
+
+def test_docling_retries_with_ocr_when_the_pdf_has_no_text_layer(tmp_path, _no_docling_options):
+    pdf = _fake_pdf(tmp_path)
+    with patch("summarizer.parser.DocumentConverter") as MockConverter:
+        export = MockConverter.return_value.convert.return_value.document.export_to_markdown
+        export.side_effect = ["<!-- image -->\n\n<!-- image -->", "scanned text"]
+        assert parse_pdf(pdf, extractor="docling") == "scanned text"
+    assert [c.args for c in _no_docling_options.call_args_list] == [(False,), (True,)]
 
 
 def test_auto_falls_back_to_pypdf_when_docling_not_installed(tmp_path, caplog):

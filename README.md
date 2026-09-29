@@ -156,7 +156,7 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 - `--source DIR` / `--file PDF`: batch or single-file mode.
 - `--force-summary`: re-summarize papers already in the processed index (keeps the extraction cache).
 - `--reparse`: also re-run extraction (implies `--force-summary`).
-- `--extractor {auto,docling,pypdf}`: `auto` uses docling if installed, falling back to pypdf.
+- `--extractor {auto,docling,pypdf}`: `auto` uses docling if installed, falling back to pypdf. docling runs without OCR (about 1–5 s per paper) and uses OCR only for PDFs with no text layer (scans). pypdf can glue words together on some PDFs; prefer docling.
 - `--output-dir DIR`: output root (default `output_summaries`).
 - `--model`, `--base-url`: backend selection.
 - `--max-chars N`: paper-text budget (default 200,000 ≈ 50k tokens). Longer text is truncated, and a warning is logged. For models with a smaller context window (known from OpenRouter), the text is cut further so the prompt and reply fit.

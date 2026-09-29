@@ -275,7 +275,16 @@ def _docling_converter_class():
     return DocumentConverter
 
 
-def _get_converter():
+def _pdf_format_options(ocr: bool) -> dict:
+    """docling PDF options; OCR is ~10x slower and adds little on born-digital PDFs."""
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.document_converter import PdfFormatOption
+
+    return {InputFormat.PDF: PdfFormatOption(pipeline_options=PdfPipelineOptions(do_ocr=ocr))}
+
+
+def _get_converter(ocr: bool = False):
     """Return a process-wide converter; building one loads docling's models.
 
     Raises:
@@ -283,13 +292,13 @@ def _get_converter():
             (the failure is remembered, so later papers skip straight to pypdf).
     """
     cls = _docling_converter_class()
-    converter = _CONVERTERS.get(cls)
+    converter = _CONVERTERS.get((cls, ocr))
     if converter is None:
         try:
-            converter = cls()
+            converter = cls(format_options=_pdf_format_options(ocr))
         except Exception as exc:
             converter = DoclingUnavailable(f"docling failed to start: {exc}")
-        _CONVERTERS[cls] = converter
+        _CONVERTERS[(cls, ocr)] = converter
     if isinstance(converter, DoclingUnavailable):
         raise converter
     return converter
@@ -298,20 +307,28 @@ def _get_converter():
 def _run_docling(pdf_path: Path) -> str:
     """Run docling on *pdf_path* and return the full markdown string.
 
-    Calls are serialized: docling is not reliably thread-safe under parallel
-    batch runs, while LLM calls stay parallel.
+    OCR runs only when the PDF has no text layer (a scan).  Calls are
+    serialized: docling is not reliably thread-safe under parallel batch runs,
+    while LLM calls stay parallel.
 
     Raises:
         DoclingUnavailable: if docling is not installed.
         ParseError: wrapping any exception raised by docling.
     """
     with _DOCLING_LOCK:
-        converter = _get_converter()
-        try:
-            result = converter.convert(str(pdf_path))
-            return result.document.export_to_markdown()
-        except Exception as e:
-            raise ParseError(f"Failed to parse {pdf_path}: {e}") from e
+        text = _convert(pdf_path, ocr=False)
+        if not re.search(r"\w", text.replace("<!-- image -->", "")):
+            logger.info("No text layer in %s; retrying with OCR", pdf_path.name)
+            text = _convert(pdf_path, ocr=True)
+        return text
+
+
+def _convert(pdf_path: Path, ocr: bool) -> str:
+    converter = _get_converter(ocr)
+    try:
+        return converter.convert(str(pdf_path)).document.export_to_markdown()
+    except Exception as e:
+        raise ParseError(f"Failed to parse {pdf_path}: {e}") from e
 
 
 def _extract_text_with_pypdf(pdf_path: Path) -> str:
