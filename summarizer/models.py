@@ -6,9 +6,10 @@ data that flows through the pipeline — validation of LLM output, batch
 reporting, and runtime configuration.
 """
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, get_args, get_origin
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -162,6 +163,95 @@ SummaryPart1 = Annotated[
 # Part 2 (SNN extraction fields)
 # ---------------------------------------------------------------------------
 
+InferenceHardware = Literal[
+    "CPU/GPU", "Neuromorphic emulator/SDK", "Physical neuromorphic chip", "not reported"
+]
+Architecture = Literal["fully spiking", "hybrid", "not reported"]
+CreditAssignment = Literal[
+    "Global", "Semi-local", "Local", "Analytical", "Hybrid", "Not applicable", "not reported"
+]
+LearningRegime = Literal["Offline", "Online", "Mixed", "not applicable", "not reported"]
+ParadigmFamily = Literal[
+    "Gradient-based (surrogate gradient BPTT)",
+    "Gradient-based (online approximation: e-prop/FPTT/OSTL)",
+    "ANN-to-SNN conversion",
+    "Predictive coding / prediction error learning",
+    "Reinforcement learning (model-free)",
+    "Reinforcement learning (model-based)",
+    "Local plasticity (STDP / R-STDP / three-factor)",
+    "Homeostatic / intrinsic plasticity (auxiliary)",
+    "Evolutionary / black-box optimization",
+    "Analytical / closed-form (NEF / reservoir / control law)",
+    "Hybrid / multi-phase",
+]
+
+
+def _canonical_key(value: str) -> str:
+    return re.sub(r"\s*/\s*", "/", re.sub(r"\s+", " ", value.strip())).casefold()
+
+
+def labels(annotation: object) -> tuple[str, ...]:
+    """Allowed labels of a ``Literal`` or ``list[Literal]`` annotation."""
+    if get_origin(annotation) is list:
+        annotation = get_args(annotation)[0]
+    return get_args(annotation)
+
+
+_NOT_APPLICABLE = {"not applicable", "n/a", "na", "none"}
+
+
+class Classification(BaseModel):
+    """Typed labels from the controlled vocabularies in the prompt references.
+
+    These are the columns for comparison tables and gold-label scoring.  Values
+    are matched case- and whitespace-insensitively to the allowed labels;
+    "not applicable" becomes "not reported" where a field has no such label,
+    and ``paradigm_families`` tolerates a bare string, null, placeholders and
+    duplicates.
+    """
+
+    inference_hardware: InferenceHardware
+    architecture: Architecture
+    credit_assignment: CreditAssignment
+    learning_regime: LearningRegime
+    paradigm_families: list[ParadigmFamily]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _canonicalize(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        for name, field in cls.model_fields.items():
+            allowed = {_canonical_key(label): label for label in labels(field.annotation)}
+
+            def canonical(value: object, allowed: dict = allowed) -> object:
+                if not isinstance(value, str):
+                    return value
+                key = _canonical_key(value)
+                if key in _NOT_APPLICABLE and key not in allowed:
+                    key = "not reported"
+                return allowed.get(key, value)
+
+            value = data.get(name)
+            if name == "paradigm_families":
+                items = [] if value is None else [value] if isinstance(value, str) else value
+                if isinstance(items, list):
+                    kept = [canonical(v) for v in items]
+                    kept = [
+                        v
+                        for v in kept
+                        if not (
+                            isinstance(v, str)
+                            and _canonical_key(v) in _NOT_APPLICABLE | {"not reported"}
+                        )
+                    ]
+                    hashable = all(isinstance(v, str) for v in kept)
+                    data[name] = list(dict.fromkeys(kept)) if hashable else kept
+            else:
+                data[name] = canonical(value)
+        return data
+
 
 class SummaryPart2(BaseModel):
     """Structured extraction of SNN-specific technical fields.
@@ -192,6 +282,7 @@ class SummaryPart2(BaseModel):
     data_collection: str
     key_training_details: str
     comparison_to_baselines: str
+    classification: Classification
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +334,28 @@ class LLMResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class Provenance(BaseModel):
+    """How a summary was produced; stored in its JSON sidecar."""
+
+    schema_version: int = 1
+    created_at: str
+    git_commit: str | None
+    pdf_sha256: str
+    source_path: str
+    extractor: str
+    chars_full: int  # after reference stripping
+    chars_sent: int
+    model: str
+    base_url: str
+    references_sha256: str
+    calls: int
+    json_repairs: int
+    schema_repairs: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+
+
 class PaperSummary(BaseModel):
     """The complete validated output for one paper, composed of all three parts.
 
@@ -257,6 +370,7 @@ class PaperSummary(BaseModel):
     metadata: PaperMetadata
     part1: SummaryPart1
     part2: SummaryPart2 | None
+    provenance: Provenance | None = None
 
 
 # ---------------------------------------------------------------------------

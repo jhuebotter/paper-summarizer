@@ -28,19 +28,23 @@ uv run summarize-papers --source input_papers
 
 ## What it does
 
-- Extracts PDF text with [docling](https://github.com/docling-project/docling) (optional extra, better layout/tables) or pypdf, and caches it next to the PDF.
+- Extracts PDF text with [docling](https://github.com/docling-project/docling) (optional extra, better layout/tables) or pypdf, and caches it in `~/.cache/paper-summarizer/` (or `$XDG_CACHE_HOME/paper-summarizer/`), keyed by the PDF's content.
 - Sends one combined prompt per paper (bibliographic metadata + Part 1 summary + Part 2 SNN-control extraction) and asks for a single JSON object.
 - Validates the JSON with pydantic. Syntax errors get one repair call; schema errors get up to two repair calls, which resend the paper text only when content is missing.
 - Sorts papers into `primary` (new experiments/methods), `synthesis` (reviews, surveys, perspectives, commentaries, …) or `non_research`.
+- For primary papers, Part 2 also carries typed labels from the reference vocabularies (inference hardware, fully spiking vs hybrid, credit assignment, learning regime, paradigm families), ready for comparison tables.
+- Writes each summary as markdown plus a JSON sidecar with the validated data and its provenance (model, extractor, text length sent, tokens, cost, commit).
 - Processes batches in parallel, skips papers it has already done, and reports token totals and cost (priced from OpenRouter's live model list).
 
 ## Typical workflow
 
 1. Discover PDFs under `--source` (recursive, `.pdf` in any case) or take one `--file`.
-2. Extract text, or reuse the cache `<pdf_stem>.<extractor>.md` next to the PDF.
+2. Extract text, or reuse the cache `<sha256>.<extractor>.md`; drop the reference section (`--strip-references`, on by default).
 3. Build the prompt from `skill_data/references/*.md` (~11k tokens) plus the paper text (up to `--max-chars`).
 4. Call the backend; validate and repair the JSON; render markdown.
-5. Write `output_summaries/<paper_type>/<citation_key>_summary.md` (versioned `_v2`, `_v3`, … instead of overwriting) and record it in `output_summaries/processed.jsonl`.
+5. Write `output_summaries/<paper_type>/<citation_key>_summary.md` and `.json` (versioned `_v2`, `_v3`, … instead of overwriting) and record the paper in `output_summaries/processed.jsonl`.
+
+`summarize-papers render [--output-dir DIR]` rebuilds every markdown file from its JSON sidecar without any LLM calls, e.g. after changing the template.
 
 ## Data prep: collect PDFs from nested libraries
 
@@ -104,6 +108,16 @@ The authors train a recurrent LIF controller with surrogate-gradient BPTT on a s
 
 ## Part 2: SNN Control Extraction
 
+### Classification
+
+**Inference hardware:** CPU/GPU
+**Architecture:** fully spiking
+**Credit assignment:** Global
+**Learning regime:** Offline
+**Paradigm families:** Gradient-based (surrogate gradient BPTT)
+
+### Details
+
 **Neuron model:** LIF (Source: Sec. 3.1)
 
 **Controller hardware (inference):** CPU/GPU
@@ -115,7 +129,7 @@ The authors train a recurrent LIF controller with surrogate-gradient BPTT on a s
 ```text
 .
 ├── input_papers/                 # PDFs to process (gitignored)
-├── output_summaries/             # Summaries by paper type + processed.jsonl (gitignored)
+├── output_summaries/             # Summaries (.md + .json) by paper type, processed.jsonl (gitignored)
 ├── skill_data/references/        # Prompt references: JSON contract, template, field guides
 ├── collect_pdfs.sh               # Flatten nested PDF libraries
 ├── eval/                         # Evaluation papers, gold labels, runs and cache (gitignored)
@@ -157,19 +171,20 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 
 ## Skip and rerun behavior
 
-- Papers listed in `output_summaries/processed.jsonl` (keyed by absolute PDF path) are skipped. A legacy `processed.txt` is still read and migrated on the next save.
-- Extraction caches are per extractor (`<stem>.docling.md`, `<stem>.pypdf.md`). A legacy `<stem>.md` is still honoured by `--extractor auto`.
+- Papers are identified by content (SHA-256): anything in `output_summaries/processed.jsonl` is skipped even after moving or renaming the PDF, and identical copies in one batch are processed once. A changed PDF counts as a new paper. Older index entries (path only, or a legacy `processed.txt`) are migrated when their PDF is next seen, unless the file changed after it was summarized, in which case it is summarized again.
+- Extraction caches are per content and extractor (`<sha256>.docling.md`, `<sha256>.pypdf.md`). Caches that earlier versions wrote next to the PDFs are still read unless they are older than the PDF.
 - Failed papers are not recorded, so the next run retries them. The exit code is 1 if any paper failed.
 - Ctrl-C cancels queued papers (exit code 130). Finished papers are kept and skipped on the next run.
 - A run stopped by a quota or `--max-cost` exits with 1 and says why; rerunning continues where it stopped.
-- Use one run at a time per output directory.
+- One run at a time per output directory: a second run (or `render`) on the same directory exits with an error while the first is running (POSIX; on Windows, don't overlap runs).
+- `render` overwrites the markdown files, including any hand edits; invalid sidecars are reported and skipped.
 
 ## Evaluation
 
 `summarize-papers eval` runs one or more model × extractor configurations over a folder of PDFs and writes a report. It uses its own run directory and never touches `output_summaries/` or the processed index.
 
 ```bash
-mkdir -p eval/papers && cp /path/to/some/papers/*.pdf eval/papers/   # extraction caches are written next to the PDFs
+mkdir -p eval/papers && cp /path/to/some/papers/*.pdf eval/papers/
 uv run summarize-papers eval --source eval/papers --init-gold          # adds unlabelled entries to eval/gold.jsonl
 # optionally fill in labels in eval/gold.jsonl, then:
 uv run summarize-papers eval --source eval/papers --models nvidia/nemotron-3-super-120b-a12b:free,qwen/qwen3.8-27b:free
@@ -186,7 +201,7 @@ Duplicate PDFs (same content) are evaluated once. Successful LLM responses are c
 - A Ctrl-C'd run writes no report; re-run it.
 - Eval uses one worker by default because of free-tier limits.
 
-**Gold labels:** `eval/gold.jsonl` holds one `{"sha256", "file", "labels"}` object per paper. The labels are `is_research_paper`, `paper_type` (`primary`/`synthesis`/`non_research`), `synthesis_subtype`, `year`, `first_author` (surname) and `title`. `null` means not labelled, and the field is skipped.
+**Gold labels:** `eval/gold.jsonl` holds one `{"sha256", "file", "labels"}` object per paper. The labels are `is_research_paper`, `paper_type` (`primary`/`synthesis`/`non_research`), `synthesis_subtype`, `year`, `first_author` (surname), `title`, and the typed Part 2 labels `classification.inference_hardware`, `.architecture`, `.credit_assignment`, `.learning_regime` and `.paradigm_families` (a list; compared as a set). Use the exact labels from `skill_data/references/json-output-contract.md`. `null` means not labelled, and the field is skipped.
 
 **Metrics** (a rate with nothing to count is reported as n/a):
 - **Quotes:** each `citable_snippets` quote is checked against the exact text the model saw, word by word, ignoring punctuation, hyphenation, ligatures and `[12]`-style citations. It counts as verbatim, near (≥70% of its word 3-grams found), or not found. Parts separated by an ellipsis must appear in order, and parts shorter than three words make a quote at best near.
@@ -226,7 +241,7 @@ CI runs lint and tests on Python 3.12–3.14.
 
 ## Roadmap
 
-- Structured JSON outputs next to each summary, content-hash paper identity, DOI-based metadata.
+- Metadata from the Zotero library (Better BibTeX citation keys) instead of the LLM.
 - Leaner, type-specific prompts (and choosing the `--structured-output` default from evaluation results).
 - Decision models, i.e. fast classifiers that return calibrated probabilities (e.g. TypeSafe's Jev, or local models via Ollaya), for screening, typed field extraction and cross-checks.
 - Domain profiles, so the research field is hot-swappable.

@@ -3,9 +3,10 @@
 Entry point: ``summarize-papers`` (configured in ``pyproject.toml``).
 
 Usage:
-    summarize-papers --source DIR [options]   # batch mode
-    summarize-papers --file PDF [options]     # single-file mode
-    summarize-papers eval --source DIR ...    # evaluation (see evaluation.py)
+    summarize-papers --source DIR [options]     # batch mode
+    summarize-papers --file PDF [options]       # single-file mode
+    summarize-papers eval --source DIR ...      # evaluation (see evaluation.py)
+    summarize-papers render [--output-dir DIR]  # re-render markdown from JSON sidecars
 
 ``--source`` and ``--file`` are mutually exclusive; exactly one must be supplied.
 ``--reparse`` implies ``--force-summary``.
@@ -32,7 +33,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from summarizer.batch import find_pdfs, load_processed_index, run_batch, run_pdfs, should_skip
+from summarizer.batch import OutputDirLocked, find_pdfs, render_all, run_batch, run_pdfs
 from summarizer.evaluation import EvalConfig, init_gold, run_eval
 from summarizer.llm import (
     fetch_openrouter_key_info,
@@ -72,6 +73,9 @@ def main(argv: list[str] | None = None) -> None:
     if argv[:1] == ["eval"]:
         _eval_main(argv[1:])
         return
+    if argv[:1] == ["render"]:
+        _render_main(argv[1:])
+        return
 
     args = _build_parser().parse_args(argv)
     setup_logging(verbose=args.verbose, log_file=_log_file(args.log_file))
@@ -109,6 +113,9 @@ def main(argv: list[str] | None = None) -> None:
             _run_single(Path(args.file), config)
         else:
             _run_batch(Path(args.source), config)
+    except OutputDirLocked as exc:
+        logger.error("%s; wait for it to finish or use another --output-dir.", exc)
+        sys.exit(1)
     except KeyboardInterrupt:
         logger.warning(
             "Interrupted: queued papers were cancelled; finished papers are saved and "
@@ -121,6 +128,40 @@ def _log_file(log_file: str | None) -> Path:
     if log_file:
         return Path(log_file)
     return Path("logs") / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+
+# ---------------------------------------------------------------------------
+# Render mode
+# ---------------------------------------------------------------------------
+
+
+def _render_main(argv: list[str]) -> None:
+    """``summarize-papers render``: rebuild markdown from the JSON sidecars."""
+    parser = argparse.ArgumentParser(
+        prog="summarize-papers render",
+        description="Re-render every summary's markdown from its JSON sidecar (no LLM calls).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        metavar="DIR",
+        default="output_summaries",
+        help="Summary output root (default: output_summaries).",
+    )
+    args = parser.parse_args(argv)
+    setup_logging(verbose=False, log_file=None)
+    output_dir = Path(args.output_dir)
+    if not output_dir.is_dir():
+        logger.error("Not a directory: %s", output_dir)
+        sys.exit(1)
+    try:
+        rendered, failed = render_all(output_dir)
+    except OutputDirLocked as exc:
+        logger.error("%s; wait for it to finish.", exc)
+        sys.exit(1)
+    logger.info("Re-rendered %d summaries in %s", rendered, output_dir)
+    if failed:
+        logger.error("%d sidecar(s) could not be rendered (see above)", failed)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -262,15 +303,6 @@ def _run_single(pdf_path: Path, config: Config) -> None:
     if not pdf_path.is_file():
         logger.error("File not found: %s", pdf_path)
         sys.exit(1)
-
-    processed = load_processed_index(config.output_dir)
-    if should_skip(pdf_path, processed, config.force_summary):
-        logger.info(
-            "Already processed: %s (use --force-summary to reprocess)",
-            pdf_path.name,
-        )
-        sys.exit(0)
-
     _report_and_exit(run_pdfs([pdf_path], config))
 
 
@@ -405,7 +437,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "server such as LM Studio). Processes a directory of PDFs (--source) "
             "or a single PDF (--file)."
         ),
-        epilog="Evaluate models/extractors on a set of PDFs: summarize-papers eval --help",
+        epilog=(
+            "Other commands: summarize-papers eval --help (evaluate models/extractors), "
+            "summarize-papers render --help (re-render markdown from JSON)."
+        ),
     )
 
     source_group = parser.add_mutually_exclusive_group(required=True)

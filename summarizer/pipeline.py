@@ -4,10 +4,13 @@ Single LLM call per paper: metadata + Part 1 + Part 2 are requested
 in one combined JSON response.
 """
 
+import functools
 import json
 import logging
 import re
+import subprocess
 import unicodedata
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -18,11 +21,12 @@ from summarizer.models import (
     LLMResponse,
     PaperSummary,
     PipelineError,
+    Provenance,
     SummaryPart1Synthesis,
     SummaryPart2,
 )
-from summarizer.parser import parse_pdf
-from summarizer.prompts import build_combined_prompt, load_references
+from summarizer.parser import load_text, truncate_text
+from summarizer.prompts import build_combined_prompt, load_references, references_digest
 
 logger = logging.getLogger(__name__)
 
@@ -80,23 +84,26 @@ def _run_pipeline(
     accumulator: "CostAccumulator | None" = None,
     references: str | None = None,
 ) -> PaperSummary:
-    # Step 1: parse PDF → markdown (uses cache if available)
-    paper_text = parse_pdf(
+    # Step 1: extract text (cached), cut it to the budget and the model's context
+    parsed = load_text(
         pdf_path,
-        config.max_chars,
-        reparse=config.reparse,
         extractor=config.extractor,
+        reparse=config.reparse,
         strip_references=config.strip_references,
     )
-
-    # Step 2: load references and build combined prompt
     if references is None:
         references = load_references(config.skill_data_dir)
     if client is None:
         client = create_client(config)
     paper_text = fit_to_context(
-        paper_text, references, pdf_path.name, client.pricing.context_length, config
+        truncate_text(parsed.text, config.max_chars, pdf_path.name),
+        references,
+        pdf_path.name,
+        client.pricing.context_length,
+        config,
     )
+
+    # Step 2: build the combined prompt
     prompt = build_combined_prompt(
         paper_text=paper_text,
         references=references,
@@ -108,18 +115,58 @@ def _run_pipeline(
         f"{len(prompt) // 4:,}",
     )
 
-    # Step 3: single LLM call → parse and validate
-    raw = call_llm(client, prompt, accumulator=accumulator)
+    # Step 3: single LLM call → parse and validate (per-paper totals feed the caller's)
+    paper_cost = CostAccumulator(parent=accumulator)
+    raw = call_llm(client, prompt, accumulator=paper_cost)
     response = _validate_with_schema_repair(
         raw=raw,
         client=client,
         original_prompt=prompt,
         pdf_path=pdf_path,
-        accumulator=accumulator,
+        accumulator=paper_cost,
         contract=_load_contract(config.skill_data_dir),
     )
 
-    return PaperSummary(metadata=response.metadata, part1=response.part1, part2=response.part2)
+    provenance = Provenance(
+        created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+        git_commit=git_commit(),
+        pdf_sha256=parsed.sha256,
+        source_path=str(pdf_path.resolve()),
+        extractor=parsed.extractor,
+        chars_full=len(parsed.text),
+        chars_sent=len(paper_text),
+        model=config.model,
+        base_url=config.base_url,
+        references_sha256=references_digest(references),
+        calls=paper_cost.calls,
+        json_repairs=paper_cost.json_repairs,
+        schema_repairs=paper_cost.schema_repairs,
+        input_tokens=paper_cost.total_input_tokens,
+        output_tokens=paper_cost.total_output_tokens,
+        cost_usd=paper_cost.total_cost,
+    )
+    return PaperSummary(
+        metadata=response.metadata,
+        part1=response.part1,
+        part2=response.part2,
+        provenance=provenance,
+    )
+
+
+@functools.cache
+def git_commit() -> str | None:
+    """Short commit hash of the checkout this code runs from, if any."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return out.stdout.strip() or None
+    except (OSError, subprocess.CalledProcessError):
+        return None
 
 
 def fit_to_context(

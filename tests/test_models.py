@@ -368,3 +368,100 @@ def test_llm_response_invalid_metadata_rejected(mock_part2_dict):
             part1={"paper_type": "primary", "tldr": "x"},
             part2=mock_part2_dict,
         )
+
+
+# ---------------------------------------------------------------------------
+# Classification (typed Part 2 labels)
+# ---------------------------------------------------------------------------
+
+
+def test_classification_labels_are_matched_leniently():
+    from summarizer.models import Classification
+
+    c = Classification(
+        inference_hardware="cpu / gpu",
+        architecture="Fully  Spiking",
+        credit_assignment="semi-local",
+        learning_regime="ONLINE",
+        paradigm_families=["reinforcement learning (model-free)", "Hybrid/multi-phase"],
+    )
+    assert c.model_dump() == {
+        "inference_hardware": "CPU/GPU",
+        "architecture": "fully spiking",
+        "credit_assignment": "Semi-local",
+        "learning_regime": "Online",
+        "paradigm_families": ["Reinforcement learning (model-free)", "Hybrid / multi-phase"],
+    }
+
+
+def test_classification_rejects_unknown_labels():
+    from pydantic import ValidationError
+
+    from summarizer.models import Classification
+
+    with pytest.raises(ValidationError):
+        Classification(
+            inference_hardware="TPU",
+            architecture="hybrid",
+            credit_assignment="Global",
+            learning_regime="Offline",
+            paradigm_families=[],
+        )
+
+
+def test_classification_vocabularies_match_the_references():
+    """Drift guard: every allowed label is spelled out in the prompt references."""
+    from typing import get_args
+
+    from summarizer.models import Classification
+
+    refs = Path(__file__).parent.parent / "skill_data" / "references"
+    contract = (refs / "json-output-contract.md").read_text(encoding="utf-8")
+    paradigms = (refs / "learning-paradigms.md").read_text(encoding="utf-8")
+    for name, field in Classification.model_fields.items():
+        labels = get_args(field.annotation)
+        if name == "paradigm_families":
+            for label in get_args(labels[0]):
+                assert f"`{label}`" in paradigms, label
+        else:
+            for label in labels:
+                assert label in contract, (name, label)
+
+
+def test_classification_placeholders_and_list_forms():
+    from summarizer.models import Classification
+
+    c = Classification(
+        inference_hardware="N/A",
+        architecture="Not applicable",
+        credit_assignment="not applicable",
+        learning_regime="Not Applicable",
+        paradigm_families="hybrid/multi-phase",
+    )
+    assert (c.inference_hardware, c.architecture) == ("not reported", "not reported")
+    assert (c.credit_assignment, c.learning_regime) == ("Not applicable", "not applicable")
+    assert c.paradigm_families == ["Hybrid / multi-phase"]
+    none = Classification(**{**c.model_dump(), "paradigm_families": None})
+    assert none.paradigm_families == []
+    dupes = Classification(
+        **{
+            **c.model_dump(),
+            "paradigm_families": ["hybrid/multi-phase", "Hybrid / Multi-phase", "not reported"],
+        }
+    )
+    assert dupes.paradigm_families == ["Hybrid / multi-phase"]
+
+
+def test_classification_contract_lists_exactly_the_allowed_labels():
+    """Two-way drift guard: the contract's `a | b | c` line per field equals the Literal."""
+    import re
+
+    from summarizer.models import Classification, labels
+
+    refs = Path(__file__).parent.parent / "skill_data" / "references"
+    contract = (refs / "json-output-contract.md").read_text(encoding="utf-8")
+    for name, field in Classification.model_fields.items():
+        if name == "paradigm_families":
+            continue  # defined in learning-paradigms.md, checked separately
+        line = re.search(rf'"{name}": "([^"]+)"', contract).group(1)
+        assert set(line.split(" | ")) == set(labels(field.annotation)), name

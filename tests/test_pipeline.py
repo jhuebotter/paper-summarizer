@@ -8,6 +8,7 @@ import pytest
 
 from summarizer.llm import CostAccumulator, ModelPricing, UsageStats
 from summarizer.models import Config, PaperSummary, ParseError, PipelineError
+from summarizer.parser import ParsedText
 from summarizer.pipeline import (
     _sanitize_citation_key,
     author_surname_token,
@@ -40,8 +41,10 @@ def fake_pdf(tmp_path):
 
 
 def _mock_parse(paper_text: str):
-    """Return a patcher that makes parse_pdf return the given text."""
-    return patch("summarizer.pipeline.parse_pdf", return_value=paper_text)
+    """Return a patcher that makes text loading return the given text."""
+    return patch(
+        "summarizer.pipeline.load_text", return_value=ParsedText(paper_text, "pypdf", "0" * 64)
+    )
 
 
 def _make_combined_dict(part1_dict: dict, part2_dict: dict) -> dict:
@@ -255,7 +258,7 @@ def test_process_pdf_non_research(fake_pdf, config):
 
 
 # ---------------------------------------------------------------------------
-# reparse flag is forwarded to parse_pdf
+# parser flags are forwarded to load_text
 # ---------------------------------------------------------------------------
 
 
@@ -276,13 +279,13 @@ def test_process_pdf_forwards_parser_config(
     kwarg_name,
     expected,
 ):
-    """Config parser flags are forwarded to parse_pdf as keyword arguments."""
+    """Config parser flags are forwarded to load_text as keyword arguments."""
     setattr(config, config_attr, config_value)
     combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
     client_patcher, _ = _mock_llm_combined(combined)
 
     with (
-        patch("summarizer.pipeline.parse_pdf", return_value="text") as mock_parse,
+        _mock_parse("text") as mock_parse,
         client_patcher,
     ):
         process_pdf(fake_pdf, config)
@@ -298,7 +301,7 @@ def test_process_pdf_forwards_parser_config(
 
 def test_process_pdf_parse_error_raises_pipeline_error(fake_pdf, config):
     """ParseError from the PDF parser is wrapped in PipelineError."""
-    with patch("summarizer.pipeline.parse_pdf", side_effect=ParseError("corrupt PDF")):
+    with patch("summarizer.pipeline.load_text", side_effect=ParseError("corrupt PDF")):
         with pytest.raises(PipelineError) as exc_info:
             process_pdf(fake_pdf, config)
     assert exc_info.value.pdf_path == fake_pdf
@@ -633,3 +636,49 @@ def test_process_pdf_passes_strip_references_to_parser(
     with _mock_parse("text") as parse, client_patcher:
         process_pdf(fake_pdf, config)
     assert parse.call_args.kwargs["strip_references"] is True
+
+
+def test_provenance_records_how_the_summary_was_made(
+    tmp_path, monkeypatch, config, mock_part1_dict, mock_part2_dict
+):
+    from dataclasses import replace
+
+    from summarizer.llm import UsageStats
+
+    (tmp_path / "paper.pdf").write_bytes(b"%PDF")
+    monkeypatch.chdir(tmp_path)
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    mock_client = MagicMock()
+    mock_client.pricing = ModelPricing()
+    mock_client.complete.return_value = MagicMock(
+        text=json.dumps(combined),
+        usage=UsageStats(input_tokens=1200, output_tokens=300, cost=0.002),
+    )
+    batch_total = CostAccumulator()
+    batch_total.add(UsageStats(), 1.0)  # an earlier paper in the same batch
+    with patch(
+        "summarizer.pipeline.load_text",
+        return_value=ParsedText("x" * 500, "docling", "f" * 64),
+    ):
+        summary = process_pdf(
+            Path("paper.pdf"),
+            replace(config, max_chars=100),
+            client=mock_client,
+            accumulator=batch_total,
+        )
+
+    prov = summary.provenance
+    assert (prov.pdf_sha256, prov.extractor) == ("f" * 64, "docling")
+    assert (prov.chars_full, prov.chars_sent) == (500, 100)
+    assert (prov.calls, prov.input_tokens, prov.cost_usd) == (1, 1200, 0.002)  # this paper only
+    assert prov.model == config.model
+    assert prov.source_path == str((tmp_path / "paper.pdf").resolve())
+    assert batch_total.total_cost == 1.002  # per-paper totals feed the caller's
+
+
+def test_provenance_survives_a_json_roundtrip(fake_pdf, config, mock_part1_dict, mock_part2_dict):
+    combined = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    client_patcher, _ = _mock_llm_combined(combined)
+    with _mock_parse("text"), client_patcher:
+        summary = process_pdf(fake_pdf, config)
+    assert PaperSummary.model_validate_json(summary.model_dump_json()) == summary

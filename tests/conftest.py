@@ -1,5 +1,6 @@
 """Shared pytest fixtures for the snn_summarizer test suite."""
 
+import copy
 import logging
 from pathlib import Path
 
@@ -60,6 +61,12 @@ def _isolated_env(request, monkeypatch):
     monkeypatch.setattr("summarizer.cli.load_dotenv", lambda *args, **kwargs: False)
     for var in ("LLM_API_KEY", "LLM_MODEL"):
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _extraction_cache_in_tmp(tmp_path, monkeypatch):
+    """Extraction caches go to $XDG_CACHE_HOME; keep them per test, out of $HOME."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
 
 
 @pytest.fixture(autouse=True)
@@ -157,16 +164,23 @@ MOCK_PART2_DICT = {
     "data_collection": "Simulated rollouts in MuJoCo",
     "key_training_details": "BPTT with surrogate gradients; 500 training episodes",
     "comparison_to_baselines": "Compared against ANN with same architecture; SNN achieves comparable reward",
+    "classification": {
+        "inference_hardware": "CPU/GPU",
+        "architecture": "fully spiking",
+        "credit_assignment": "Global",
+        "learning_regime": "Offline",
+        "paradigm_families": ["Gradient-based (surrogate gradient BPTT)"],
+    },
 }
 
 
 @pytest.fixture
 def mock_part1_dict() -> dict:
     """Flat metadata + Part 1 dict (copy) for building models and combined responses."""
-    return MOCK_PART1_DICT.copy()
+    return copy.deepcopy(MOCK_PART1_DICT)
 
 
 @pytest.fixture
 def mock_part2_dict() -> dict:
     """Part 2 (SNN extraction) dict (copy)."""
-    return MOCK_PART2_DICT.copy()
+    return copy.deepcopy(MOCK_PART2_DICT)

@@ -8,9 +8,23 @@ import pytest
 
 import summarizer.parser as parser_mod
 from summarizer.models import ParseError
-from summarizer.parser import parse_pdf
+from summarizer.parser import load_text, truncate_text
+
+
+def parse_pdf(pdf_path, max_chars=200_000, reparse=False, extractor="auto", strip_references=False):
+    """``load_text`` + ``truncate_text``, as the pipeline combines them."""
+    parsed = load_text(pdf_path, extractor, reparse=reparse, strip_references=strip_references)
+    return truncate_text(parsed.text, max_chars, pdf_path.name)
+
 
 PROJECT_ROOT = Path(__file__).parent.parent
+
+
+def _cache(tmp_path: Path, pdf: Path, extractor: str) -> Path:
+    """Where the extraction cache for ``pdf`` lives (conftest sets XDG_CACHE_HOME)."""
+    from summarizer.parser import sha256_file
+
+    return tmp_path / "xdg-cache" / "paper-summarizer" / f"{sha256_file(pdf)}.{extractor}.md"
 
 
 @pytest.fixture(autouse=True)
@@ -102,7 +116,7 @@ def test_parse_pdf_writes_cache_on_fresh_parse(tmp_path):
     """After a fresh docling parse, {pdf_stem}.docling.md is created next to the PDF."""
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF-1.4 fake content")
-    cache = tmp_path / "paper.docling.md"
+    cache = _cache(tmp_path, pdf, "docling")
 
     mock_result = MagicMock()
     mock_result.document.export_to_markdown.return_value = "parsed content"
@@ -237,8 +251,8 @@ def test_parse_pdf_falls_back_to_pypdf_on_docling_failure(tmp_path):
         result = parse_pdf(pdf, max_chars=10_000)
 
     assert result == "fallback text"
-    assert (tmp_path / "paper.pypdf.md").read_text(encoding="utf-8") == "fallback text"
-    assert not (tmp_path / "paper.docling.md").exists()
+    assert _cache(tmp_path, pdf, "pypdf").read_text(encoding="utf-8") == "fallback text"
+    assert not _cache(tmp_path, pdf, "docling").exists()
 
 
 def test_parse_pdf_raises_parse_error_if_docling_and_fallback_fail(tmp_path):
@@ -319,7 +333,7 @@ def test_pypdf_extractor_ignores_docling_cache(tmp_path):
     (tmp_path / "paper.docling.md").write_text("docling text", encoding="utf-8")
     with patch("summarizer.parser._extract_text_with_pypdf", return_value="pypdf text"):
         assert parse_pdf(pdf, extractor="pypdf") == "pypdf text"
-    assert (tmp_path / "paper.pypdf.md").read_text(encoding="utf-8") == "pypdf text"
+    assert _cache(tmp_path, pdf, "pypdf").read_text(encoding="utf-8") == "pypdf text"
 
 
 def test_docling_extractor_ignores_legacy_and_pypdf_cache(tmp_path):
@@ -509,7 +523,7 @@ def test_parse_pdf_strips_before_truncating_and_caches_full_text(tmp_path):
     assert parse_pdf(pdf, max_chars=1000, extractor="docling", strip_references=True) == (
         "x" * 100 + "\n"
     )
-    assert (tmp_path / "paper.docling.md").read_text(encoding="utf-8") == text
+    assert _cache(tmp_path, pdf, "docling").read_text(encoding="utf-8") == text
 
 
 @pytest.mark.parametrize(
@@ -557,3 +571,72 @@ def test_strip_happens_before_truncation(tmp_path):
     pdf = tmp_path / "paper.pdf"
     result = parse_pdf(pdf, max_chars=1010, extractor="docling", strip_references=True)
     assert result == (body + "## Appendix\nkeep")[:1010]  # truncation after stripping
+
+
+def test_cache_follows_content_not_location(tmp_path):
+    """A moved PDF reuses its extraction cache (keyed by sha256)."""
+    from summarizer.parser import load_text
+
+    pdf = _fake_pdf(tmp_path)
+    with patch("summarizer.parser._extract_text_with_pypdf", return_value="once") as extract:
+        assert load_text(pdf, "pypdf").text == "once"
+        moved = tmp_path / "moved" / "renamed.pdf"
+        moved.parent.mkdir()
+        pdf.rename(moved)
+        parsed = load_text(moved, "pypdf")
+    extract.assert_called_once()
+    assert (parsed.text, parsed.extractor) == ("once", "pypdf")
+
+
+def test_old_caches_next_to_the_pdf_are_still_read(tmp_path):
+    from summarizer.parser import load_text
+
+    pdf = _fake_pdf(tmp_path)
+    (tmp_path / "paper.md").write_text("legacy text", encoding="utf-8")
+    parsed = load_text(pdf)
+    assert (parsed.text, parsed.extractor) == ("legacy text", "unknown")
+    assert not list(tmp_path.glob("*.docling.md"))  # nothing new written next to the PDF
+
+
+def test_stale_cache_next_to_a_replaced_pdf_is_ignored(tmp_path):
+    """Regression: an old <stem>.docling.md fed the previous paper's text to a new PDF."""
+    import os
+
+    pdf = _fake_pdf(tmp_path)
+    cache = tmp_path / "paper.docling.md"
+    cache.write_text("TEXT OF THE OLD PAPER", encoding="utf-8")
+    os.utime(cache, (1_000_000, 1_000_000))  # written long before the PDF was replaced
+    with patch("summarizer.parser._extract_text_with_pypdf", return_value="new paper"):
+        assert load_text(pdf, "pypdf").text == "new paper"
+    assert load_text(pdf, "auto").text == "new paper"  # now from the content-keyed cache
+
+
+def test_extracted_newlines_are_normalized(tmp_path):
+    pdf = _fake_pdf(tmp_path)
+    with patch("summarizer.parser._extract_text_with_pypdf", return_value="a\r\nb\rc"):
+        fresh = load_text(pdf, "pypdf").text
+    assert fresh == "a\nb\nc" == load_text(pdf, "pypdf").text
+
+
+def test_relative_xdg_cache_home_is_ignored(tmp_path, monkeypatch):
+    from summarizer.parser import _extraction_cache_dir
+
+    monkeypatch.setenv("XDG_CACHE_HOME", "relative/dir")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _extraction_cache_dir() == tmp_path / ".cache" / "paper-summarizer"
+
+
+def test_auto_prefers_docling_cache_in_the_cache_dir(tmp_path):
+    pdf = _fake_pdf(tmp_path)
+    for extractor in ("docling", "pypdf"):
+        path = _cache(tmp_path, pdf, extractor)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(extractor, encoding="utf-8")
+    assert load_text(pdf).text == "docling"
+
+
+@pytest.mark.parametrize("extractor", ["docling", "pypdf"])
+def test_explicit_extractor_reads_its_old_cache_next_to_the_pdf(tmp_path, extractor):
+    pdf = _fake_pdf(tmp_path)
+    (tmp_path / f"paper.{extractor}.md").write_text("old cache", encoding="utf-8")
+    assert load_text(pdf, extractor).text == "old cache"

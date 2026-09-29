@@ -101,10 +101,19 @@ Hard rules:
     "online_vs_offline": "string",
     "data_collection": "string",
     "key_training_details": "string",
-    "comparison_to_baselines": "string"
+    "comparison_to_baselines": "string",
+    "classification": {
+      "inference_hardware": "CPU/GPU | Neuromorphic emulator/SDK | Physical neuromorphic chip | not reported",
+      "architecture": "fully spiking | hybrid | not reported",
+      "credit_assignment": "Global | Semi-local | Local | Analytical | Hybrid | Not applicable | not reported",
+      "learning_regime": "Offline | Online | Mixed | not applicable | not reported",
+      "paradigm_families": ["zero or more paradigm family labels from learning-paradigms.md"]
+    }
   }
 }
 ```
+
+`part2.classification` holds typed labels for comparison tables. Each value must be exactly one of the listed labels (pick the one that matches the corresponding free-text field; use `not reported` when the paper doesn't say). `paradigm_families` lists every canonical paradigm family label that applies, verbatim, e.g. `["Reinforcement learning (model-free)", "Hybrid / multi-phase"]`; use `[]` if there is no learning.
 
 ### Synthesis (review / survey / perspective / commentary / opinion / …)
 
