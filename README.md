@@ -58,6 +58,15 @@ Use `collect_pdfs.sh` when your PDFs live in deep subfolders (for example Zotero
 - Copies them into one folder as `<parent_folder>__<original_filename>.pdf`.
 - Never overwrites: a different file with the same name gets a `__2`, `__3`, … suffix, and identical files are skipped, so re-running it is safe.
 
+### Zotero metadata
+
+When a PDF's name starts with its Zotero attachment key (`<KEY>__…pdf`, as `collect_pdfs.sh` names them) and Zotero is running, runs take the title, authors, year, venue and citation key from the Zotero item instead of the LLM. They use Zotero's read-only local API on `localhost:23119`, which is on by default in Zotero 7+ (*Settings → Advanced → Allow other applications on this computer to communicate with Zotero*). Your personal library and all your groups are searched.
+- `--no-zotero` turns it off. When Zotero isn't reachable, the run logs one warning and uses the LLM's metadata.
+- The sidecar records the item (`provenance.zotero_item`) and which fields Zotero changed (`provenance.zotero_fields`); each change is also logged.
+- The paper type, classification and everything else still come from the LLM, and PDFs are still read from disk.
+- `eval` never uses Zotero, since it measures the model.
+- Metadata fixed in Zotero later reaches existing summaries only with `--force-summary`.
+
 ## Usage
 
 ```bash
@@ -162,6 +171,7 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 - `--max-chars N`: paper-text budget (default 200,000 ≈ 50k tokens). Longer text is truncated, and a warning is logged. For models with a smaller context window (known from OpenRouter), the text is cut further so the prompt and reply fit.
 - `--strip-references` / `--no-strip-references`: drop the References/Bibliography section before sending (default on). This saves tokens and budget for the actual paper. With docling, appendices after the references are kept; with pypdf, everything after the references heading is dropped.
 - `--structured-output`: ask the backend to constrain replies to the summary's JSON schema (off by default until the evaluation shows it helps; the model must support structured outputs).
+- `--zotero` / `--no-zotero`: bibliographic metadata from the local Zotero library (default on; see [Zotero metadata](#zotero-metadata)).
 - `--max-cost USD`: stop starting new papers once this much has been spent (papers already running still finish). Also applies to `eval`.
 - `--max-output-tokens N`: cap generated tokens (default: no cap). If the model hits the cap, the paper fails with a clear message instead of an unrepairable half-JSON.
 - `--workers N`: parallel papers (default 3). `--timeout S`: per-call timeout (default 120).
@@ -241,7 +251,6 @@ CI runs lint and tests on Python 3.12–3.14.
 
 ## Roadmap
 
-- Metadata from the Zotero library (Better BibTeX citation keys) instead of the LLM.
 - Leaner, type-specific prompts (and choosing the `--structured-output` default from evaluation results).
 - Decision models, i.e. fast classifiers that return calibrated probabilities (e.g. TypeSafe's Jev, or local models via Ollaya), for screening, typed field extraction and cross-checks.
 - Domain profiles, so the research field is hot-swappable.

@@ -37,6 +37,7 @@ from summarizer.parser import sha256_file
 from summarizer.pipeline import process_pdf
 from summarizer.prompts import load_references
 from summarizer.renderer import render_summary
+from summarizer.zotero import ZoteroRecord, lookup_all
 
 try:
     import fcntl
@@ -287,6 +288,7 @@ def _process_one_pdf(
     accumulator: CostAccumulator,
     references: str,
     stop: StopSignal,
+    zotero: ZoteroRecord | None = None,
 ) -> dict:
     """Worker task: process one PDF and return renderable artifacts."""
     stop.check_budget(accumulator, config.max_cost)
@@ -295,7 +297,12 @@ def _process_one_pdf(
     logger.info("  Processing [%d/%d]: %s", run_idx, run_total, pdf_path.name)
     try:
         summary = process_pdf(
-            pdf_path, config, client=client, accumulator=accumulator, references=references
+            pdf_path,
+            config,
+            client=client,
+            accumulator=accumulator,
+            references=references,
+            zotero=zotero,
         )
     except PipelineError as exc:
         if isinstance(exc.cause, QuotaExhausted):
@@ -429,6 +436,7 @@ def _run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
     client = create_client(config)
     accumulator = CostAccumulator()
     references = load_references(config.skill_data_dir)
+    zotero = lookup_all(jobs) if config.zotero else {}
 
     show_progress = sys.stderr.isatty()
     run_total = len(jobs)
@@ -446,6 +454,7 @@ def _run_pdfs(pdfs: list[Path], config: Config) -> BatchReport:
                 accumulator,
                 references,
                 stop,
+                zotero.get(pdf_path),
             ): (pdf_path, run_idx)
             for run_idx, pdf_path in enumerate(jobs, start=1)
         }

@@ -27,6 +27,7 @@ from summarizer.models import (
 )
 from summarizer.parser import load_text, truncate_text
 from summarizer.prompts import build_combined_prompt, load_references, references_digest
+from summarizer.zotero import ZoteroRecord
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ def process_pdf(
     client: "LLMClient | None" = None,
     accumulator: "CostAccumulator | None" = None,
     references: str | None = None,
+    zotero: ZoteroRecord | None = None,
 ) -> PaperSummary:
     """Process a single PDF end-to-end and return a validated ``PaperSummary``.
 
@@ -62,6 +64,8 @@ def process_pdf(
         accumulator: Optional cost accumulator updated after each LLM call.
         references:  Optional pre-loaded reference text (batch mode loads it
                      once); read from ``config.skill_data_dir`` when ``None``.
+        zotero:      The paper's Zotero item; its title, authors, year, venue and
+                     citation key replace the LLM's.
 
     Raises:
         PipelineError: wraps any ``ParseError``, ``LLMError``,
@@ -69,7 +73,12 @@ def process_pdf(
     """
     try:
         return _run_pipeline(
-            pdf_path, config, client=client, accumulator=accumulator, references=references
+            pdf_path,
+            config,
+            client=client,
+            accumulator=accumulator,
+            references=references,
+            zotero=zotero,
         )
     except PipelineError:
         raise
@@ -83,6 +92,7 @@ def _run_pipeline(
     client: "LLMClient | None" = None,
     accumulator: "CostAccumulator | None" = None,
     references: str | None = None,
+    zotero: ZoteroRecord | None = None,
 ) -> PaperSummary:
     # Step 1: extract text (cached), cut it to the budget and the model's context
     parsed = load_text(
@@ -118,6 +128,7 @@ def _run_pipeline(
     # Step 3: single LLM call → parse and validate (per-paper totals feed the caller's)
     paper_cost = CostAccumulator(parent=accumulator)
     raw = call_llm(client, prompt, accumulator=paper_cost)
+    zotero_fields = _zotero_differences(raw, zotero, pdf_path) if zotero else []
     response = _validate_with_schema_repair(
         raw=raw,
         client=client,
@@ -125,6 +136,7 @@ def _run_pipeline(
         pdf_path=pdf_path,
         accumulator=paper_cost,
         contract=_load_contract(config.skill_data_dir),
+        zotero=zotero,
     )
 
     provenance = Provenance(
@@ -144,6 +156,8 @@ def _run_pipeline(
         input_tokens=paper_cost.total_input_tokens,
         output_tokens=paper_cost.total_output_tokens,
         cost_usd=paper_cost.total_cost,
+        zotero_item=zotero.item if zotero else None,
+        zotero_fields=zotero_fields,
     )
     return PaperSummary(
         metadata=response.metadata,
@@ -215,6 +229,7 @@ def _validate_with_schema_repair(
     pdf_path: Path,
     accumulator: "CostAccumulator | None" = None,
     contract: str = "",
+    zotero: ZoteroRecord | None = None,
 ) -> LLMResponse:
     """Validate response and repair schema with bounded LLM retries.
 
@@ -227,6 +242,7 @@ def _validate_with_schema_repair(
     attempts = _MAX_SCHEMA_REPAIR_RETRIES + 1
 
     for attempt in range(1, attempts + 1):
+        current = _apply_zotero(current, zotero)
         current = _normalize_metadata_year(current, pdf_path)
         current = _normalize_citation_key(current, pdf_path)
         try:
@@ -339,6 +355,40 @@ def _build_schema_repair_prompt(
         "Response JSON to repair:\n"
         f"{bad_json}"
     )
+
+
+def _zotero_values(zotero: ZoteroRecord) -> dict:
+    """The non-empty metadata values Zotero provides."""
+    key = zotero.citation_key.lower()
+    values = {
+        "citation_key": key if _is_valid_citation_key(key) else None,
+        "title": zotero.title,
+        "authors": zotero.authors,
+        "year": zotero.year,
+        "venue": zotero.venue,
+    }
+    return {field: value for field, value in values.items() if value}
+
+
+def _apply_zotero(raw: dict, zotero: ZoteroRecord | None) -> dict:
+    """Replace the LLM's bibliographic fields with the Zotero item's."""
+    metadata = raw.get("metadata")
+    if zotero is not None and isinstance(metadata, dict):
+        metadata.update(_zotero_values(zotero))
+    return raw
+
+
+def _zotero_differences(raw: dict, zotero: ZoteroRecord, pdf_path: Path) -> list[str]:
+    """Fields where Zotero disagrees with the LLM; each difference is logged."""
+    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    changed = []
+    for field, value in _zotero_values(zotero).items():
+        if metadata.get(field) != value:
+            logger.info(
+                "Zotero %s for %s: %r -> %r", field, pdf_path.name, metadata.get(field), value
+            )
+            changed.append(field)
+    return changed
 
 
 def _normalize_metadata_year(raw: dict, pdf_path: Path) -> dict:

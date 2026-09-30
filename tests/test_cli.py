@@ -55,6 +55,7 @@ def test_parser_defaults():
     assert args.force_summary is False
     assert args.reparse is False
     assert args.dry_run is False
+    assert args.zotero is True
     assert args.verbose is False
     assert args.timeout == 120
     assert args.workers == 3
@@ -670,3 +671,8 @@ def test_render_rejects_a_missing_output_dir(tmp_path):
     with pytest.raises(SystemExit) as exc_info:
         main(["render", "--output-dir", str(tmp_path / "missing")])
     assert exc_info.value.code == 1
+
+
+def test_no_zotero_flag():
+    args = _build_parser().parse_args(["--source", ".", "--no-zotero"])
+    assert args.zotero is False
