@@ -17,6 +17,7 @@ from functools import partial
 from pathlib import Path
 
 from summarizer.batch import StopSignal, atomic_write_text
+from summarizer.decider import QUESTIONS as DECIDER_QUESTIONS
 from summarizer.llm import (
     CompletionResponse,
     CostAccumulator,
@@ -115,6 +116,20 @@ class CachingClient:
         atomic_write_text(path, json.dumps(entry))
         return response
 
+    def decide(self, body: dict) -> dict:
+        key = json.dumps([self.base_url, body], sort_keys=True)
+        path = self._cache_dir / f"decide-{hashlib.sha256(key.encode()).hexdigest()}.json"
+        if path.exists():
+            self.hits += 1
+            return json.loads(path.read_text(encoding="utf-8"))
+        reply = self._inner.decide(body)
+        self.misses += 1
+        answers = reply.get("answers") if isinstance(reply, dict) else None
+        if answers and all(isinstance(a, dict) and "choice" in a for a in answers.values()):
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(path, json.dumps(reply))
+        return reply
+
 
 # ---------------------------------------------------------------------------
 # Gold labels
@@ -191,6 +206,26 @@ def score_gold(summary: PaperSummary, labels: dict) -> dict[str, bool]:
     return scores
 
 
+#: gold fields a decision model answers, scored as ``decider.<field>``
+DECIDER_FIELDS = tuple(f"decider.{name}" for name in DECIDER_QUESTIONS)
+
+
+def score_decisions(summary: PaperSummary, labels: dict) -> dict[str, bool]:
+    """Score the decision model's labels against the gold ``classification.*`` fields.
+
+    A paper without decisions (the decider failed) counts as wrong.
+    """
+    decisions = summary.decisions or {}
+    scores = {}
+    for field in DECIDER_FIELDS:
+        name = field.removeprefix("decider.")
+        expected = labels.get(f"classification.{name}")
+        if expected is not None:
+            got = decisions.get(name)
+            scores[field] = got is not None and _norm(got.label) == _norm(expected)
+    return scores
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -218,6 +253,10 @@ def _eval_one(
     if stop.is_set():
         return None
     labelled = {f: False for f, v in gold.get(sha, {}).items() if v is not None}
+    if config.decider:
+        labelled |= {
+            f: False for f in DECIDER_FIELDS if labelled.get(f"classification.{f[8:]}") is False
+        }
     row = {
         "config": cfg.name,
         "model": cfg.model,
@@ -275,7 +314,12 @@ def _eval_one(
         "paper_type": summary.metadata.paper_type or "non_research",
         "citation_key": summary.metadata.citation_key,
         "metrics": compute_metrics(summary, paper_text),
-        "gold": score_gold(summary, gold[sha]) if sha in gold else None,
+        "gold": (
+            score_gold(summary, gold[sha])
+            | (score_decisions(summary, gold[sha]) if config.decider else {})
+            if sha in gold
+            else None
+        ),
     }
     return row
 
@@ -469,7 +513,8 @@ def render_report(
     labelled = [r for r in rows if r.get("gold")]
     if labelled:
         lines += ["| field | " + " | ".join(by_config) + " |", "|" + "---|" * (len(by_config) + 1)]
-        for field in GOLD_FIELDS:
+        scored = {f for r in labelled for f in r["gold"]}
+        for field in [f for f in GOLD_FIELDS + DECIDER_FIELDS if f in scored]:
             cells = []
             for config_rows in by_config.values():
                 scores = [r["gold"][field] for r in config_rows if field in (r.get("gold") or {})]

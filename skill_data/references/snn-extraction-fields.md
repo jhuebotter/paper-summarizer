@@ -30,7 +30,9 @@ The type of spiking (or rate-coded) neuron (e.g., LIF / ALIF / Izhikevich / rate
 ## Network architecture
 Feedforward / recurrent / reservoir, etc.; list any non-spiking modules (readout, bottleneck, critic), and whether it is `fully spiking` or `hybrid` (rule below).
 
-**Fully spiking vs. hybrid:** `hybrid` when a trained non-spiking component does part of the computation in the control or learning loop: a DNN critic next to a spiking actor (common in spiking RL, and it undermines whole-system energy claims), or a trained non-spiking controller/policy layer fed by a spiking network. A spiking network whose only non-spiking parts are an input encoding layer or a linear / leaky-integrator readout is still `fully spiking`.
+**Fully spiking vs. hybrid:**
+- **fully spiking** — only spiking neurons do the computation; a network whose only non-spiking parts are an input encoding layer or a linear / leaky-integrator readout is still fully spiking
+- **hybrid** — a trained non-spiking component does part of the computation in the control or learning loop: a DNN critic next to a spiking actor (common in spiking RL, and it undermines whole-system energy claims), or a trained non-spiking controller/policy layer fed by a spiking network
 
 ---
 
@@ -110,7 +112,11 @@ The most important field: name the algorithm, what signal drives learning (loss/
 ---
 
 ## Online vs. offline
-Online (weights update during task execution) / offline (separate training phase from dataset or replay) / mixed; do not confuse online inference with online learning.
+Do not confuse online inference with online learning.
+- **Offline** — separate training phase from dataset or replay
+- **Online** — weights update during task execution
+- **Mixed** — both offline and online
+- **not applicable** — nothing is learned
 
 ---
 

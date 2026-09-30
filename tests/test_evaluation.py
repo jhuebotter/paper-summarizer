@@ -196,17 +196,22 @@ def good(mock_part1_dict, mock_part2_dict) -> str:
     return json.dumps(_combined(mock_part1_dict, mock_part2_dict))
 
 
-def _run(tmp_path, pdfs, reply, configs=None, paper_text=PAPER_TEXT, max_chars=200_000, **kw):
+def _run(
+    tmp_path, pdfs, reply, configs=None, paper_text=PAPER_TEXT, max_chars=200_000, decide=None, **kw
+):
     config = Config(
         base_url="http://localhost:1234/v1",
         skill_data_dir=REFERENCES_DIR,
         workers=2,
         max_chars=max_chars,
+        decider="jev-test" if decide else None,
     )
+    client = _inner_client(reply)
+    client.decide.side_effect = decide
     with (
         patch("summarizer.evaluation.load_text", return_value=_parsed(paper_text)),
         patch("summarizer.pipeline.load_text", return_value=_parsed(paper_text)),
-        patch("summarizer.evaluation.create_client", return_value=_inner_client(reply)),
+        patch("summarizer.evaluation.create_client", return_value=client),
     ):
         rows, _ = run_eval(
             pdfs,
@@ -307,6 +312,37 @@ def test_run_eval_scores_gold_labels_and_failures_count_as_wrong(tmp_path, pdfs,
     assert by_file["a.pdf"]["gold"] == {"paper_type": True}
     assert by_file["b.pdf"]["gold"] == {"paper_type": False}
     assert dict(config_summary(rows))["gold labels"] == "50% (1/2)"
+
+
+def test_run_eval_scores_the_decider_next_to_the_llm(tmp_path, pdfs, good):
+    from test_decider import _reply
+
+    gold = tmp_path / "gold.jsonl"
+    init_gold(gold, pdfs)
+    records = [json.loads(line) for line in gold.read_text().splitlines()]
+    for record in records:
+        record["labels"]["classification.architecture"] = "hybrid"
+    gold.write_text("".join(json.dumps(r) + "\n" for r in records))
+
+    rows = _run(
+        tmp_path,
+        pdfs,
+        _replies((REPAIR, "still not json"), ("a.pdf", good), ("b.pdf", "not json")),
+        gold_path=gold,
+        decide=lambda body: _reply({"architecture": "hybrid"}),
+    )
+    by_file = {r["file"]: r for r in rows}
+    assert by_file["a.pdf"]["gold"] == {
+        "classification.architecture": False,  # the LLM says fully spiking
+        "decider.architecture": True,
+    }
+    assert by_file["b.pdf"]["gold"] == {  # a failed paper is wrong for both
+        "classification.architecture": False,
+        "decider.architecture": False,
+    }
+    report = (tmp_path / "run" / "report.md").read_text()
+    assert "| decider.architecture | 50% (1/2) |" in report
+    assert "| decider.learning_regime |" not in report  # nothing labelled
 
 
 def test_keyboard_interrupt_propagates(tmp_path, pdfs):

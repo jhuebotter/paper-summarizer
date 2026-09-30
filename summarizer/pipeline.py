@@ -15,6 +15,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from summarizer import decider
 from summarizer.llm import CostAccumulator, LLMClient, call_llm, create_client
 from summarizer.models import (
     Config,
@@ -105,8 +106,9 @@ def _run_pipeline(
         references = load_references(config.skill_data_dir)
     if client is None:
         client = create_client(config)
+    truncated = truncate_text(parsed.text, config.max_chars, pdf_path.name)
     paper_text = fit_to_context(
-        truncate_text(parsed.text, config.max_chars, pdf_path.name),
+        truncated,
         references,
         pdf_path.name,
         client.pricing.context_length,
@@ -139,6 +141,25 @@ def _run_pipeline(
         zotero=zotero,
     )
 
+    decisions, decider_cost, decider_model, decider_error = None, 0.0, None, None
+    if config.decider and response.part2 is not None:
+        try:
+            decisions, decider_cost, decider_model = decider.decide(
+                client,
+                config.decider,
+                response.metadata.title,
+                truncated,
+                decider.label_descriptions(config.skill_data_dir),
+            )
+        except Exception as exc:  # the summary stands without the decisions (even on a quota)
+            logger.warning("Decision model failed for %s: %s", pdf_path.name, exc)
+            decider_error = str(exc)
+        else:
+            for field, decision in decisions.items():
+                decision.llm_label = getattr(response.part2.classification, field)
+            if accumulator is not None:
+                accumulator.add_cost(decider_cost)
+
     provenance = Provenance(
         created_at=datetime.now(UTC).isoformat(timespec="seconds"),
         git_commit=git_commit(),
@@ -158,12 +179,16 @@ def _run_pipeline(
         cost_usd=paper_cost.total_cost,
         zotero_item=zotero.item if zotero else None,
         zotero_fields=zotero_fields,
+        decider_model=decider_model,
+        decider_cost_usd=decider_cost,
+        decider_error=decider_error,
     )
     return PaperSummary(
         metadata=response.metadata,
         part1=response.part1,
         part2=response.part2,
         provenance=provenance,
+        decisions=decisions,
     )
 
 
