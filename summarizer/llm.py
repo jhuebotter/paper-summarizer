@@ -7,7 +7,7 @@ injects the extra headers required by OpenRouter when the base URL matches.
 The public interface is ``LLMClient.complete(prompt)`` returning an object
 with ``.text`` and ``.usage`` attributes.
 
-Retries live in exactly one place (``_complete_with_retries``); the SDK's own
+Retries live in exactly one place (``with_retries``); the SDK's own
 retry loop is disabled so attempts don't multiply.  Exhausted quotas (daily
 free-model cap, credits, key limits) raise ``QuotaExhausted`` instead, so runs
 can stop cleanly.
@@ -193,7 +193,7 @@ class LLMClient:
             base_url=base_url,
             api_key=api_key,
             default_headers=extra_headers or {},
-            max_retries=0,  # retries are handled by _complete_with_retries
+            max_retries=0,  # retries are handled by with_retries
         )
 
     def complete(self, prompt: str) -> CompletionResponse:

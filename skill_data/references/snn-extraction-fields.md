@@ -53,7 +53,7 @@ GPU (model if reported) / CPU / neuromorphic chip (which one?) / `not reported`.
 
 ## Controller hardware (inference)
 Where does the network execute at runtime? Use exactly one:
-- **CPU/GPU** — standard compute: CPUs or GPUs, including software simulators such as Nengo, Brian or PyTorch
+- **CPU/GPU** — standard compute
 - **Neuromorphic emulator/SDK** — chip behaviour simulated in software (e.g. NengoLoihi emulator, Lava software stack); no physical chip present
 - **Physical neuromorphic chip** — real hardware (e.g. Loihi board, SpiNNaker rack, custom FPGA); required for energy measurements to be meaningful
 - **not reported** — the paper never says where the network runs; don't infer `CPU/GPU` from a software simulation
@@ -104,7 +104,7 @@ The most important field: name the algorithm, what signal drives learning (loss/
 ## Credit assignment scope
 - **Global** — BPTT-style gradients (truncated/full as stated) propagate through trained components
 - **Semi-local** — eligibility traces + modulating signal (e-prop, FPTT, perturbation); avoids full BPTT storage
-- **Local** — pre/post-synaptic activity only, optionally with a modulating or error signal (STDP, R-STDP, three-factor rules, PES)
+- **Local** — pre/post-synaptic activity only (STDP, R-STDP, three-factor rules)
 - **Analytical** — no gradient; weights set by closed-form optimization (NEF, reservoir). Applies when such weights form (part of) the controller; fixed decoders used only as a setup step don't make a network `Analytical` or `Hybrid`.
 - **Hybrid** — combines scopes; describe each component separately
 - **Not applicable** — no learning: "Not applicable — weights [analytically constructed / fixed by design]."
@@ -113,10 +113,10 @@ The most important field: name the algorithm, what signal drives learning (loss/
 
 ## Online vs. offline
 Do not confuse online inference with online learning.
-- **Offline** — a separate training phase (from a dataset, rollouts or replay); weights are fixed while the controller runs
+- **Offline** — separate training phase from dataset or replay
 - **Online** — weights update during task execution
-- **Mixed** — both: offline training and online adaptation during execution
-- **not applicable** — nothing is learned (weights analytically constructed or fixed by design)
+- **Mixed** — both offline and online
+- **not applicable** — nothing is learned
 
 ---
 

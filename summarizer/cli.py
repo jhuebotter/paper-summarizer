@@ -34,7 +34,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from summarizer.batch import OutputDirLocked, find_pdfs, render_all, run_batch, run_pdfs
-from summarizer.decider import DEFAULT_DECIDER
+from summarizer.decider import DEFAULT_DECIDER, label_descriptions
 from summarizer.evaluation import EvalConfig, init_gold, run_eval
 from summarizer.llm import (
     fetch_openrouter_key_info,
@@ -109,6 +109,7 @@ def main(argv: list[str] | None = None) -> None:
     if not args.dry_run:
         _check_backend(config.base_url)
         _check_openrouter_config(config)
+        _check_decider(config)
         _log_key_info(config)
 
     try:
@@ -225,6 +226,7 @@ def _eval_main(argv: list[str]) -> None:
     _check_backend(config.base_url)
     for model in models:
         _check_openrouter_config(replace(config, model=model))
+    _check_decider(config)
     _log_key_info(config)
     setup_logging(verbose=args.verbose, log_file=Path(args.log_file or out_dir / "eval.log"))
 
@@ -352,6 +354,16 @@ def _report_and_exit(report: BatchReport) -> None:
 # ---------------------------------------------------------------------------
 # Backend health check
 # ---------------------------------------------------------------------------
+
+
+def _check_decider(config: Config) -> None:
+    """Fail fast when the decider's label definitions can't be read from the references."""
+    if config.decider:
+        try:
+            label_descriptions(config.skill_data_dir)
+        except (OSError, ValueError) as exc:
+            logger.error("--decider: %s", exc)
+            sys.exit(2)
 
 
 def _check_backend(base_url: str) -> None:

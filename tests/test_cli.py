@@ -688,4 +688,4 @@ def test_decider_flag_defaults_to_the_pinned_jev_snapshot():
     parser = _build_parser()
     assert parser.parse_args(["--source", "."]).decider is None
     assert parser.parse_args(["--source", ".", "--decider"]).decider == DEFAULT_DECIDER
-    assert parser.parse_args(["--source", ".", "--decider", "laya"]).decider == "laya"
+    assert parser.parse_args(["--source", ".", "--decider", "other/model"]).decider == "other/model"

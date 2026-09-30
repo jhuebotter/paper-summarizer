@@ -1,18 +1,19 @@
 """Typed classification from a decision model.
 
-Decision models (TypeSafe's Jev, served by OpenRouter; Laya runs the same API
-locally) answer typed questions with calibrated probabilities instead of
-generating text.  Given the paper text, one ``choice`` question per single-label
+Decision models (TypeSafe's Jev, served by OpenRouter) answer typed questions
+with calibrated probabilities instead of generating text.  Given the paper text, one ``choice`` question per single-label
 ``Classification`` field is asked; the label descriptions are read from
 ``snn-extraction-fields.md``, so the LLM and the decider work from the same
 definitions.  The answers are stored next to the LLM's labels, not instead of
 them.
 """
 
-import json
+import functools
 import logging
 import re
 from pathlib import Path
+
+import openai
 
 from summarizer.llm import LLMClient, with_retries
 from summarizer.models import Classification, Decision, labels
@@ -20,7 +21,10 @@ from summarizer.models import Classification, Decision, labels
 logger = logging.getLogger(__name__)
 
 DEFAULT_DECIDER = "typesafe/jev-1.13-20260917"
-DECIDER_MAX_CHARS = 90_000  # ~23k tokens; Jev's context (32k) also holds the questions
+# Jev's context is 32k tokens including the questions; dense pypdf text can take
+# 2-3 characters per token, so over-long requests are retried with less text.
+DECIDER_MAX_CHARS = 60_000
+_SHRINK = 0.6
 
 #: field -> (heading in snn-extraction-fields.md, question)
 QUESTIONS = {
@@ -44,8 +48,10 @@ QUESTIONS = {
 }
 _NOT_REPORTED = "The paper does not say."
 _BULLET = re.compile(r"^- \*\*(.+?)\*\* — (.+)$", re.MULTILINE)
+_PINNED = re.compile(r"-\d{8}$")  # a dated snapshot, e.g. typesafe/jev-1.13-20260917
 
 
+@functools.cache
 def label_descriptions(references_dir: Path) -> dict[str, dict[str, str]]:
     """``field -> label -> description`` from the reference's label bullets.
 
@@ -55,13 +61,17 @@ def label_descriptions(references_dir: Path) -> dict[str, dict[str, str]]:
     text = (references_dir / "snn-extraction-fields.md").read_text(encoding="utf-8")
     out = {}
     for field, (heading, _) in QUESTIONS.items():
-        section = text.split(f"## {heading}\n", 1)[-1].split("\n## ", 1)[0]
+        if f"## {heading}\n" not in text:
+            raise ValueError(f"No '## {heading}' section in snn-extraction-fields.md")
+        section = text.split(f"## {heading}\n", 1)[1].split("\n## ", 1)[0]
         bullets = dict(_BULLET.findall(section))
         bullets.setdefault("not reported", _NOT_REPORTED)
         allowed = labels(Classification.model_fields[field].annotation)
         missing = [label for label in allowed if label not in bullets]
         if missing:
             raise ValueError(f"No description for {field} labels {missing} under '## {heading}'")
+        if len({_key(label) for label in allowed}) < len(allowed):
+            raise ValueError(f"Two {field} labels map to the same question key")
         out[field] = {label: bullets[label] for label in allowed}
     return out
 
@@ -86,16 +96,28 @@ def decide(
         }
         for field, labels_ in descriptions.items()
     }
-    state = json.dumps({"title": title, "paper": paper_text[:DECIDER_MAX_CHARS]})
-    reply = with_retries(
-        lambda: client.decide({"model": model, "state": state, "questions": questions}), client
-    )
+    text = paper_text[:DECIDER_MAX_CHARS]
+    while True:
+        body = {"model": model, "state": {"title": title, "paper": text}, "questions": questions}
+        try:
+            reply = with_retries(lambda body=body: client.decide(body), client)
+            break
+        except Exception as exc:
+            cause = exc.__cause__
+            too_long = isinstance(cause, openai.BadRequestError) and "max_tokens" in str(cause)
+            if not too_long or len(text) < 5_000:
+                raise
+            logger.info("Paper too long for the decision model; retrying with less text")
+            text = text[: int(len(text) * _SHRINK)]
+    answers = reply.get("answers") if isinstance(reply, dict) else None
+    if not isinstance(answers, dict) or any(f not in answers for f in descriptions):
+        raise ValueError(f"Decision model reply without answers: {str(reply)[:200]}")
     served = reply.get("model")
-    if served and model.rsplit("-", 1)[-1].isdigit() and served != model:
+    if _PINNED.search(model) and served and served != model:
         logger.warning("Decision model %s answered as %s", model, served)
     decisions = {}
     for field, labels_ in descriptions.items():
-        answer = reply["answers"][field]
+        answer = answers[field]
         by_key = {_key(label): label for label in labels_}
         decisions[field] = Decision(
             label=by_key[answer["choice"]],

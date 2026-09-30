@@ -16,7 +16,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from summarizer import decider
-from summarizer.llm import CostAccumulator, LLMClient, QuotaExhausted, call_llm, create_client
+from summarizer.llm import CostAccumulator, LLMClient, call_llm, create_client
 from summarizer.models import (
     Config,
     LLMResponse,
@@ -151,9 +151,7 @@ def _run_pipeline(
                 truncated,
                 decider.label_descriptions(config.skill_data_dir),
             )
-        except QuotaExhausted:
-            raise
-        except Exception as exc:  # the summary stands without the decisions
+        except Exception as exc:  # the summary stands without the decisions (even on a quota)
             logger.warning("Decision model failed for %s: %s", pdf_path.name, exc)
             decider_error = str(exc)
         else:

@@ -192,8 +192,10 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 With `--decider`, each primary paper's text is also sent to a decision model: TypeSafe's Jev on the same OpenRouter key, pinned to `typesafe/jev-1.13-20260917`. The model answers one multiple-choice question per classification field (inference hardware, architecture, credit assignment, learning regime) and returns calibrated probabilities.
 - **Descriptions:** each label's description comes from the bullets in `skill_data/references/snn-extraction-fields.md`, so the LLM and the decider share definitions.
 - **Storage:** the answers go into the sidecar next to the LLM's labels (`decisions`, with probabilities and the LLM's label). They don't replace them. The markdown shows a note only where the two disagree.
-- **Cost:** about $0.001 per paper. It is recorded in `provenance.decider_cost_usd` and counts toward `--max-cost`.
-- **Failures:** a failure is logged and recorded (`provenance.decider_error`); the summary is kept.
+- **Cost:** about $0.001 per paper. It is recorded in `provenance.decider_cost_usd` (not in the LLM's `provenance.cost_usd`) and counts toward `--max-cost` and the eval's cost column.
+- **Long papers:** the decider sees at most the first 60,000 characters, and less if the model reports the text is too long.
+- **Quota:** a decider failure, including an exhausted quota, never discards the paper's summary.
+- **Failures:** a failure is logged and recorded (`provenance.decider_error`); the summary is kept. In eval, a paper without decisions counts as wrong for `decider.*`, and the decider only runs on papers the LLM classifies as primary.
 - **Privacy:** it sends the paper text to TypeSafe via OpenRouter, like the LLM call. Don't use it on unpublished work.
 - **Endpoint:** it uses the System One wire format (`POST <base-url>/systemone`) on the LLM's backend. A local [Laya](https://github.com/nvkudva/laya-server) server speaks the same format, but it would need its own URL (not supported yet) and reads only 512–1024 tokens.
 - **Eval:** `summarize-papers eval --decider` scores the decider's labels as `decider.*` next to the LLM's `classification.*`.

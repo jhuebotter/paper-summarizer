@@ -59,7 +59,8 @@ def test_decide_maps_answers_back_to_labels_and_cuts_the_text():
     body = client.decide.call_args.args[0]
     assert set(body["questions"]) == set(QUESTIONS)
     assert all(q["type"] == "choice" for q in body["questions"].values())
-    assert len(json.loads(body["state"])["paper"]) == DECIDER_MAX_CHARS
+    assert body["state"]["title"] == "T"
+    assert len(body["state"]["paper"]) == DECIDER_MAX_CHARS
     assert decisions["inference_hardware"].label == "Physical neuromorphic chip"
     assert decisions["inference_hardware"].probabilities["Physical neuromorphic chip"] == 0.9
     assert (cost, served) == (0.0005, "typesafe/jev-1.13-20260917")
@@ -160,21 +161,109 @@ def test_a_failing_decider_does_not_fail_the_paper(config, mock_part1_dict, mock
     assert "bad reply" in summary.provenance.decider_error
 
 
-def test_exhausted_quota_in_the_decider_stops_the_run(config, mock_part1_dict, mock_part2_dict):
+def test_exhausted_quota_in_the_decider_keeps_the_summary(config, mock_part1_dict, mock_part2_dict):
+    """Review finding: re-raising threw away an LLM summary that was already paid for."""
     from summarizer.llm import QuotaExhausted
-    from summarizer.models import PipelineError
 
-    with pytest.raises(PipelineError) as info:
-        _run(config, _combined(mock_part1_dict, mock_part2_dict), QuotaExhausted("credits"))
-    assert isinstance(info.value.cause, QuotaExhausted)
+    summary, _ = _run(config, _combined(mock_part1_dict, mock_part2_dict), QuotaExhausted("402"))
+    assert summary.decisions is None and "402" in summary.provenance.decider_error
 
 
-def test_no_decider_call_without_the_flag_or_part2(config, mock_part1_dict, mock_part2_dict):
-    combined = _combined(mock_part1_dict, mock_part2_dict)
+def test_too_long_text_is_retried_shorter():
+    """Review finding: Jev rejects over-long input (400 max_tokens_exceeded), it doesn't truncate."""
+    import httpx2 as httpx
+    import openai
+
+    request = httpx.Request("POST", "https://x/systemone")
+    too_long = openai.BadRequestError(
+        "max_tokens_exceeded", response=httpx.Response(400, request=request), body=None
+    )
+    sizes = []
+
+    def reply(body):
+        sizes.append(len(body["state"]["paper"]))
+        if len(sizes) == 1:
+            raise too_long
+        return _reply()
+
+    decisions, _, _ = decide(
+        _client(reply), "m", "T", "x" * 100_000, label_descriptions(REFERENCES)
+    )
+    assert sizes == [DECIDER_MAX_CHARS, int(DECIDER_MAX_CHARS * 0.6)] and decisions
+
+
+def test_a_reply_without_answers_is_an_error():
+    with pytest.raises(ValueError, match="without answers"):
+        decide(_client({"model": "m"}), "m", "T", "text", label_descriptions(REFERENCES))
+
+
+def test_unpinned_model_ids_are_not_checked(caplog):
+    decide(
+        _client(_reply(model="typesafe/jev-1.13-20261201")),
+        "typesafe/jev-1.13",
+        "T",
+        "x",
+        label_descriptions(REFERENCES),
+    )
+    assert not any("answered as" in r.message for r in caplog.records)
+
+
+def test_no_decider_call_without_the_flag(config, mock_part1_dict, mock_part2_dict):
     config.decider = None
-    summary, client = _run(config, combined, lambda body: _reply())
+    summary, client = _run(config, _combined(mock_part1_dict, mock_part2_dict), lambda b: _reply())
     client.decide.assert_not_called()
     assert summary.decisions is None
+
+
+def test_no_decider_call_for_papers_without_part2(config):
+    synthesis = {
+        "metadata": {
+            "citation_key": "doe2020survey",
+            "title": "A Survey",
+            "authors": ["J. Doe"],
+            "year": 2020,
+            "venue": "V",
+            "is_research_paper": True,
+            "paper_type": "synthesis",
+            "rejection_reason": None,
+            "tags": [],
+        },
+        "part1": {
+            "paper_type": "synthesis",
+            **dict.fromkeys(
+                [
+                    "tldr",
+                    "target_papers_field",
+                    "scope_coverage",
+                    "taxonomy_organization",
+                    "core_argument",
+                    "synthesis_contribution",
+                    "key_claims_narrative",
+                    "key_takeaways",
+                    "limitations",
+                    "critical_assessment",
+                    "relevance",
+                ],
+                "x",
+            ),
+        },
+        "part2": None,
+    }
+    summary, client = _run(config, synthesis, lambda b: _reply())
+    client.decide.assert_not_called()
+    assert summary.decisions is None
+
+
+def test_decider_gets_the_title_and_truncated_text(config, mock_part1_dict, mock_part2_dict):
+    config.max_chars = 5
+    summary, client = _run(
+        config,
+        _combined(mock_part1_dict, mock_part2_dict),
+        lambda b: _reply(model="typesafe/jev-1.13-20261201"),
+    )
+    state = client.decide.call_args.args[0]["state"]
+    assert state == {"title": summary.metadata.title, "paper": "paper"}  # "paper text"[:5]
+    assert summary.provenance.decider_model == "typesafe/jev-1.13-20261201"  # the served one
 
 
 # ---------------------------------------------------------------------------
@@ -201,15 +290,60 @@ def test_decisions_are_scored_against_the_gold_classification(mock_part1_dict, m
     }
 
 
-def test_caching_client_replays_decisions(tmp_path):
+def test_caching_client_replays_decisions_per_request(tmp_path):
     from summarizer.evaluation import CachingClient
 
     inner = MagicMock(model="m", base_url="u", pricing=None)
-    inner.decide.return_value = {"answers": {}}
+    inner.decide.side_effect = lambda body: {"answers": {"q": body["q"]}}
     cached = CachingClient(inner, tmp_path)
-    assert cached.decide({"q": 1}) == cached.decide({"q": 1}) == {"answers": {}}
-    inner.decide.assert_called_once()
-    assert (cached.hits, cached.misses) == (1, 1)
+    assert cached.decide({"q": 1}) == cached.decide({"q": 1}) == {"answers": {"q": 1}}
+    assert cached.decide({"q": 2}) == {"answers": {"q": 2}}
+    assert inner.decide.call_count == 2
+    assert (cached.hits, cached.misses) == (1, 2)
+
+
+def test_malformed_decider_replies_are_not_cached(tmp_path):
+    from summarizer.evaluation import CachingClient
+
+    inner = MagicMock(model="m", base_url="u", pricing=None)
+    inner.decide.return_value = "not json"
+    cached = CachingClient(inner, tmp_path)
+    cached.decide({"q": 1})
+    cached.decide({"q": 1})
+    assert inner.decide.call_count == 2
+
+
+def test_add_cost_reaches_the_run_total_but_not_the_call_count():
+    from summarizer.llm import CostAccumulator
+
+    run = CostAccumulator()
+    paper = CostAccumulator(parent=run)
+    paper.add_cost(0.5)
+    assert (run.total_cost, run.calls, paper.calls) == (0.5, 0, 0)
+
+
+@pytest.mark.parametrize("command", [[], ["eval"]])
+def test_decider_flag_reaches_the_config(tmp_path, command):
+    from summarizer.cli import main
+
+    report = MagicMock(processed=0, skipped=0, failed=0, failed_papers=[], total_cost=0.0)
+    report.stopped_reason = None
+    argv = [*command, "--source", str(tmp_path), "--decider"]
+    if not command:
+        argv.append("--dry-run")
+    with (
+        patch("summarizer.cli.run_batch", return_value=report) as run_batch,
+        patch("summarizer.cli.run_eval", return_value=([], None)) as run_eval,
+        patch("summarizer.cli._check_backend"),
+        patch("summarizer.cli._check_openrouter_config"),
+        patch("summarizer.cli._log_key_info"),
+        patch("sys.exit"),
+    ):
+        (tmp_path / "a.pdf").write_bytes(b"%PDF")
+        main(argv)
+    called = run_eval if command else run_batch
+    config = called.call_args.args[1]
+    assert config.decider == "typesafe/jev-1.13-20260917"
 
 
 def test_markdown_notes_only_disagreeing_decisions(mock_part1_dict, mock_part2_dict):
