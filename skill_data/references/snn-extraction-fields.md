@@ -30,7 +30,9 @@ The type of spiking (or rate-coded) neuron (e.g., LIF / ALIF / Izhikevich / rate
 ## Network architecture
 Feedforward / recurrent / reservoir, etc.; list any non-spiking modules (readout, bottleneck, critic), and whether it is `fully spiking` or `hybrid` (rule below).
 
-**Fully spiking vs. hybrid:** `hybrid` when a trained non-spiking component does part of the computation in the control or learning loop: a DNN critic next to a spiking actor (common in spiking RL, and it undermines whole-system energy claims), or a trained non-spiking controller/policy layer fed by a spiking network. A spiking network whose only non-spiking parts are an input encoding layer or a linear / leaky-integrator readout is still `fully spiking`.
+**Fully spiking vs. hybrid:**
+- **fully spiking** — only spiking neurons do the computation; a network whose only non-spiking parts are an input encoding layer or a linear / leaky-integrator readout is still fully spiking
+- **hybrid** — a trained non-spiking component does part of the computation in the control or learning loop: a DNN critic next to a spiking actor (common in spiking RL, and it undermines whole-system energy claims), or a trained non-spiking controller/policy layer fed by a spiking network
 
 ---
 
@@ -51,7 +53,7 @@ GPU (model if reported) / CPU / neuromorphic chip (which one?) / `not reported`.
 
 ## Controller hardware (inference)
 Where does the network execute at runtime? Use exactly one:
-- **CPU/GPU** — standard compute
+- **CPU/GPU** — standard compute: CPUs or GPUs, including software simulators such as Nengo, Brian or PyTorch
 - **Neuromorphic emulator/SDK** — chip behaviour simulated in software (e.g. NengoLoihi emulator, Lava software stack); no physical chip present
 - **Physical neuromorphic chip** — real hardware (e.g. Loihi board, SpiNNaker rack, custom FPGA); required for energy measurements to be meaningful
 - **not reported** — the paper never says where the network runs; don't infer `CPU/GPU` from a software simulation
@@ -102,7 +104,7 @@ The most important field: name the algorithm, what signal drives learning (loss/
 ## Credit assignment scope
 - **Global** — BPTT-style gradients (truncated/full as stated) propagate through trained components
 - **Semi-local** — eligibility traces + modulating signal (e-prop, FPTT, perturbation); avoids full BPTT storage
-- **Local** — pre/post-synaptic activity only (STDP, R-STDP, three-factor rules)
+- **Local** — pre/post-synaptic activity only, optionally with a modulating or error signal (STDP, R-STDP, three-factor rules, PES)
 - **Analytical** — no gradient; weights set by closed-form optimization (NEF, reservoir). Applies when such weights form (part of) the controller; fixed decoders used only as a setup step don't make a network `Analytical` or `Hybrid`.
 - **Hybrid** — combines scopes; describe each component separately
 - **Not applicable** — no learning: "Not applicable — weights [analytically constructed / fixed by design]."
@@ -110,7 +112,11 @@ The most important field: name the algorithm, what signal drives learning (loss/
 ---
 
 ## Online vs. offline
-Online (weights update during task execution) / offline (separate training phase from dataset or replay) / mixed; do not confuse online inference with online learning.
+Do not confuse online inference with online learning.
+- **Offline** — a separate training phase (from a dataset, rollouts or replay); weights are fixed while the controller runs
+- **Online** — weights update during task execution
+- **Mixed** — both: offline training and online adaptation during execution
+- **not applicable** — nothing is learned (weights analytically constructed or fixed by design)
 
 ---
 

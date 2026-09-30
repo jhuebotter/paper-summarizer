@@ -89,6 +89,13 @@ class CostAccumulator:
         if self._parent is not None:
             self._parent.add(usage, cost)
 
+    def add_cost(self, cost: float) -> None:
+        """Record spend that is not an LLM call (e.g. a decision model)."""
+        with self._lock:
+            self.total_cost += cost
+        if self._parent is not None:
+            self._parent.add_cost(cost)
+
     def note_json_repair(self) -> None:
         with self._lock:
             self.json_repairs += 1
@@ -228,6 +235,13 @@ class LLMClient:
                 f"LLM returned no content (finish_reason={choice.finish_reason!r})", usage
             )
         return CompletionResponse(text=text, usage=usage)
+
+    def decide(self, body: dict) -> dict:
+        """POST a decision request in the System One wire format (``/systemone``,
+        relative to the base URL) and return the JSON reply."""
+        return self._client.post(
+            "/systemone", body=body, cast_to=object, options={"timeout": self.timeout_s}
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +623,11 @@ def _record(accumulator: "CostAccumulator | None", usage: "UsageStats | None", c
 def _complete_with_retries(
     client: LLMClient, prompt: str, accumulator: "CostAccumulator | None" = None
 ) -> CompletionResponse:
-    """Run one completion with retry/backoff on transient errors.
+    return with_retries(lambda: client.complete(prompt), client, accumulator)
+
+
+def with_retries(call, client: LLMClient, accumulator: "CostAccumulator | None" = None):
+    """Run one backend request with retry/backoff on transient errors.
 
     Retried: HTTP 429 (per-minute limits), 5xx, timeouts, connection errors and
     transient provider errors reported inside a 200 response (whose usage, if
@@ -619,7 +637,7 @@ def _complete_with_retries(
     attempts = _MAX_TRANSIENT_RETRIES + 1
     for attempt in range(1, attempts + 1):
         try:
-            return client.complete(prompt)
+            return call()
         except ProviderError as exc:
             if exc.code == 402:
                 raise QuotaExhausted(f"Credits exhausted: {exc}") from exc

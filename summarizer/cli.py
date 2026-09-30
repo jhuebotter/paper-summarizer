@@ -34,6 +34,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from summarizer.batch import OutputDirLocked, find_pdfs, render_all, run_batch, run_pdfs
+from summarizer.decider import DEFAULT_DECIDER
 from summarizer.evaluation import EvalConfig, init_gold, run_eval
 from summarizer.llm import (
     fetch_openrouter_key_info,
@@ -99,6 +100,7 @@ def main(argv: list[str] | None = None) -> None:
         workers=args.workers,
         strip_references=args.strip_references,
         structured_output=args.structured_output,
+        decider=args.decider,
         max_cost=args.max_cost,
         zotero=args.zotero,
     )
@@ -217,6 +219,7 @@ def _eval_main(argv: list[str]) -> None:
         workers=args.workers,
         strip_references=args.strip_references,
         structured_output=args.structured_output,
+        decider=args.decider,
         max_cost=args.max_cost,
     )
     _check_backend(config.base_url)
@@ -595,6 +598,16 @@ def _add_backend_args(parser: argparse.ArgumentParser, log_default: str) -> None
         help=(
             "Constrain replies to the summary JSON schema (backend must support it; default: off)."
         ),
+    )
+    parser.add_argument(
+        "--decider",
+        nargs="?",
+        const=DEFAULT_DECIDER,
+        default=None,
+        metavar="MODEL",
+        help="Also ask a decision model for the classification labels, on the same backend "
+        f"(stored next to the LLM's labels; default model: {DEFAULT_DECIDER}; default: off). "
+        "Sends the paper text to that model.",
     )
 
 
