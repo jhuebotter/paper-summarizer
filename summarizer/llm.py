@@ -570,7 +570,7 @@ def _extract_json(text: str) -> dict:
         raise LLMError(f"No JSON object found in LLM response: {text[:200]!r}")
     json_str = text[start : end + 1]
     try:
-        return json.loads(json_str)
+        return json.loads(json_str, strict=False)  # models emit raw tabs/newlines in strings
     except json.JSONDecodeError as e:
         raise LLMError(f"Failed to parse LLM response as JSON: {e}") from e
 
