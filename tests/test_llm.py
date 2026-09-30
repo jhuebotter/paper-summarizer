@@ -1299,3 +1299,11 @@ def test_accumulator_forwards_to_parent():
     child.note_schema_repair()
     assert (parent.calls, parent.total_cost, parent.total_input_tokens) == (1, 0.25, 5)
     assert (parent.json_repairs, parent.schema_repairs) == (1, 1)
+
+
+def test_raw_control_characters_inside_strings_are_accepted():
+    """Regression: a real reply with a raw tab inside a string failed as invalid JSON."""
+    mock_client = MagicMock()
+    mock_client.complete.return_value = MagicMock(text='{"a": "x\ty\nz"}', usage=None)
+    assert call_llm(mock_client, "p") == {"a": "x\ty\nz"}
+    mock_client.complete.assert_called_once()  # no repair call
