@@ -28,9 +28,9 @@ The type of spiking (or rate-coded) neuron (e.g., LIF / ALIF / Izhikevich / rate
 ---
 
 ## Network architecture
-Feedforward / recurrent / reservoir, etc.; list any non-spiking modules (readout, bottleneck, critic), and whether it is `fully spiking` or `hybrid` (explicitly state `hybrid` if any non-spiking component participates in the learning/control loop).
+Feedforward / recurrent / reservoir, etc.; list any non-spiking modules (readout, bottleneck, critic), and whether it is `fully spiking` or `hybrid` (rule below).
 
-**Fully spiking vs. hybrid:** A spiking actor with a non-spiking DNN critic is `hybrid` — this is common in spiking RL and undermines whole-system energy claims.
+**Fully spiking vs. hybrid:** `hybrid` when a trained non-spiking component does part of the computation in the control or learning loop: a DNN critic next to a spiking actor (common in spiking RL, and it undermines whole-system energy claims), or a trained non-spiking controller/policy layer fed by a spiking network. A spiking network whose only non-spiking parts are an input encoding layer or a linear / leaky-integrator readout is still `fully spiking`.
 
 ---
 
@@ -45,7 +45,7 @@ Be specific — "PyTorch" alone is insufficient if a spiking library is used on 
 ---
 
 ## Hardware (training)
-GPU (model if reported) / CPU / neuromorphic chip / `not reported`.
+GPU (model if reported) / CPU / neuromorphic chip (which one?) / `not reported`.
 
 ---
 
@@ -53,7 +53,8 @@ GPU (model if reported) / CPU / neuromorphic chip / `not reported`.
 Where does the network execute at runtime? Use exactly one:
 - **CPU/GPU** — standard compute
 - **Neuromorphic emulator/SDK** — chip behaviour simulated in software (e.g. NengoLoihi emulator, Lava software stack); no physical chip present
-- **Physical neuromorphic chip** — real hardware (e.g. Loihi board, SpiNNaker rack); required for energy measurements to be meaningful
+- **Physical neuromorphic chip** — real hardware (e.g. Loihi board, SpiNNaker rack, custom FPGA); required for energy measurements to be meaningful
+- **not reported** — the paper never says where the network runs; don't infer `CPU/GPU` from a software simulation
 
 **Do not conflate with the task environment.** A controller can run on a real Loihi chip while the robot arm is simulated in MuJoCo — these are orthogonal axes reported separately.
 
@@ -102,7 +103,7 @@ The most important field: name the algorithm, what signal drives learning (loss/
 - **Global** — BPTT-style gradients (truncated/full as stated) propagate through trained components
 - **Semi-local** — eligibility traces + modulating signal (e-prop, FPTT, perturbation); avoids full BPTT storage
 - **Local** — pre/post-synaptic activity only (STDP, R-STDP, three-factor rules)
-- **Analytical** — no gradient; weights set by closed-form optimization (NEF, reservoir)
+- **Analytical** — no gradient; weights set by closed-form optimization (NEF, reservoir). Applies when such weights form (part of) the controller; fixed decoders used only as a setup step don't make a network `Analytical` or `Hybrid`.
 - **Hybrid** — combines scopes; describe each component separately
 - **Not applicable** — no learning: "Not applicable — weights [analytically constructed / fixed by design]."
 
