@@ -19,10 +19,7 @@ Requires [uv](https://docs.astral.sh/uv/getting-started/installation/). uv insta
 ```bash
 git clone https://github.com/jhuebotter/paper-summarizer && cd paper-summarizer
 uv sync --extra docling          # omit --extra docling for a light pypdf-only install
-cat > .env <<'EOF'
-LLM_API_KEY=your_openrouter_key_here
-# LLM_MODEL=nvidia/nemotron-3-super-120b-a12b:free   # optional override
-EOF
+cp .env.example .env              # then put your OpenRouter key in .env
 uv run summarize-papers --source input_papers
 ```
 
@@ -60,8 +57,8 @@ Use `collect_pdfs.sh` when your PDFs live in deep subfolders (for example Zotero
 
 ### Zotero metadata
 
-When a PDF's name starts with its Zotero attachment key (`<KEY>__…pdf`, as `collect_pdfs.sh` names them) and Zotero is running, runs take the title, authors, year, venue and citation key from the Zotero item instead of the LLM. They use Zotero's read-only local API on `localhost:23119`, which is on by default in Zotero 7+ (*Settings → Advanced → Allow other applications on this computer to communicate with Zotero*). Your personal library and all your groups are searched.
-- `--no-zotero` turns it off. When Zotero isn't reachable, the run logs one warning and uses the LLM's metadata.
+When a PDF's name starts with its Zotero attachment key (`<KEY>__…pdf`, as `collect_pdfs.sh` names them) and Zotero is running, runs take the title, authors, year, venue and citation key from the Zotero item instead of the LLM. They use Zotero's read-only local API on `localhost:23119`, which is off by default: enable *Settings → Advanced → Miscellaneous → Allow other applications on this computer to communicate with Zotero* (Zotero 7+). Your personal library and all your groups are searched.
+- `--no-zotero` turns it off. When Zotero isn't reachable or stops answering, the run logs a warning and uses the LLM's metadata for the remaining papers. Items in the Zotero trash are used, with a warning.
 - The sidecar records the item (`provenance.zotero_item`) and which fields Zotero changed (`provenance.zotero_fields`); each change is also logged.
 - The paper type, classification and everything else still come from the LLM, and PDFs are still read from disk.
 - `eval` never uses Zotero, since it measures the model.

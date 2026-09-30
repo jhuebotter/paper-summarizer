@@ -359,7 +359,7 @@ def _build_schema_repair_prompt(
 
 def _zotero_values(zotero: ZoteroRecord) -> dict:
     """The non-empty metadata values Zotero provides."""
-    key = zotero.citation_key.lower()
+    key = _sanitize_citation_key(zotero.citation_key)  # e.g. paredes-valles2024Fully
     values = {
         "citation_key": key if _is_valid_citation_key(key) else None,
         "title": zotero.title,

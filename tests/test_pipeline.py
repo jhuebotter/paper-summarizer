@@ -825,3 +825,48 @@ def test_without_zotero_provenance_has_no_item(fake_pdf, config, mock_part1_dict
     with _mock_parse("Some paper text."), client_patcher:
         provenance = process_pdf(fake_pdf, config).provenance
     assert (provenance.zotero_item, provenance.zotero_fields) == (None, [])
+
+
+@pytest.mark.parametrize(
+    "zotero_key, author, year, expected",
+    [
+        ("paredes-valles2024Fully", "Federico Paredes-Vallés", 2024, "paredesvalles2024fully"),
+        ("garciaa.2023Spiking", "Omar A. García A.", 2023, "garciaa2023spiking"),  # as stored
+        ("garciaa.2023Spiking", "Omar García", 2023, "garcia2023spiking"),  # clean name: rebuilt
+    ],
+)
+def test_zotero_citation_keys_are_sanitized(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict, zotero_key, author, year, expected
+):
+    """Review finding: hyphenated/dotted Zotero keys were dropped instead of cleaned."""
+    record = _zotero_record(citation_key=zotero_key, authors=[author], year=year)
+    client_patcher, _ = _mock_llm_combined(_make_combined_dict(mock_part1_dict, mock_part2_dict))
+    with _mock_parse("Some paper text."), client_patcher:
+        assert process_pdf(fake_pdf, config, zotero=record).metadata.citation_key == expected
+
+
+def test_llm_key_is_checked_against_zotero_author_and_year(
+    fake_pdf, config, mock_part1_dict, mock_part2_dict
+):
+    """Without a Zotero key, the LLM's key must still agree with Zotero's first author and year."""
+    client_patcher, _ = _mock_llm_combined(_make_combined_dict(mock_part1_dict, mock_part2_dict))
+    with _mock_parse("Some paper text."), client_patcher:
+        summary = process_pdf(fake_pdf, config, zotero=_zotero_record(citation_key=""))
+    assert summary.metadata.citation_key == "oikonomou2023spiking"  # LLM key: huebotter2025spiking
+
+
+def test_zotero_values_survive_a_schema_repair(fake_pdf, config, mock_part1_dict, mock_part2_dict):
+    broken = _make_combined_dict(mock_part1_dict, mock_part2_dict)
+    broken["part2"] = {**broken["part2"], "neuron_model": None}
+    fixed = _make_combined_dict(mock_part1_dict, mock_part2_dict)  # the LLM's metadata again
+    mock_client = MagicMock()
+    mock_client.complete.side_effect = [
+        MagicMock(text=json.dumps(broken)),
+        MagicMock(text=json.dumps(fixed)),
+    ]
+    with (
+        _mock_parse("text"),
+        patch("summarizer.pipeline.create_client", return_value=mock_client),
+    ):
+        summary = process_pdf(fake_pdf, config, zotero=_zotero_record())
+    assert (summary.metadata.year, summary.metadata.citation_key) == (2023, "oikonomou2023hybrid")

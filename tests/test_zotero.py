@@ -114,3 +114,73 @@ def test_missing_fields_stay_empty_and_venue_falls_back():
         "arXiv",
         "",
     )
+
+
+def test_child_notes_are_not_attachments():
+    note = {"data": {"itemType": "note", "parentItem": "YXWFBPTP"}}
+    with _fake_api({f"{GROUP}/items/AAAAAAAA": note, f"{GROUP}/items/YXWFBPTP": PARENT}):
+        assert lookup_all([Path("AAAAAAAA__a.pdf")]) == {}
+
+
+def test_conference_venue_prefers_the_proceedings_title():
+    parent = {
+        "data": {
+            "itemType": "conferencePaper",
+            "title": "T",
+            "creators": [],
+            "proceedingsTitle": "Proceedings of ICML",
+            "conferenceName": "ICML 2018",
+        },
+        "meta": {},
+    }
+    items = {f"{GROUP}/items/AAAAAAAA": _attachment("PPPPPPPP"), f"{GROUP}/items/PPPPPPPP": parent}
+    with _fake_api(items):
+        assert (
+            lookup_all([Path("AAAAAAAA__a.pdf")])[Path("AAAAAAAA__a.pdf")].venue
+            == "Proceedings of ICML"
+        )
+
+
+def test_only_zotero_key_prefixes_are_looked_up():
+    names = [
+        "aaaaaaaa__lower.pdf",
+        "AAAAAAAA_single.pdf",
+        "AAAAAAA__seven.pdf",
+        "AAAAAAAAB__nine.pdf",
+    ]
+    with _fake_api({}) as urlopen:
+        assert lookup_all([Path(n) for n in names]) == {}
+    urlopen.assert_not_called()
+
+
+def test_a_timeout_stops_further_lookups_but_keeps_earlier_matches(caplog):
+    """Review finding: a hung Zotero stalled the run for the timeout on every PDF."""
+    items = {
+        f"{GROUP}/items/LUN2TVN5": _attachment(),
+        f"{GROUP}/items/YXWFBPTP": PARENT,
+        "users/0/items/BBBBBBBB": TimeoutError("timed out"),
+    }
+    pdfs = [Path("LUN2TVN5__a.pdf"), Path("BBBBBBBB__b.pdf"), Path("CCCCCCCC__c.pdf")]
+    with _fake_api(items) as urlopen, caplog.at_level(logging.WARNING, logger="summarizer.zotero"):
+        records = lookup_all(pdfs)
+    assert list(records) == [pdfs[0]]
+    assert not any("CCCCCCCC" in c.args[0] for c in urlopen.call_args_list)
+    assert all(c.kwargs["timeout"] == 3 for c in urlopen.call_args_list)
+
+
+def test_items_in_the_trash_are_used_with_a_warning(caplog):
+    trashed = {**PARENT, "data": {**PARENT["data"], "deleted": True}}
+    items = {f"{GROUP}/items/LUN2TVN5": _attachment(), f"{GROUP}/items/YXWFBPTP": trashed}
+    with _fake_api(items), caplog.at_level(logging.WARNING, logger="summarizer.zotero"):
+        assert lookup_all([Path("LUN2TVN5__a.pdf")])
+    assert any("trash" in r.message for r in caplog.records)
+
+
+def test_local_api_disabled_hints_at_the_setting(caplog):
+    forbidden = urllib.error.HTTPError("u", 403, "Forbidden", {}, None)
+    with (
+        _fake_api({"users/0/groups": forbidden}),
+        caplog.at_level(logging.WARNING, "summarizer.zotero"),
+    ):
+        assert lookup_all([Path("AAAAAAAA__a.pdf")]) == {}
+    assert any("Allow other applications" in r.message for r in caplog.records)

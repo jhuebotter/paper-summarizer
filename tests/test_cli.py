@@ -673,6 +673,10 @@ def test_render_rejects_a_missing_output_dir(tmp_path):
     assert exc_info.value.code == 1
 
 
-def test_no_zotero_flag():
-    args = _build_parser().parse_args(["--source", ".", "--no-zotero"])
-    assert args.zotero is False
+def test_no_zotero_flag_reaches_the_config(tmp_path):
+    report = MagicMock(processed=0, skipped=0, failed=0, failed_papers=[], total_cost=0.0)
+    report.stopped_reason = None
+    argv = ["summarize-papers", "--source", str(tmp_path), "--dry-run", "--no-zotero"]
+    with patch("sys.argv", argv), patch("summarizer.cli.run_batch", return_value=report) as run:
+        main()
+    assert run.call_args[0][1].zotero is False

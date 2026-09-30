@@ -383,7 +383,7 @@ class Provenance(BaseModel):
     output_tokens: int
     cost_usd: float
     zotero_item: str | None = None  # e.g. "groups/5824653/items/YXWFBPTP"
-    zotero_fields: list[str] = []  # metadata fields where Zotero replaced the LLM's value
+    zotero_fields: list[str] = Field(default_factory=list)  # fields where Zotero replaced the LLM's
 
 
 class PaperSummary(BaseModel):

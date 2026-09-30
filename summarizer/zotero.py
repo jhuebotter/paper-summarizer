@@ -6,10 +6,11 @@ serves a read-only API on ``localhost:23119`` while it runs; this module maps
 each PDF to its parent item there, so title, authors, year, venue and citation
 key can come from the curated library instead of the LLM.
 
-Lookups are best-effort: when Zotero isn't running, the run continues with the
-LLM's metadata and a single warning.
+Lookups are best-effort: when Zotero isn't reachable (or stops answering), the
+run continues with the LLM's metadata.
 """
 
+import http.client
 import json
 import logging
 import re
@@ -50,21 +51,22 @@ def lookup_all(pdfs: list[Path]) -> dict[Path, ZoteroRecord]:
     keyed = {pdf: m.group(1) for pdf in pdfs if (m := _KEY_PREFIX.match(pdf.name))}
     if not keyed:
         return {}
-    try:
-        groups = _get("users/0/groups") or []
-    except (OSError, ValueError) as exc:
-        logger.warning("Zotero is not reachable (%s); using the LLM's metadata", exc)
-        return {}
-    libraries = ["users/0"] + [f"groups/{g['id']}" for g in groups]
     records = {}
-    for pdf, key in keyed.items():
-        try:
-            record = _find(key, libraries)
-        except (OSError, ValueError) as exc:
-            logger.warning("Zotero lookup failed for %s: %s", pdf.name, exc)
-            continue
-        if record is not None:
-            records[pdf] = record
+    try:
+        libraries = ["users/0"] + [f"groups/{g['id']}" for g in _get("users/0/groups") or []]
+        for pdf, key in keyed.items():
+            try:
+                record = _find(key, libraries)
+            except urllib.error.HTTPError as exc:
+                logger.warning("Zotero lookup failed for %s: %s", pdf.name, exc)
+                continue
+            if record is not None:
+                records[pdf] = record
+    except (OSError, ValueError, TypeError, KeyError, http.client.HTTPException) as exc:
+        hint = (
+            " (enable Settings → Advanced → Allow other applications…)" if "403" in str(exc) else ""
+        )
+        logger.warning("Zotero is not reachable (%s)%s; using the LLM's metadata", exc, hint)
     logger.info("Zotero: matched %d of %d PDFs with a Zotero key", len(records), len(keyed))
     return records
 
@@ -78,6 +80,10 @@ def _find(key: str, libraries: list[str]) -> ZoteroRecord | None:
         if data.get("itemType") != "attachment" or not data.get("parentItem"):
             return None  # a standalone attachment or not an attachment: no bibliographic item
         parent = _get(f"{library}/items/{data['parentItem']}")
+        if parent and parent.get("data", {}).get("deleted"):
+            logger.warning(
+                "Zotero item %s (attachment %s) is in the trash", data["parentItem"], key
+            )
         return _record(f"{library}/items/{data['parentItem']}", parent) if parent else None
     return None
 

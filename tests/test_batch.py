@@ -18,6 +18,7 @@ from summarizer.batch import (
     should_skip,
 )
 from summarizer.models import Config, PipelineError
+from summarizer.parser import sha256_file
 
 _PDF_COUNTER = itertools.count()
 
@@ -902,6 +903,25 @@ def test_batch_passes_each_pdf_its_zotero_record(tmp_path, config):
         run_batch(tmp_path, config)
     lookup.assert_called_once_with([pdf])
     assert seen == {"AAAAAAAA__paper.pdf": record}
+
+
+def test_zotero_lookup_covers_only_the_papers_to_process(tmp_path, config):
+    new, done = tmp_path / "AAAAAAAA__new.pdf", tmp_path / "BBBBBBBB__done.pdf"
+    new.write_bytes(_pdf_bytes())
+    done.write_bytes(_pdf_bytes())
+    sha = sha256_file(done)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    save_processed_index(
+        config.output_dir, {sha: {"pdf_path": str(done), "outputs": [], "sha256": sha}}
+    )
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.lookup_all", return_value={}) as lookup,
+        patch("summarizer.batch.process_pdf", return_value=_make_summary("a2020x")),
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        run_batch(tmp_path, config)
+    lookup.assert_called_once_with([new])
 
 
 def test_no_zotero_and_dry_run_skip_the_lookup(tmp_path, config):
