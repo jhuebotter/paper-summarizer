@@ -124,7 +124,8 @@ class CachingClient:
             return json.loads(path.read_text(encoding="utf-8"))
         reply = self._inner.decide(body)
         self.misses += 1
-        if isinstance(reply, dict) and isinstance(reply.get("answers"), dict):
+        answers = reply.get("answers") if isinstance(reply, dict) else None
+        if answers and all(isinstance(a, dict) and "choice" in a for a in answers.values()):
             self._cache_dir.mkdir(parents=True, exist_ok=True)
             atomic_write_text(path, json.dumps(reply))
         return reply

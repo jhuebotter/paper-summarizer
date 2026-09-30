@@ -294,10 +294,11 @@ def test_caching_client_replays_decisions_per_request(tmp_path):
     from summarizer.evaluation import CachingClient
 
     inner = MagicMock(model="m", base_url="u", pricing=None)
-    inner.decide.side_effect = lambda body: {"answers": {"q": body["q"]}}
+    inner.decide.side_effect = lambda body: {"answers": {"a": {"choice": body["q"]}}}
     cached = CachingClient(inner, tmp_path)
-    assert cached.decide({"q": 1}) == cached.decide({"q": 1}) == {"answers": {"q": 1}}
-    assert cached.decide({"q": 2}) == {"answers": {"q": 2}}
+    first = cached.decide({"q": 1})
+    assert first == cached.decide({"q": 1}) == {"answers": {"a": {"choice": 1}}}
+    assert cached.decide({"q": 2}) == {"answers": {"a": {"choice": 2}}}
     assert inner.decide.call_count == 2
     assert (cached.hits, cached.misses) == (1, 2)
 
@@ -356,3 +357,90 @@ def test_markdown_notes_only_disagreeing_decisions(mock_part1_dict, mock_part2_d
     md = render_summary(_summary_with(mock_part1_dict, mock_part2_dict, decisions))
     assert "**Architecture:** fully spiking (decision model: hybrid, p=0.81)" in md
     assert "**Learning regime:** Offline  " in md
+
+
+def _bad_request(message):
+    import httpx2 as httpx
+    import openai
+
+    request = httpx.Request("POST", "https://x/systemone")
+    return openai.BadRequestError(message, response=httpx.Response(400, request=request), body=None)
+
+
+def test_other_bad_requests_fail_immediately():
+    client = _client(lambda body: (_ for _ in ()).throw(_bad_request("invalid question")))
+    with pytest.raises(Exception, match="invalid question"):
+        decide(client, "m", "T", "x" * 100_000, label_descriptions(REFERENCES))
+    assert client.decide.call_count == 1
+
+
+def test_shrinking_stops_below_a_floor():
+    client = _client(lambda body: (_ for _ in ()).throw(_bad_request("max_tokens_exceeded")))
+    with pytest.raises(Exception, match="max_tokens"):
+        decide(client, "m", "T", "x" * 100_000, label_descriptions(REFERENCES))
+    sizes = [len(c.args[0]["state"]["paper"]) for c in client.decide.call_args_list]
+    assert sizes[0] == DECIDER_MAX_CHARS and 1_000 < sizes[-1] < 5_000 and len(sizes) == 6
+
+
+@pytest.mark.parametrize(
+    "reply", ["not json", {"answers": "x"}, {"answers": {"architecture": {"choice": "hybrid"}}}]
+)
+def test_malformed_replies_are_errors(reply):
+    with pytest.raises(ValueError, match="without answers"):
+        decide(_client(reply), "m", "T", "text", label_descriptions(REFERENCES))
+
+
+def test_missing_heading_and_colliding_labels_are_errors(tmp_path, monkeypatch):
+    text = (REFERENCES / "snn-extraction-fields.md").read_text()
+    (tmp_path / "snn-extraction-fields.md").write_text(
+        text.replace("## Credit assignment scope", "## Credit")
+    )
+    with pytest.raises(ValueError, match="No '## Credit assignment scope' section"):
+        label_descriptions(tmp_path)
+    monkeypatch.setattr("summarizer.decider._key", lambda label: "same")
+    with pytest.raises(ValueError, match="same question key"):
+        label_descriptions.__wrapped__(REFERENCES)
+
+
+def test_only_dated_snapshots_count_as_pinned(caplog):
+    decide(
+        _client(_reply(model="typesafe/jev-2-x")),
+        "typesafe/jev-2",
+        "T",
+        "x",
+        label_descriptions(REFERENCES),
+    )
+    assert not any("answered as" in r.message for r in caplog.records)
+
+
+def test_caching_client_skips_replies_without_choices(tmp_path):
+    from summarizer.evaluation import CachingClient
+
+    inner = MagicMock(model="m", base_url="u", pricing=None)
+    inner.decide.return_value = {"answers": {"architecture": {"probabilities": {}}}}
+    cached = CachingClient(inner, tmp_path)
+    cached.decide({"q": 1})
+    cached.decide({"q": 1})
+    assert inner.decide.call_count == 2
+
+
+@pytest.mark.parametrize("command", [[], ["eval"]])
+def test_unreadable_label_definitions_stop_at_startup(tmp_path, command):
+    from summarizer.cli import main
+
+    (tmp_path / "a.pdf").write_bytes(b"%PDF")
+    refs = tmp_path / "refs"
+    refs.mkdir()
+    argv = [*command, "--source", str(tmp_path), "--decider", "--skill-data-dir", str(refs)]
+    with (
+        patch("summarizer.cli._check_backend"),
+        patch("summarizer.cli._check_openrouter_config"),
+        patch("summarizer.cli._log_key_info"),
+        patch("summarizer.cli.run_batch") as run_batch,
+        patch("summarizer.cli.run_eval") as run_eval,
+        pytest.raises(SystemExit) as info,
+    ):
+        main(argv)
+    assert info.value.code == 1
+    run_batch.assert_not_called()
+    run_eval.assert_not_called()

@@ -363,7 +363,7 @@ def _check_decider(config: Config) -> None:
             label_descriptions(config.skill_data_dir)
         except (OSError, ValueError) as exc:
             logger.error("--decider: %s", exc)
-            sys.exit(2)
+            sys.exit(1)
 
 
 def _check_backend(base_url: str) -> None:
