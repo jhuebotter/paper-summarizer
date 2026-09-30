@@ -195,7 +195,7 @@ With `--decider`, each primary paper's text is also sent to a decision model: Ty
 - **Cost:** about $0.001 per paper. It is recorded in `provenance.decider_cost_usd` and counts toward `--max-cost`.
 - **Failures:** a failure is logged and recorded (`provenance.decider_error`); the summary is kept.
 - **Privacy:** it sends the paper text to TypeSafe via OpenRouter, like the LLM call. Don't use it on unpublished work.
-- **Endpoint:** it uses the System One wire format (`POST <base-url>/systemone`), which a local [Laya](https://github.com/nvkudva/laya-server) server also serves (`--base-url http://localhost:8000/v1 --decider laya`). Laya reads only 512–1024 tokens of the paper, though.
+- **Endpoint:** it uses the System One wire format (`POST <base-url>/systemone`) on the LLM's backend. A local [Laya](https://github.com/nvkudva/laya-server) server speaks the same format, but it would need its own URL (not supported yet) and reads only 512–1024 tokens.
 - **Eval:** `summarize-papers eval --decider` scores the decider's labels as `decider.*` next to the LLM's `classification.*`.
 
 ## Evaluation
