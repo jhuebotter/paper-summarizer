@@ -168,6 +168,7 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 - `--max-chars N`: paper-text budget (default 200,000 ≈ 50k tokens). Longer text is truncated, and a warning is logged. For models with a smaller context window (known from OpenRouter), the text is cut further so the prompt and reply fit.
 - `--strip-references` / `--no-strip-references`: drop the References/Bibliography section before sending (default on). This saves tokens and budget for the actual paper. With docling, appendices after the references are kept; with pypdf, everything after the references heading is dropped.
 - `--structured-output`: ask the backend to constrain replies to the summary's JSON schema (off by default until the evaluation shows it helps; the model must support structured outputs).
+- `--decider [MODEL]`: also ask a decision model for the four single-label classification fields (see [Decision model](#decision-model)). Off by default.
 - `--zotero` / `--no-zotero`: bibliographic metadata from the local Zotero library (default on; see [Zotero metadata](#zotero-metadata)).
 - `--max-cost USD`: stop starting new papers once this much has been spent (papers already running still finish). Also applies to `eval`.
 - `--max-output-tokens N`: cap generated tokens (default: no cap). If the model hits the cap, the paper fails with a clear message instead of an unrepairable half-JSON.
@@ -185,6 +186,17 @@ Before processing (not in `--dry-run`), the CLI checks that the backend is reach
 - A run stopped by a quota or `--max-cost` exits with 1 and says why; rerunning continues where it stopped.
 - One run at a time per output directory: a second run (or `render`) on the same directory exits with an error while the first is running (POSIX; on Windows, don't overlap runs).
 - `render` overwrites the markdown files, including any hand edits; invalid sidecars are reported and skipped.
+
+## Decision model
+
+With `--decider`, each primary paper's text is also sent to a decision model: TypeSafe's Jev on the same OpenRouter key, pinned to `typesafe/jev-1.13-20260917`. The model answers one multiple-choice question per classification field (inference hardware, architecture, credit assignment, learning regime) and returns calibrated probabilities.
+- **Descriptions:** each label's description comes from the bullets in `skill_data/references/snn-extraction-fields.md`, so the LLM and the decider share definitions.
+- **Storage:** the answers go into the sidecar next to the LLM's labels (`decisions`, with probabilities and the LLM's label). They don't replace them. The markdown shows a note only where the two disagree.
+- **Cost:** about $0.001 per paper. It is recorded in `provenance.decider_cost_usd` and counts toward `--max-cost`.
+- **Failures:** a failure is logged and recorded (`provenance.decider_error`); the summary is kept.
+- **Privacy:** it sends the paper text to TypeSafe via OpenRouter, like the LLM call. Don't use it on unpublished work.
+- **Endpoint:** it uses the System One wire format (`POST <base-url>/systemone`), which a local [Laya](https://github.com/nvkudva/laya-server) server also serves (`--base-url http://localhost:8000/v1 --decider laya`). Laya reads only 512–1024 tokens of the paper, though.
+- **Eval:** `summarize-papers eval --decider` scores the decider's labels as `decider.*` next to the LLM's `classification.*`.
 
 ## Evaluation
 
@@ -249,7 +261,7 @@ CI runs lint and tests on Python 3.12–3.14.
 ## Roadmap
 
 - Leaner, type-specific prompts (and choosing the `--structured-output` default from evaluation results).
-- Decision models, i.e. fast classifiers that return calibrated probabilities (e.g. TypeSafe's Jev, or local models via Ollaya), for screening, typed field extraction and cross-checks.
+- Decision models beyond the classification labels: screening (in scope for the review?) and paradigm families; trusting them over the LLM where the evaluation supports it.
 - Domain profiles, so the research field is hot-swappable.
 - Corpus-level comparison tables, BibTeX export and staged synthesis.
 

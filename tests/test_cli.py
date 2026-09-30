@@ -680,3 +680,12 @@ def test_no_zotero_flag_reaches_the_config(tmp_path):
     with patch("sys.argv", argv), patch("summarizer.cli.run_batch", return_value=report) as run:
         main()
     assert run.call_args[0][1].zotero is False
+
+
+def test_decider_flag_defaults_to_the_pinned_jev_snapshot():
+    from summarizer.decider import DEFAULT_DECIDER
+
+    parser = _build_parser()
+    assert parser.parse_args(["--source", "."]).decider is None
+    assert parser.parse_args(["--source", ".", "--decider"]).decider == DEFAULT_DECIDER
+    assert parser.parse_args(["--source", ".", "--decider", "laya"]).decider == "laya"
