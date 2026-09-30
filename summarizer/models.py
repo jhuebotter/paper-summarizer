@@ -384,6 +384,18 @@ class Provenance(BaseModel):
     cost_usd: float
     zotero_item: str | None = None  # e.g. "groups/5824653/items/YXWFBPTP"
     zotero_fields: list[str] = Field(default_factory=list)  # fields where Zotero replaced the LLM's
+    decider_model: str | None = None  # snapshot that answered, e.g. "typesafe/jev-1.13-20260917"
+    decider_cost_usd: float = 0.0
+    decider_error: str | None = None
+
+
+class Decision(BaseModel):
+    """A decision model's answer for one ``Classification`` field."""
+
+    label: str
+    probabilities: dict[str, float]
+    confidence: float | None = None
+    llm_label: str | None = None  # the LLM's label for the same field
 
 
 class PaperSummary(BaseModel):
@@ -401,6 +413,7 @@ class PaperSummary(BaseModel):
     part1: SummaryPart1
     part2: SummaryPart2 | None
     provenance: Provenance | None = None
+    decisions: dict[str, Decision] | None = None  # decision-model labels (see decider.py)
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +514,8 @@ class Config:
         max_cost:          Stop starting new papers once this many USD are spent.
         zotero:            Take bibliographic metadata from the local Zotero library
                            (batch runs only; see ``zotero.py``).
+        decider:           Decision model asked for the classification labels
+                           (``None``: off; see ``decider.py``).
     """
 
     base_url: str = DEFAULT_BASE_URL
@@ -521,6 +536,7 @@ class Config:
     structured_output: bool = False
     max_cost: float | None = None
     zotero: bool = True
+    decider: str | None = None
 
 
 # ---------------------------------------------------------------------------

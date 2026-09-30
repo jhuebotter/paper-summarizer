@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from summarizer.models import (
     CitableSnippet,
     Classification,
+    Decision,
     OpenProblemsPrimary,
     OpenProblemsSynthesis,
     PaperMetadata,
@@ -60,7 +61,7 @@ def render_summary(summary: PaperSummary) -> str:
     if paper_type == "primary":
         assert isinstance(summary.part1, SummaryPart1Primary)
         assert summary.part2 is not None
-        return _render_primary(summary.metadata, summary.part1, summary.part2)
+        return _render_primary(summary.metadata, summary.part1, summary.part2, summary.decisions)
     if paper_type == "synthesis":
         assert isinstance(summary.part1, SummaryPart1Synthesis)
         return _render_synthesis(summary.metadata, summary.part1)
@@ -202,20 +203,27 @@ def _render_open_problems_synthesis(op: OpenProblemsSynthesis) -> str:
     )
 
 
-def _render_classification(classification: Classification) -> str:
-    """One line per typed label, e.g. ``**Inference hardware:** CPU/GPU``."""
+def _render_classification(
+    classification: Classification, decisions: dict[str, Decision] | None = None
+) -> str:
+    """One line per typed label, e.g. ``**Inference hardware:** CPU/GPU``, noting where
+    the decision model disagrees."""
     lines = []
     for name, value in classification.model_dump().items():
         shown = ("; ".join(value) or "none") if isinstance(value, list) else value
+        decision = (decisions or {}).get(name)
+        if decision is not None and decision.label != value:
+            p = decision.probabilities.get(decision.label)
+            shown += f" (decision model: {decision.label}" + (f", p={p:.2f})" if p else ")")
         lines.append(f"**{name.replace('_', ' ').capitalize()}:** {shown}  ")
     return "\n".join(lines)
 
 
-def _render_part2(part2: SummaryPart2) -> str:
+def _render_part2(part2: SummaryPart2, decisions: dict[str, Decision] | None = None) -> str:
     """Render the Part 2 SNN extraction section."""
     return (
         "## Part 2: SNN Control Extraction\n\n"
-        f"### Classification\n\n{_render_classification(part2.classification)}\n\n"
+        f"### Classification\n\n{_render_classification(part2.classification, decisions)}\n\n"
         "### Details\n\n"
         f"**Neuron model:** {part2.neuron_model}\n\n"
         f"**Network architecture:** {part2.network_architecture}\n\n"
@@ -247,6 +255,7 @@ def _render_primary(
     meta: PaperMetadata,
     part1: SummaryPart1Primary,
     part2: SummaryPart2,
+    decisions: dict[str, Decision] | None = None,
 ) -> str:
     """Render a primary research paper (≤600 words for Part 1 prose)."""
     _check_word_limit("primary", _count_words(*part1_prose(part1)))
@@ -273,7 +282,7 @@ def _render_primary(
         f"### Citable Snippets\n\n{citable}\n\n"
         f'### Relevance to a review on "spiking neural networks for control"\n\n{part1.relevance}\n\n'
         "---\n\n"
-        f"{_render_part2(part2)}"
+        f"{_render_part2(part2, decisions)}"
     )
 
 
