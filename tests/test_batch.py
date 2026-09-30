@@ -18,6 +18,7 @@ from summarizer.batch import (
     should_skip,
 )
 from summarizer.models import Config, PipelineError
+from summarizer.parser import sha256_file
 
 _PDF_COUNTER = itertools.count()
 
@@ -578,7 +579,7 @@ def test_parse_legacy_line_edge_cases(line, expected):
 def test_run_batch_report_includes_token_totals(tmp_path, config):
     (tmp_path / "paper.pdf").write_bytes(_pdf_bytes())
 
-    def fake_process(pdf_path, config, client, accumulator, references):
+    def fake_process(pdf_path, config, client, accumulator, references, zotero=None):
         from summarizer.llm import UsageStats
 
         accumulator.add(UsageStats(input_tokens=1000, output_tokens=200), 0.0)
@@ -633,7 +634,7 @@ def test_max_cost_stops_starting_new_papers(tmp_path, config):
     config.workers = 1
     config.max_cost = 0.01
 
-    def fake_process(pdf_path, config, client, accumulator, references):
+    def fake_process(pdf_path, config, client, accumulator, references, zotero=None):
         accumulator.add(UsageStats(), 0.005)
         return _make_summary(pdf_path.stem)
 
@@ -876,3 +877,63 @@ def test_render_all_includes_versioned_sidecars(tmp_path, mock_part1_dict, mock_
         (tmp_path / name).write_text(summary.model_dump_json())
     assert render_all(tmp_path) == (2, 0)
     assert (tmp_path / "x2020y_summary_v2.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# Zotero lookup
+# ---------------------------------------------------------------------------
+
+
+def test_batch_passes_each_pdf_its_zotero_record(tmp_path, config):
+    pdf = tmp_path / "AAAAAAAA__paper.pdf"
+    pdf.write_bytes(_pdf_bytes())
+    record = object()
+    seen = {}
+
+    def fake_process(pdf_path, config, client, accumulator, references, zotero=None):
+        seen[pdf_path.name] = zotero
+        return _make_summary("a2020x")
+
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.lookup_all", return_value={pdf: record}) as lookup,
+        patch("summarizer.batch.process_pdf", side_effect=fake_process),
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        run_batch(tmp_path, config)
+    lookup.assert_called_once_with([pdf])
+    assert seen == {"AAAAAAAA__paper.pdf": record}
+
+
+def test_zotero_lookup_covers_only_the_papers_to_process(tmp_path, config):
+    new, done = tmp_path / "AAAAAAAA__new.pdf", tmp_path / "BBBBBBBB__done.pdf"
+    new.write_bytes(_pdf_bytes())
+    done.write_bytes(_pdf_bytes())
+    sha = sha256_file(done)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    save_processed_index(
+        config.output_dir, {sha: {"pdf_path": str(done), "outputs": [], "sha256": sha}}
+    )
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.lookup_all", return_value={}) as lookup,
+        patch("summarizer.batch.process_pdf", return_value=_make_summary("a2020x")),
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        run_batch(tmp_path, config)
+    lookup.assert_called_once_with([new])
+
+
+def test_no_zotero_and_dry_run_skip_the_lookup(tmp_path, config):
+    (tmp_path / "AAAAAAAA__paper.pdf").write_bytes(_pdf_bytes())
+    with (
+        patch("summarizer.batch.create_client"),
+        patch("summarizer.batch.lookup_all") as lookup,
+        patch("summarizer.batch.process_pdf", return_value=_make_summary("a2020x")),
+        patch("summarizer.batch.render_summary", return_value="# md"),
+    ):
+        config.zotero = False
+        run_batch(tmp_path, config)
+        config.zotero, config.dry_run = True, True
+        run_batch(tmp_path, config)
+    lookup.assert_not_called()

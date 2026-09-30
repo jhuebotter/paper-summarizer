@@ -55,6 +55,7 @@ def test_parser_defaults():
     assert args.force_summary is False
     assert args.reparse is False
     assert args.dry_run is False
+    assert args.zotero is True
     assert args.verbose is False
     assert args.timeout == 120
     assert args.workers == 3
@@ -670,3 +671,12 @@ def test_render_rejects_a_missing_output_dir(tmp_path):
     with pytest.raises(SystemExit) as exc_info:
         main(["render", "--output-dir", str(tmp_path / "missing")])
     assert exc_info.value.code == 1
+
+
+def test_no_zotero_flag_reaches_the_config(tmp_path):
+    report = MagicMock(processed=0, skipped=0, failed=0, failed_papers=[], total_cost=0.0)
+    report.stopped_reason = None
+    argv = ["summarize-papers", "--source", str(tmp_path), "--dry-run", "--no-zotero"]
+    with patch("sys.argv", argv), patch("summarizer.cli.run_batch", return_value=report) as run:
+        main()
+    assert run.call_args[0][1].zotero is False

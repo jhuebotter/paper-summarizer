@@ -25,6 +25,7 @@ Python >=3.12, developed on 3.14 (`.python-version`). Use uv, not pip/conda; com
 - Schema repair resends the paper only for missing content (`pipeline._needs_paper_context`).
 - Parser caches `$XDG_CACHE_HOME/paper-summarizer/<sha256>.<extractor>.md` (old caches next to the PDF are still read; tests point `XDG_CACHE_HOME` at `tmp_path`); docling is imported lazily, is an optional extra, and runs without OCR unless most pages have no text (scans).
 - Processed index: `output_summaries/processed.jsonl`, keyed by PDF sha256 (path-only entries and legacy `processed.txt` still match by path). Each summary gets a `.json` sidecar (`PaperSummary` with `provenance`); `summarize-papers render` rebuilds markdown from them. `batch.output_dir_lock` prevents concurrent runs on one output dir.
+- Zotero: `batch` looks up each `<KEY>__*.pdf` in the local Zotero API (`zotero.lookup_all`, main thread, read-only) and `process_pdf` lets the item's title/authors/year/venue/citation key override the LLM's (`pipeline._apply_zotero`). Eval never does this. Never write to `~/Zotero` (shared group library).
 - Evaluation: `summarize-papers eval` (`evaluation.py` runner/cache/gold/report, `metrics.py` pure metrics) calls `process_pdf` directly and must never write to `output_summaries/`.
 
 ## Conventions

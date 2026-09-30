@@ -382,6 +382,8 @@ class Provenance(BaseModel):
     input_tokens: int
     output_tokens: int
     cost_usd: float
+    zotero_item: str | None = None  # e.g. "groups/5824653/items/YXWFBPTP"
+    zotero_fields: list[str] = Field(default_factory=list)  # fields where Zotero replaced the LLM's
 
 
 class PaperSummary(BaseModel):
@@ -497,6 +499,8 @@ class Config:
         structured_output: Ask the backend to constrain replies to the
                            ``LLMResponse`` JSON schema.
         max_cost:          Stop starting new papers once this many USD are spent.
+        zotero:            Take bibliographic metadata from the local Zotero library
+                           (batch runs only; see ``zotero.py``).
     """
 
     base_url: str = DEFAULT_BASE_URL
@@ -516,6 +520,7 @@ class Config:
     strip_references: bool = True
     structured_output: bool = False
     max_cost: float | None = None
+    zotero: bool = True
 
 
 # ---------------------------------------------------------------------------

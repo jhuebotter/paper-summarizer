@@ -100,6 +100,7 @@ def main(argv: list[str] | None = None) -> None:
         strip_references=args.strip_references,
         structured_output=args.structured_output,
         max_cost=args.max_cost,
+        zotero=args.zotero,
     )
 
     # Validate the backend is reachable and usable before starting any work
@@ -478,6 +479,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="List PDFs that would be processed without calling the LLM.",
+    )
+    parser.add_argument(
+        "--zotero",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Take title, authors, year, venue and citation key from the local Zotero "
+        "library for PDFs named <ZoteroKey>__*.pdf (Zotero must be running; default: on).",
     )
     parser.add_argument(
         "--output-dir",
