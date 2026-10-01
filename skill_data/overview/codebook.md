@@ -1,6 +1,7 @@
 # Literature-overview codebook: spiking neural networks for control
 
-Use this codebook to fill a structured record for **one primary research paper**. Every value must
+Use this codebook to fill a structured record for **one research paper** (section 0 says how to
+mark reviews and other documents). Every value must
 be supported by the paper itself. Quote the sentence that supports it. Use what the paper reports
 about **its own** system, not about cited work.
 
@@ -9,13 +10,14 @@ General rules:
 - **Multi-select fields** take every option that applies, and `[]` when none applies.
 - **Evidence quotes:** copy one short verbatim sentence or clause (at most about 30 words) from the
   paper. Do not paraphrase or merge fragments. If nothing in the paper supports a value, choose
-  `not reported` (or the field's equivalent) and leave the quote empty.
+  `not reported` (or the field's equivalent, unless the field defines a default) and leave the
+  quote empty.
 - **Follow the definitions, not the paper's words.** The paper's own words ("online", "offline",
   "fully neuromorphic", "robust") don't decide a value; this codebook's definitions do.
 - **Main system:** if the paper has several experiments or systems, describe its main SNN
   control system: the one in the title or abstract that does the most control-like task. Ignore
-  experiments without an SNN, and side benchmarks. Single-choice fields and the component list
-  describe that system; for `control_level`, take the most control-like experiment.
+  experiments without an SNN, and side benchmarks. Single-choice fields, the metrics and the
+  component list describe that system.
 - **Text only.** Use only what the text states. Something stated to be in a supplement counts as
   stated.
 - **Evaluation and deployment.** The **evaluation** is the runs whose results the paper reports as
@@ -287,10 +289,12 @@ adaptation.
 
 ## 3. Analytic design
 
-**`analytic_methods`** (multi-select; `[]` if nothing is hand-designed or solved). Give two kinds
-of label:
+**`analytic_methods`** (multi-select; `[]` if no component is hand-designed, solved, or a fixed
+reservoir). The labels say:
 - the framework that computes the weights, if any: `NEF`, `spike coding network`;
-- the origin of the computation: `control-theoretic` or `hand-wired circuit`.
+- the origin of the computation: `control-theoretic` or `hand-wired circuit`;
+- or that a fixed random network serves as a basis: `reservoir`;
+- `other` for anything else analytic.
 
 So PID in Nengo is [`NEF`, `control-theoretic`], an NEF-built CPG is [`NEF`,
 `hand-wired circuit`], and PID with hand-wired neuron arrays or WTA circuits is
@@ -460,8 +464,9 @@ paper is ambiguous. Leave it empty otherwise.
   `transferred`.
 - **Reservoir with a FORCE/RLS-trained readout.**
   - Recurrent weights: `random / fixed`.
-  - Readout: `learned`, `supervised / imitation`, `local error (LMS-like)`. Its regime is `online`
-    while the system runs, or `offline` if fitted to recordings.
+  - Readout trained online (FORCE/RLS while the system runs): `learned`,
+    `supervised / imitation`, `local error (LMS-like)`, `online`.
+  - Readout fitted once to recordings by regression: `solved`.
   - `analytic_methods`: [`reservoir`].
 - **ANN trained, then converted.** Two components:
   - ANN: `learned`, not spiking, not deployed, its own signal, `backprop / BPTT`, `offline`.
@@ -492,6 +497,7 @@ paper is ambiguous. Leave it empty otherwise.
   thrust commands; the drone flies.**
   - `spiking_roles` = [`sensing`, `state estimation`]; `control_level` = `closed-loop`.
   - The linear layer is a `controller` component: not spiking, `searched`.
-- **Online RL where the reported curve is the learning curve.** adapts=true. The regime is
-  `online` if the weights update every step, `interleaved` if updates are applied at the end of
-  each trial.
+- **Online RL whose results are learning curves, with no separate frozen test phase.** The
+  evaluation *is* the learning, so adapts=true. The regime is `online` if the weights update every
+  step, `interleaved` if updates are applied at the end of each trial. Deep RL that reports
+  training curves but evaluates (or would deploy) a frozen policy keeps adapts=false.

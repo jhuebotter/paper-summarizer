@@ -54,14 +54,8 @@ from summarizer.models import (
     BatchReport,
     Config,
 )
-from summarizer.overview import OverviewRecord, score_record
-from summarizer.overview_run import (
-    COLLECTED_FILENAME,
-    DEFAULT_CODEBOOK,
-    OverviewConfig,
-    load_results,
-    run_overview,
-)
+from summarizer.overview import OverviewRecord, load_results, normalize, score_record
+from summarizer.overview_run import DEFAULT_CODEBOOK, OverviewConfig, run_overview
 from summarizer.overview_tables import papers_csv, render_report
 
 logger = logging.getLogger(__name__)
@@ -221,7 +215,10 @@ def _overview_main(argv: list[str]) -> None:
         "--codebook",
         metavar="FILE",
         default=str(DEFAULT_CODEBOOK),
-        help="Codebook embedded in the prompt (default: skill_data/overview/codebook.md).",
+        help=(
+            "Codebook embedded in the prompt (default: skill_data/overview/codebook.md). An edited "
+            "copy must keep the option values, which the record schema fixes."
+        ),
     )
     parser.add_argument(
         "--critic",
@@ -245,12 +242,22 @@ def _overview_main(argv: list[str]) -> None:
         "--gold",
         metavar="FILE",
         default=None,
-        help="Gold JSONL ({sha256, record}); prints per-field accuracy of the stored records.",
+        help=(
+            "Gold JSONL, one {sha256, record} per line; after the run, prints the per-field "
+            "accuracy of every stored record in --output-dir that has a gold entry."
+        ),
     )
     parser.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args(argv)
     setup_logging(verbose=args.verbose, log_file=_log_file(None))
 
+    for flag, value in (("--codebook", args.codebook), ("--gold", args.gold)):
+        if value and not Path(value).is_file():
+            logger.error("%s: file not found: %s", flag, value)
+            sys.exit(1)
+    if args.source and not Path(args.source).is_dir():
+        logger.error("Not a directory: %s", args.source)
+        sys.exit(1)
     pdfs = [Path(args.file)] if args.file else find_pdfs(Path(args.source))
     missing = [p for p in pdfs if not p.is_file()]
     if missing or not pdfs:
@@ -293,7 +300,7 @@ def _print_overview_scores(gold_path: Path, output_dir: Path) -> None:
     for line in gold_path.read_text(encoding="utf-8").splitlines():
         if line.strip():
             row = json.loads(line)
-            gold[row["sha256"]] = OverviewRecord.model_validate(row["record"])
+            gold[row["sha256"]] = normalize(OverviewRecord.model_validate(row["record"]))[0]
     hits: dict[str, int] = {}
     n = 0
     for result in load_results(output_dir):
@@ -340,12 +347,19 @@ def _overview_tables_main(argv: list[str]) -> None:
         )
         sys.exit(1)
     out = Path(args.output) if args.output else input_dir / "overview.md"
+    if out.suffix.lower() == ".csv":
+        logger.error("--output is the markdown report; the CSV is written next to it")
+        sys.exit(1)
     out.parent.mkdir(parents=True, exist_ok=True)
-    second = load_results(Path(args.compare)) if args.compare else None
+    second = None
+    if args.compare:
+        second = load_results(Path(args.compare))
+        if not second:
+            logger.error("--compare: no overview records under %s", args.compare)
+            sys.exit(1)
     out.write_text(render_report(results, second), encoding="utf-8")
     out.with_suffix(".csv").write_text(papers_csv(results), encoding="utf-8")
     logger.info("Wrote %s and %s (%d records)", out, out.with_suffix(".csv"), len(results))
-    logger.info("Collected records: %s", input_dir / COLLECTED_FILENAME)
 
 
 # ---------------------------------------------------------------------------

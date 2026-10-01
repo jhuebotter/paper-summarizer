@@ -219,19 +219,28 @@ With `--decider`, each primary paper's text is also sent to a decision model: Ty
 - a list of records to check by hand.
 
 ```bash
-uv run summarize-papers overview --source input_papers             # writes output_overview/records/*.json
-uv run summarize-papers overview-tables                            # writes output_overview/overview.md and .csv
-uv run summarize-papers overview --source papers/ --gold gold.jsonl # also prints per-field accuracy
+uv run summarize-papers overview --source input_papers --model deepseek/deepseek-v4-pro
+uv run summarize-papers overview --source input_papers --model nvidia/nemotron-3-ultra-550b-a55b:free --output-dir output_overview_free
+uv run summarize-papers overview-tables --compare output_overview_free   # output_overview/overview.md and .csv
 ```
 
-- **Prompt:** one LLM call per paper, carrying the codebook (about 7k tokens), a JSON template of the allowed values, and the paper text (up to 120k characters, references stripped).
+- **Prompt:** one LLM call per paper, carrying the codebook (about 8k tokens), a JSON template of the allowed values, and the paper text (up to 120k characters, references stripped).
+- **Models (dev set, 26 papers, agent-made gold):**
+  - `deepseek/deepseek-v4-pro`: 92% of fields at about $0.003 per paper.
+  - `nvidia/nemotron-3-ultra-550b-a55b:free`: 91%, free. It is the best free model.
+- **Second run:** `--compare DIR` points the tables at a second model's records. Fields where the two disagree are listed first under "Records to check by hand". On dev, labels the two agreed on were 96% right; the 9% they disagreed on held more than half of the errors. Details are in `notes/overview/` (local).
 - **Checks:**
   - An invalid reply gets one repair call.
   - The codebook's cross-field rules are then applied (`overview.normalize`); each fix is recorded.
   - Every evidence quote is checked against the paper text; quotes not found are listed under "Records to check by hand".
-- **Derived labels:** the review's categories (`design`, `quadrant`, `learning_pairs`, `regimes`, …) are computed from the facts by `overview.derive`. To change a convention, change the rule, not the records.
+- **Derived labels:** the review's categories (`design`, `quadrant`, `learning_pairs`, `regimes`, …) are computed from the facts by `overview.derive`. Loading records re-applies the current rules, so to change a convention you change the rule, with no new LLM calls.
 - **Critic pass:** `--critic` adds a second call in which the model checks its own record.
-- **Skipping and metadata:** a record is skipped when one exists for the same PDF content, model, codebook and critic setting; use `--force` to redo it. Citation keys, titles and years come from Zotero when it runs.
+- **Skipping and metadata:**
+  - A record is skipped when one exists for the same PDF content, model, codebook and critic setting; use `--force` to redo it.
+  - Records are named by Zotero key (`KEY__…pdf`) or by a sha prefix, and a PDF's content has only one record.
+  - Citation keys, titles and years come from Zotero when it runs.
+- **Codebook:** `--codebook` takes an edited copy of the codebook. Its option values must stay the same, because the record schema fixes them.
+- **Gold scoring:** `--gold FILE` reads one `{"sha256", "record"}` object per line and logs per-field accuracy for every stored record in the output directory that has a gold entry.
 - **Separate from summaries and eval:** this never touches `output_summaries/` or the eval directories.
 
 ## Evaluation

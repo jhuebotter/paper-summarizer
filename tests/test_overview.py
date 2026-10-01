@@ -593,3 +593,444 @@ def test_a_second_run_flags_the_fields_it_disagrees_on(tmp_path):
     report = (tmp_path / "a" / "overview.md").read_text()
     assert "disagrees on 2 labels in 1 papers" in report
     assert "second run disagrees on: interface, derived.quadrant" in report
+
+
+# ---------------------------------------------------------------------------
+# Regression tests from the code review
+# ---------------------------------------------------------------------------
+
+
+def _extract_with(tmp_path, client, accumulator=None, **kw):
+    from summarizer.llm import CostAccumulator
+
+    config = OverviewConfig(output_dir=tmp_path / "out", zotero=False, **kw)
+    acc = accumulator or CostAccumulator()
+    with patch(
+        "summarizer.overview_run.load_text", return_value=ParsedText(PAPER, "docling", "f" * 64)
+    ):
+        return extract_record(_pdf(tmp_path), config, client, acc, "CODEBOOK"), acc
+
+
+def test_a_critic_reply_without_json_keeps_the_paid_draft(tmp_path):
+    client = _client(json.dumps(_record().model_dump()), "sorry, no json here", "still none")
+    result, _ = _extract_with(tmp_path, client, critic=True)
+    assert result.record.interface == "continuous"
+    assert result.draft is not None
+
+
+def test_an_exhausted_quota_in_the_critic_still_stops_the_run(tmp_path):
+    client = _client(json.dumps(_record().model_dump()))
+    client.complete.side_effect = [
+        CompletionResponse(text=json.dumps(_record().model_dump()), usage=None),
+        QuotaExhausted("daily cap"),
+    ]
+    with pytest.raises(QuotaExhausted):
+        _extract_with(tmp_path, client, critic=True)
+
+
+def test_quotes_are_checked_on_the_final_record_and_repairs_are_counted(tmp_path):
+    bad = _record().model_dump()
+    bad["interface"] = "spikes"
+    fixed = _record(control_evidence="We use Loihi for all experiments.").model_dump()
+    result, acc = _extract_with(tmp_path, _client(json.dumps(bad), json.dumps(fixed)))
+    assert result.missing_quotes == ["control_evidence"]
+    assert (result.calls, acc.schema_repairs) == (2, 1)
+
+
+def test_the_same_pdf_under_two_names_gets_one_record(tmp_path):
+    reply = json.dumps(_record().model_dump())
+    keyed = _pdf(tmp_path, "ABCD1234__Doe - 2024 - A.pdf", b"%PDF same")
+    _run(tmp_path, [keyed], _client(reply))
+    plain = _pdf(tmp_path, "Doe 2024 copy.pdf", b"%PDF same")
+    again = _run(tmp_path, [plain, keyed], _client())
+    assert (again.processed, again.skipped) == (0, 2)
+    assert [p.name for p in (tmp_path / "out" / "records").iterdir()] == ["ABCD1234.json"]
+    assert len(load_results(tmp_path / "out")) == 1
+
+
+def test_names_sharing_a_prefix_do_not_overwrite_each_other(tmp_path):
+    reply = json.dumps(_record().model_dump())
+    pdfs = [_pdf(tmp_path, "draft__v1.pdf", b"%PDF 1"), _pdf(tmp_path, "draft__v2.pdf", b"%PDF 2")]
+    assert _run(tmp_path, pdfs, _client(reply, reply)).processed == 2
+    assert len(list((tmp_path / "out" / "records").iterdir())) == 2
+    assert _run(tmp_path, pdfs, _client()).processed == 0
+
+
+def test_a_record_without_a_key_is_named_by_its_sha(tmp_path):
+    pdf = _pdf(tmp_path, "plain.pdf", b"%PDF plain")
+    _run(tmp_path, [pdf], _client(json.dumps(_record().model_dump())))
+    assert (tmp_path / "out" / "records" / f"{sha256_file(pdf)[:16]}.json").exists()
+
+
+def test_a_changed_model_or_critic_setting_makes_records_stale(tmp_path):
+    pdfs = [_pdf(tmp_path)]
+    reply = json.dumps(_record().model_dump())
+    _run(tmp_path, pdfs, _client(reply))
+    assert _run(tmp_path, pdfs, _client(reply, reply), critic=True).processed == 1
+    client = _client(reply)
+    client.model = "other/model"
+    config = OverviewConfig(
+        output_dir=tmp_path / "out", zotero=False, workers=1, model="other/model"
+    )
+    with (
+        patch("summarizer.overview_run.create_client", return_value=client),
+        patch(
+            "summarizer.overview_run.load_text",
+            side_effect=lambda p, **_: ParsedText(PAPER, "docling", sha256_file(p)),
+        ),
+    ):
+        assert run_overview(pdfs, config).processed == 1
+
+
+def test_the_collected_file_is_rebuilt_even_when_nothing_is_extracted(tmp_path):
+    pdfs = [_pdf(tmp_path)]
+    _run(tmp_path, pdfs, _client(json.dumps(_record().model_dump())))
+    collected = tmp_path / "out" / "overview.jsonl"
+    collected.unlink()
+    _run(tmp_path, pdfs, _client())
+    assert len(collected.read_text().splitlines()) == 1
+
+
+def test_max_cost_stops_before_any_call(tmp_path):
+    pdfs = [_pdf(tmp_path), _pdf(tmp_path, "WXYZ9876__Roe - 2020 - B.pdf", b"%PDF b")]
+    client = _client()
+    report = _run(tmp_path, pdfs, client, max_cost=0.0)
+    assert (report.processed, report.skipped) == (0, 2)
+    assert report.stopped_reason and client.complete.call_count == 0
+
+
+def test_run_reports_tokens_and_cost(tmp_path):
+    reply = json.dumps(_record().model_dump())
+    report = _run(tmp_path, [_pdf(tmp_path)], _client(reply))
+    assert report.input_tokens == 1000 and report.total_cost == pytest.approx(0.0011)
+
+
+def test_zotero_metadata_is_stored(tmp_path):
+    from summarizer.zotero import ZoteroRecord
+
+    pdf = _pdf(tmp_path)
+    zr = ZoteroRecord(
+        item="groups/1/items/X",
+        citation_key="doe2024",
+        title="T",
+        authors=["J Doe"],
+        year=2024,
+        venue="V",
+    )
+    config = OverviewConfig(output_dir=tmp_path / "out", workers=1, model="test/model")
+    with (
+        patch(
+            "summarizer.overview_run.create_client",
+            return_value=_client(json.dumps(_record().model_dump())),
+        ),
+        patch(
+            "summarizer.overview_run.load_text",
+            side_effect=lambda p, **_: ParsedText(PAPER, "docling", sha256_file(p)),
+        ),
+        patch("summarizer.overview_run.lookup_all", return_value={pdf: zr}),
+    ):
+        run_overview([pdf], config)
+    (result,) = load_results(tmp_path / "out")
+    assert (result.citation_key, result.year, label(result)) == ("doe2024", 2024, "doe2024")
+
+
+def test_loading_recomputes_labels_with_the_current_rules(tmp_path):
+    stale = _result("AAAA1111__Doe - 2024 - RL.pdf", _record())
+    stale.derived = {**stale.derived, "design": "analytic"}
+    _store(tmp_path, [stale])
+    (loaded,) = load_results(tmp_path)
+    assert loaded.derived["design"] == "learned"
+
+
+def test_duplicate_records_keep_the_newest(tmp_path):
+    old = _result("same", _record(), created="2026-01-01T00:00:00+00:00")
+    new = _result("same", _record(interface="event-native"), created="2026-02-01T00:00:00+00:00")
+    _store(tmp_path, [old, new])
+    (loaded,) = load_results(tmp_path)
+    assert loaded.record.interface == "event-native"
+
+
+def test_a_non_spiking_hand_designed_controller_is_not_fully_spiking():
+    rec = _record(
+        spiking_roles=[],
+        components=[
+            _component(
+                name="control law",
+                spiking=False,
+                obtained_by="hand-designed",
+                signal="not applicable",
+                mechanism="not applicable",
+                regime="not applicable",
+            )
+        ],
+    )
+    assert derive(rec)["fully_spiking_deployed"] is False
+
+
+def test_a_teacher_outside_the_controller_does_not_make_it_analytic():
+    rec = _record(
+        components=[
+            _component(
+                signal="supervised / imitation",
+                mechanism="eligibility + modulator (three-factor)",
+                regime="online",
+            ),
+            _component(
+                name="teacher PID",
+                role="other",
+                spiking=False,
+                deployed=False,
+                obtained_by="hand-designed",
+                signal="not applicable",
+                mechanism="not applicable",
+                regime="not applicable",
+            ),
+        ],
+        analytic_methods=["control-theoretic"],
+    )
+    assert derive(rec)["design"] == "learned"
+
+
+def test_analytic_methods_decide_only_without_controller_components():
+    assert (
+        derive(_record(components=[], analytic_methods=["control-theoretic"]))["design"]
+        == "analytic"
+    )
+    assert (
+        derive(_record(components=[], analytic_methods=["reservoir"]))["design"]
+        == "not determinable"
+    )
+
+
+def test_searched_components_count_as_learned():
+    rec = _record(
+        components=[_component(obtained_by="searched", mechanism="evolutionary / black-box")]
+    )
+    d = derive(rec)
+    assert (d["design"], d["learning_pairs"]) == ("learned", ["rl+ES"])
+
+
+def test_a_learned_component_without_mechanism_has_no_pair():
+    assert (
+        derive(_record(components=[_component(mechanism="not applicable")]))["learning_pairs"] == []
+    )
+
+
+def test_quadrant_covers_mixed_and_excludes_unreported_interfaces():
+    assert derive(_record(interface="mixed"))["quadrant"] == "learned × mixed"
+    assert derive(_record(interface="not reported"))["quadrant"] == "n/a"
+
+
+def test_adapts_online_ignores_components_that_were_not_learned():
+    comp = _component(obtained_by="hand-designed", adapts_during_evaluation=True)
+    assert derive(_record(components=[comp]))["adapts_online"] is False
+
+
+def test_trained_readouts_keep_a_system_fully_spiking():
+    rec = _record(
+        components=[
+            _component(),
+            _component(name="readout", role="readout / decoder", spiking=False),
+        ]
+    )
+    d = derive(rec)
+    assert d["fully_spiking_deployed"] is True and d["nonspiking_training_only"] is False
+
+
+def test_embedded_platforms_keep_their_hardware_loop():
+    rec, _ = normalize(_record(platform="embedded CPU / microcontroller", hardware_in_loop=True))
+    assert rec.hardware_in_loop is True
+
+
+def test_partial_coverage_on_a_chip_is_kept():
+    rec, changes = normalize(
+        _record(platform="neuromorphic chip (digital)", platform_coverage="partial")
+    )
+    assert rec.platform_coverage == "partial" and changes == []
+
+
+def test_no_control_task_clears_plant_fields_and_the_hardware_loop():
+    rec, _ = normalize(
+        _record(
+            control_level="no control task",
+            platform="neuromorphic chip (digital)",
+            platform_coverage="whole network",
+            hardware_in_loop=True,
+        )
+    )
+    assert (rec.hardware_in_loop, rec.plant_model_use, rec.interface) == (
+        False,
+        "not applicable",
+        "not applicable",
+    )
+
+
+def test_simulated_and_real_plants_keep_their_sim_to_real_value():
+    metrics = {**_record().metrics.model_dump(), "sim_to_real": "simulation only"}
+    rec, _ = normalize(_record(plant_setting="simulated and real", metrics=metrics))
+    assert rec.metrics.sim_to_real == "simulation only"
+
+
+def test_real_plants_without_sim_to_real_become_real_only():
+    metrics = {**_record().metrics.model_dump(), "sim_to_real": "not applicable"}
+    rec, _ = normalize(_record(plant_setting="real", metrics=metrics))
+    assert rec.metrics.sim_to_real == "real only"
+
+
+def test_fixed_components_lose_learning_fields():
+    rec, _ = normalize(
+        _record(
+            components=[_component(obtained_by="random / fixed", adapts_during_evaluation=True)]
+        )
+    )
+    c = rec.components[0]
+    assert (c.signal, c.regime, c.adapts_during_evaluation) == (
+        "not applicable",
+        "not applicable",
+        False,
+    )
+
+
+def test_metrics_evidence_is_checked_and_short_quotes_do_not_count():
+    metrics = {**_record().metrics.model_dump(), "metrics_evidence": "an invented energy number"}
+    assert missing_quotes(_record(metrics=metrics), PAPER) == ["metrics.metrics_evidence"]
+    assert missing_quotes(_record(control_evidence="the"), PAPER) == ["control_evidence"]
+
+
+def test_scored_fields_are_complete():
+    assert set(score_record(_record(), _record())) == {
+        "control_level",
+        "plant_setting",
+        "plant_dynamics",
+        "plant_model_use",
+        "interface",
+        "platform",
+        "platform_coverage",
+        "hardware_in_loop",
+        *(f"metrics.{m}" for m in overview.SCORED_METRICS),
+        *overview.SCORED_SETS,
+        "derived.design",
+        "derived.quadrant",
+        "derived.learning_pairs",
+        "derived.regimes",
+        "derived.adapts_online",
+        "derived.fully_spiking_deployed",
+        "derived.nonspiking_training_only",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tables: every section
+# ---------------------------------------------------------------------------
+
+
+def _section(report: str, n: int) -> str:
+    return report.split(f"## {n}.")[1].split(f"## {n + 1}.")[0]
+
+
+def test_every_table_counts_the_right_papers():
+    from summarizer.overview_tables import year_of
+
+    pid = _record(
+        components=[
+            _component(
+                name="PID",
+                obtained_by="hand-designed",
+                signal="not applicable",
+                mechanism="not applicable",
+                regime="not applicable",
+            )
+        ],
+        analytic_methods=["control-theoretic"],
+        interface="event-native",
+        objectives=[],
+        platform="neuromorphic chip (digital)",
+        platform_coverage="whole network",
+        hardware_in_loop=True,
+        task="Drone | hover\nreal",
+        metrics={**_record().metrics.model_dump(), "latency": "measured"},
+    )
+    two = _record(
+        components=[
+            _component(),
+            _component(
+                name="world model",
+                role="state estimation / world model",
+                signal="self-supervised / system identification",
+                regime="offline",
+            ),
+        ],
+        interface="not reported",
+    )
+    results = [
+        _result("AAAA1111__Doe and Roe - 2024 - RL.pdf", _record()),
+        _result("BBBB2222__Roe - 2020 - PID.pdf", pid, normalized=["x: 'a' -> 'b'"]),
+        _result("CCCC3333__Poe - 2021 - Two.pdf", two),
+    ]
+    results[2].record.notes = "check this"
+    report = render_report(results)
+    assert "Poe 2021" in _section(report, 1).split("Not in the grid")[1]
+    chooser = _section(report, 2)
+    rl_row = next(line for line in chooser.splitlines() if line.startswith("| `rl+BPTT`"))
+    assert "| interleaved 3 |" in rl_row and "continuous 1" in rl_row and "not reported 1" in rl_row
+    assert re.search(r"\| `self\+BPTT` \|.*\| offline 1 \|", chooser)
+    assert "| (none) | **1** (Roe 2020) |" in _section(report, 3)
+    assert "| control-theoretic | **1** (Roe 2020) |" in _section(report, 4)
+    assert "| neuromorphic chip (digital) | **1** (Roe 2020) | 1 | 0 | 0 |" in _section(report, 5)
+    reporting = _section(report, 6)
+    assert "energy | estimated: 3 (100%)" in reporting
+    assert "Measured energy or latency: **1** (Roe 2020)" in reporting
+    assert "| 2016–20 | 1 | 1 | 0 | 0 | 1 |" in _section(report, 7)
+    assert "Drone \\| hover real" in _section(report, 8)
+    flags = _section(report, 9) if "## 10." in report else report.split("## 9.")[1]
+    assert "fixed by consistency rules: x: 'a' -> 'b'" in flags and "note: check this" in flags
+    assert (
+        label(results[0]) == "Doe 2024" and year_of(_result("x.pdf", _record(), year=2019)) == 2019
+    )
+    assert label(_result("x.pdf", _record())) == "x.pdf"
+
+
+def test_disagreements_ignore_identical_and_missing_records():
+    from summarizer.overview_tables import disagreements
+
+    first = [_result("a.pdf", _record()), _result("b.pdf", _record())]
+    assert disagreements(first, [_result("a.pdf", _record())]) == {}
+    assert render_report(first, []).count("disagrees") == 0
+
+
+def test_overview_tables_rejects_a_csv_output_and_an_empty_comparison(tmp_path):
+    _store(tmp_path / "ov", [_result("a.pdf", _record())])
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "overview-tables",
+                "--input",
+                str(tmp_path / "ov"),
+                "--output",
+                str(tmp_path / "x.csv"),
+            ]
+        )
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "overview-tables",
+                "--input",
+                str(tmp_path / "ov"),
+                "--compare",
+                str(tmp_path / "none"),
+            ]
+        )
+
+
+def test_overview_command_checks_its_inputs_before_running(tmp_path):
+    pdf = _pdf(tmp_path)
+    with patch("summarizer.cli.run_overview") as run:
+        for argv in (
+            ["--gold", str(tmp_path / "missing.jsonl")],
+            ["--codebook", str(tmp_path / "missing.md")],
+        ):
+            with pytest.raises(SystemExit):
+                main(["overview", "--file", str(pdf), *argv])
+        with pytest.raises(SystemExit):
+            main(["overview", "--source", str(tmp_path / "nope")])
+    run.assert_not_called()

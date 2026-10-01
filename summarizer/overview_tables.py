@@ -19,8 +19,14 @@ import re
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 
-from summarizer.overview import MECHANISM_SHORT, SIGNAL_SHORT, comparable_facts
-from summarizer.overview_run import OverviewResult
+from summarizer.overview import (
+    MECHANISM_SHORT,
+    SCORED_METRICS,
+    SIGNAL_SHORT,
+    OverviewResult,
+    comparable_facts,
+    learning_pair,
+)
 
 _DESIGNS = ("analytic", "learned", "analytic + learned")
 _INTERFACES = ("continuous", "event-native", "mixed")
@@ -59,16 +65,20 @@ def primary(results: Iterable[OverviewResult]) -> list[OverviewResult]:
     )
 
 
-def _cell(papers: list[OverviewResult], cite: bool = True) -> str:
+def _cell(papers: list[OverviewResult]) -> str:
     if not papers:
         return "–"
-    names = ", ".join(label(p) for p in papers)
-    return f"**{len(papers)}** ({names})" if cite else str(len(papers))
+    return f"**{len(papers)}** ({', '.join(label(p) for p in papers)})"
+
+
+def _escape(cell: str) -> str:
+    """Keep model-written text from breaking a markdown table row."""
+    return " ".join(str(cell).split()).replace("|", "\\|")
 
 
 def _table(header: list[str], rows: list[list[str]]) -> str:
     lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
-    lines += ["| " + " | ".join(row) + " |" for row in rows]
+    lines += ["| " + " | ".join(_escape(cell) for cell in row) + " |" for row in rows]
     return "\n".join(lines)
 
 
@@ -122,8 +132,7 @@ def chooser_table(results: list[OverviewResult]) -> str:
         interfaces = Counter()
         for r in papers:
             for c in r.record.components:
-                short = f"{SIGNAL_SHORT.get(c.signal, '?')}+{MECHANISM_SHORT.get(c.mechanism, '?')}"
-                if short == pair and c.regime != "not applicable":
+                if learning_pair(c) == pair and c.regime != "not applicable":
                     regimes[c.regime] += 1
             interfaces[r.record.interface] += 1
         rows.append(
@@ -189,15 +198,7 @@ def reporting_table(results: list[OverviewResult]) -> str:
     """How many papers report each metric, at each evidence level."""
     n = len(results) or 1
     rows = []
-    for metric in (
-        "tracking_error",
-        "latency",
-        "energy",
-        "spike_activity",
-        "stability",
-        "robustness",
-        "sim_to_real",
-    ):
+    for metric in SCORED_METRICS:
         counts = Counter(getattr(r.record.metrics, metric) for r in results)
         rows.append(
             [metric, ", ".join(f"{k}: {v} ({100 * v / n:.0f}%)" for k, v in counts.most_common())]
@@ -249,7 +250,7 @@ def paper_rows(results: list[OverviewResult]) -> tuple[list[str], list[list[str]
             [
                 label(r),
                 str(year_of(r) or ""),
-                rec.task.replace("|", "/"),
+                rec.task,
                 ", ".join(rec.spiking_roles),
                 rec.control_level,
                 r.derived["design"],
@@ -271,9 +272,9 @@ def disagreements(
 ) -> dict[str, list[str]]:
     """Per paper (sha256), the scored fields on which a second extraction run differs.
 
-    On the dev gold, the labels two models agree on were right about 95% of the
-    time; the ~11% they disagree on held about half of the errors. So these
-    are the fields to check first.
+    Labels that two different models agree on are far more often right than the
+    ones they disagree on (see notes/overview/), so these are the fields to
+    check first.
     """
     others = {r.sha256: r for r in second}
     out = {}

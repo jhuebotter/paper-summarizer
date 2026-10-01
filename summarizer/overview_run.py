@@ -21,6 +21,7 @@ touched.
 import hashlib
 import json
 import logging
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,19 +37,20 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 from summarizer.batch import StopSignal, atomic_write_text, output_dir_lock
 from summarizer.llm import CostAccumulator, QuotaExhausted, call_llm, create_client
 from summarizer.models import (
-    _DEFAULT_MAX_CHARS,
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
     DEFAULT_SKILL_DATA_DIR,
     BatchReport,
     Config,
     FailedPaper,
+    LLMError,
 )
 from summarizer.overview import (
-    Component,
-    Metrics,
+    RECORDS_DIRNAME,
     OverviewRecord,
+    OverviewResult,
     derive,
+    load_results,
     missing_quotes,
     normalize,
 )
@@ -58,11 +60,11 @@ from summarizer.zotero import ZoteroRecord, lookup_all
 logger = logging.getLogger(__name__)
 
 DEFAULT_CODEBOOK = DEFAULT_SKILL_DATA_DIR.parent / "overview" / "codebook.md"
-RECORDS_DIRNAME = "records"
 COLLECTED_FILENAME = "overview.jsonl"
-#: Overview prompts carry the codebook (~6k tokens) and the paper; most papers
+#: Overview prompts carry the codebook (~8k tokens) and the paper; most papers
 #: fit well under this.
 _OVERVIEW_MAX_CHARS = 120_000
+_KEY_PREFIX = re.compile(r"^([A-Z0-9]{8})__")
 
 
 @dataclass(frozen=True)
@@ -84,35 +86,7 @@ class OverviewConfig:
     zotero: bool = True
 
     def llm_config(self) -> Config:
-        return Config(
-            base_url=self.base_url,
-            model=self.model,
-            timeout_s=self.timeout_s,
-            max_chars=max(self.max_chars, _DEFAULT_MAX_CHARS),
-        )
-
-
-class OverviewResult(BaseModel):
-    """One paper's stored overview: the record plus how it was obtained."""
-
-    sha256: str
-    file: str
-    citation_key: str = ""
-    title: str = ""
-    authors: list[str] = []
-    year: int | None = None
-    record: OverviewRecord
-    derived: dict
-    normalized: list[str] = []
-    missing_quotes: list[str] = []
-    draft: OverviewRecord | None = None
-    model: str
-    codebook_sha256: str
-    extractor: str
-    critic: bool = False
-    cost_usd: float = 0.0
-    calls: int = 0
-    created: str = ""
+        return Config(base_url=self.base_url, model=self.model, timeout_s=self.timeout_s)
 
 
 # ---------------------------------------------------------------------------
@@ -128,12 +102,12 @@ def _template(model: type[BaseModel]) -> dict:
         if get_origin(annotation) is list:
             inner = get_args(annotation)[0]
             out[name] = (
-                [_template(Component)]
-                if inner is Component
+                [_template(inner)]
+                if isinstance(inner, type) and issubclass(inner, BaseModel)
                 else ["<any of: " + " | ".join(get_args(inner)) + ">"]
             )
-        elif annotation is Metrics:
-            out[name] = _template(Metrics)
+        elif isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            out[name] = _template(annotation)
         elif get_origin(annotation) is Literal:
             out[name] = "<one of: " + " | ".join(get_args(annotation)) + ">"
         elif annotation is bool:
@@ -261,11 +235,15 @@ def extract_record(
     draft = None
     if config.critic:
         draft = record
-        raw = call_llm(client, build_critic_prompt(text, codebook, record.model_dump()), paper)
         try:
+            raw = call_llm(client, build_critic_prompt(text, codebook, record.model_dump()), paper)
             record = _validated(client, raw, paper)
-        except (ValidationError, ValueError):
-            logger.warning("Critic reply unusable for %s; keeping the draft", pdf_path.name)
+        except QuotaExhausted:
+            raise
+        except (LLMError, ValidationError) as exc:  # the paid draft is still a valid record
+            logger.warning(
+                "Critic reply unusable for %s (%s); keeping the draft", pdf_path.name, exc
+            )
             record = draft
     record, changes = normalize(record)
     missing = missing_quotes(record, parsed.text)
@@ -299,20 +277,32 @@ def extract_record(
 
 
 def record_path(output_dir: Path, pdf_path: Path, sha: str) -> Path:
-    """``records/<Zotero key or sha prefix>.json``: stable across renames of the PDF."""
-    stem = pdf_path.name.split("__", 1)[0] if "__" in pdf_path.name else sha[:16]
-    return output_dir / RECORDS_DIRNAME / f"{stem}.json"
+    """``records/<Zotero key>.json`` for ``KEY__*.pdf`` names, else ``records/<sha prefix>.json``."""
+    m = _KEY_PREFIX.match(pdf_path.name)
+    return output_dir / RECORDS_DIRNAME / f"{m.group(1) if m else sha[:16]}.json"
 
 
-def load_results(output_dir: Path) -> list[OverviewResult]:
-    """Every stored record under ``output_dir`` (unreadable files are logged and skipped)."""
-    results = []
+def _stored_paths(output_dir: Path) -> dict[str, Path]:
+    """``sha256 -> path`` of the records already stored under ``output_dir``."""
+    paths = {}
     for path in sorted((output_dir / RECORDS_DIRNAME).glob("*.json")):
         try:
-            results.append(OverviewResult.model_validate_json(path.read_text(encoding="utf-8")))
-        except (OSError, ValueError) as exc:
-            logger.error("Cannot read %s: %s", path, exc)
-    return results
+            paths[json.loads(path.read_text(encoding="utf-8"))["sha256"]] = path
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return paths
+
+
+def _output_path(output_dir: Path, pdf: Path, sha: str, stored: dict[str, Path], taken: set[Path]):
+    """Where ``pdf``'s record goes: its existing file if the content was seen before, so one paper
+    never gets two records; otherwise :func:`record_path`, with the sha appended if another
+    paper already uses that name."""
+    if sha in stored:
+        return stored[sha]
+    path = record_path(output_dir, pdf, sha)
+    if path in taken:
+        path = path.with_name(f"{path.stem}-{sha[:8]}.json")
+    return path
 
 
 def _is_current(path: Path, sha: str, model: str, codebook_sha: str, critic: bool) -> bool:
@@ -350,6 +340,8 @@ def _run_overview(pdfs: list[Path], config: OverviewConfig) -> BatchReport:
     failed: list[FailedPaper] = []
     skipped = 0
     seen: set[str] = set()
+    stored = _stored_paths(config.output_dir)
+    taken = set(stored.values())
     for pdf in pdfs:
         try:
             sha = sha256_file(pdf)
@@ -360,13 +352,15 @@ def _run_overview(pdfs: list[Path], config: OverviewConfig) -> BatchReport:
             skipped += 1
             continue
         seen.add(sha)
-        out = record_path(config.output_dir, pdf, sha)
+        out = _output_path(config.output_dir, pdf, sha, stored, taken)
+        taken.add(out)
         if not config.force and _is_current(out, sha, config.model, codebook_sha, config.critic):
             skipped += 1
             continue
         jobs.append((pdf, out))
     logger.info("Overview: %d to extract, %d already current", len(jobs), skipped)
     if not jobs:
+        _write_collected(config.output_dir)
         return BatchReport(processed=0, skipped=skipped, failed=len(failed), failed_papers=failed)
 
     client = create_client(config.llm_config())
@@ -413,8 +407,9 @@ def _run_overview(pdfs: list[Path], config: OverviewConfig) -> BatchReport:
     except BaseException:
         executor.shutdown(wait=False, cancel_futures=True)
         raise
+    finally:
+        _write_collected(config.output_dir)  # records finished so far, even when interrupted
     executor.shutdown()
-    _write_collected(config.output_dir)
     logger.info("Overview finished in %.0fs", time.monotonic() - t0)
     return BatchReport(
         processed=processed,
