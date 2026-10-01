@@ -137,9 +137,11 @@ The authors train a recurrent LIF controller with surrogate-gradient BPTT on a s
 ├── input_papers/                 # PDFs to process (gitignored)
 ├── output_summaries/             # Summaries (.md + .json) by paper type, processed.jsonl (gitignored)
 ├── skill_data/references/        # Prompt references: JSON contract, template, field guides
+├── skill_data/overview/          # Literature-overview codebook (embedded in overview prompts)
+├── output_overview/              # Overview records, overview.md/.csv tables (gitignored)
 ├── collect_pdfs.sh               # Flatten nested PDF libraries
 ├── eval/                         # Evaluation papers, gold labels, runs and cache (gitignored)
-└── summarizer/                   # Package source (cli, batch, pipeline, llm, parser, prompts, renderer, models, log, evaluation, metrics)
+└── summarizer/                   # Package source (cli, batch, pipeline, llm, parser, prompts, renderer, models, log, evaluation, metrics, overview, overview_run, overview_tables)
 ```
 
 ## Configuration
@@ -198,6 +200,39 @@ With `--decider`, each primary paper's text is also sent to a decision model: Ty
 - **Privacy:** it sends the paper text to TypeSafe via OpenRouter, like the LLM call. Don't use it on unpublished work.
 - **Endpoint:** it uses the System One wire format (`POST <base-url>/systemone`) on the LLM's backend. A local [Laya](https://github.com/nvkudva/laya-server) server speaks the same format, but it would need its own URL (not supported yet) and reads only 512–1024 tokens.
 - **Eval:** `summarize-papers eval --decider` scores the decider's labels as `decider.*` next to the LLM's `classification.*`.
+
+## Literature overview
+
+`summarize-papers overview` extracts a typed **overview record** per paper. A record holds facts with evidence quotes, as defined in `skill_data/overview/codebook.md`:
+- what the spiking neurons do;
+- the control setting and objectives;
+- each component and how its parameters were obtained (designed, solved, learned, searched, converted), with signal, update mechanism and regime;
+- the controller interface;
+- the platform;
+- which metrics are reported.
+
+`summarize-papers overview-tables` then builds the review's tables from the stored records, with no LLM calls:
+- the analytic/learned × continuous/event-native grid;
+- a training-signal + update-mechanism "chooser" table;
+- objectives, analytic methods, hardware, reporting practice and a trend over years;
+- a per-paper table (also as CSV);
+- a list of records to check by hand.
+
+```bash
+uv run summarize-papers overview --source input_papers             # writes output_overview/records/*.json
+uv run summarize-papers overview-tables                            # writes output_overview/overview.md and .csv
+uv run summarize-papers overview --source papers/ --gold gold.jsonl # also prints per-field accuracy
+```
+
+- **Prompt:** one LLM call per paper, carrying the codebook (about 7k tokens), a JSON template of the allowed values, and the paper text (up to 120k characters, references stripped).
+- **Checks:**
+  - An invalid reply gets one repair call.
+  - The codebook's cross-field rules are then applied (`overview.normalize`); each fix is recorded.
+  - Every evidence quote is checked against the paper text; quotes not found are listed under "Records to check by hand".
+- **Derived labels:** the review's categories (`design`, `quadrant`, `learning_pairs`, `regimes`, …) are computed from the facts by `overview.derive`. To change a convention, change the rule, not the records.
+- **Critic pass:** `--critic` adds a second call in which the model checks its own record.
+- **Skipping and metadata:** a record is skipped when one exists for the same PDF content, model, codebook and critic setting; use `--force` to redo it. Citation keys, titles and years come from Zotero when it runs.
+- **Separate from summaries and eval:** this never touches `output_summaries/` or the eval directories.
 
 ## Evaluation
 
