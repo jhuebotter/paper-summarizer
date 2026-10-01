@@ -40,3 +40,6 @@ test_pdfs/
 test_summaries/
 logs/
 eval/
+
+# paper
+paper/
