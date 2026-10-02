@@ -222,6 +222,7 @@ With `--decider`, each primary paper's text is also sent to a decision model: Ty
 uv run summarize-papers overview --source input_papers --model deepseek/deepseek-v4-pro
 uv run summarize-papers overview --source input_papers --model nvidia/nemotron-3-ultra-550b-a55b:free --output-dir output_overview_free
 uv run summarize-papers overview-tables --compare output_overview_free   # output_overview/overview.md and .csv
+uv run summarize-papers overview-tables --control-only --output output_overview/control.md   # only spiking systems that actuate a plant
 ```
 
 - **Prompt:** one LLM call per paper, carrying the codebook (about 8k tokens), a JSON template of the allowed values, and the paper text (up to 120k characters, references stripped).
