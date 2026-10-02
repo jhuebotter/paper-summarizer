@@ -1045,3 +1045,14 @@ def test_checked_fields_are_no_longer_flagged():
     assert "second run disagrees on: derived.quadrant" in flags
     assert "interface," not in flags and "checked by hand: 1 field(s)" in flags
     assert review_flags([_result("b.pdf", _record())]) == "None."
+
+
+def test_quotes_match_math_italic_text_and_ellipsis_fragments():
+    text = "The policy 𝜋(𝑎|𝑠) is trained online. Later, the robot runs on Loihi in closed loop."
+    assert (
+        missing_quotes(_record(control_evidence="The policy π(a|s) is trained online"), text) == []
+    )
+    stitched = "The policy π(a|s) is trained online ... the robot runs on Loihi"
+    assert missing_quotes(_record(control_evidence=stitched), text) == []
+    reversed_ = "the robot runs on Loihi ... The policy π(a|s) is trained online"
+    assert missing_quotes(_record(control_evidence=reversed_), text) == ["control_evidence"]

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from pathlib import Path
 from typing import Literal
 
@@ -319,8 +320,30 @@ _MIN_QUOTE_CHARS = 12
 
 
 def _squash(text: str) -> str:
-    """Lowercase letters and digits only: quotes survive line breaks, hyphenation, markup."""
-    return re.sub(r"[^0-9a-z]+", "", text.casefold())
+    """Lowercase letters and digits only: quotes survive line breaks, hyphenation, markup.
+
+    NFKC first, so math-italic letters in the extracted text (𝑎, 𝜋) match the plain
+    letters a model writes.
+    """
+    return re.sub(r"[^0-9a-z]+", "", unicodedata.normalize("NFKC", text).casefold())
+
+
+_ELLIPSIS = re.compile(r"\s*(?:\.\.\.|…|\[\.\.\.\])\s*")
+
+
+def _quote_found(quote: str, text: str) -> bool:
+    """Whether every part of ``quote`` (split at ellipses) occurs in ``text``, in order."""
+    start = 0
+    parts = [_squash(part) for part in _ELLIPSIS.split(quote)]
+    parts = [part for part in parts if part]
+    if not parts or sum(map(len, parts)) < _MIN_QUOTE_CHARS:
+        return False
+    for part in parts:
+        start = text.find(part, start)
+        if start < 0:
+            return False
+        start += len(part)
+    return True
 
 
 def evidence_quotes(record: OverviewRecord) -> list[tuple[str, str]]:
@@ -342,12 +365,7 @@ def missing_quotes(record: OverviewRecord, paper_text: str) -> list[str]:
     that the value it supports needs checking by hand.
     """
     text = _squash(paper_text)
-    missing = []
-    for field, quote in evidence_quotes(record):
-        squashed = _squash(quote)
-        if len(squashed) < _MIN_QUOTE_CHARS or squashed not in text:
-            missing.append(field)
-    return missing
+    return [field for field, quote in evidence_quotes(record) if not _quote_found(quote, text)]
 
 
 # ---------------------------------------------------------------------------
