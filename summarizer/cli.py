@@ -7,6 +7,8 @@ Usage:
     summarize-papers --file PDF [options]       # single-file mode
     summarize-papers eval --source DIR ...      # evaluation (see evaluation.py)
     summarize-papers render [--output-dir DIR]  # re-render markdown from JSON sidecars
+    summarize-papers overview --source DIR ...  # literature-overview records (overview_run.py)
+    summarize-papers overview-tables [...]      # review tables from those records
 
 ``--source`` and ``--file`` are mutually exclusive; exactly one must be supplied.
 ``--reparse`` implies ``--force-summary``.
@@ -21,6 +23,7 @@ input/backend is unavailable, 130 when interrupted.
 
 import argparse
 import importlib.util
+import json
 import logging
 import os
 import sys
@@ -51,6 +54,9 @@ from summarizer.models import (
     BatchReport,
     Config,
 )
+from summarizer.overview import OverviewRecord, load_results, normalize, score_record
+from summarizer.overview_run import DEFAULT_CODEBOOK, OverviewConfig, run_overview
+from summarizer.overview_tables import papers_csv, render_report
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +82,12 @@ def main(argv: list[str] | None = None) -> None:
         return
     if argv[:1] == ["render"]:
         _render_main(argv[1:])
+        return
+    if argv[:1] == ["overview"]:
+        _overview_main(argv[1:])
+        return
+    if argv[:1] == ["overview-tables"]:
+        _overview_tables_main(argv[1:])
         return
 
     args = _build_parser().parse_args(argv)
@@ -166,6 +178,188 @@ def _render_main(argv: list[str]) -> None:
     if failed:
         logger.error("%d sidecar(s) could not be rendered (see above)", failed)
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Overview mode
+# ---------------------------------------------------------------------------
+
+
+def _overview_main(argv: list[str]) -> None:
+    """``summarize-papers overview``: extract an overview record per paper."""
+    parser = argparse.ArgumentParser(
+        prog="summarize-papers overview",
+        description=(
+            "Extract a literature-overview record (typed facts with evidence quotes, see "
+            "skill_data/overview/codebook.md) for each PDF; skips papers whose record is "
+            "current. Then run `summarize-papers overview-tables`."
+        ),
+    )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--source", metavar="DIR", help="Directory of PDFs (searched recursively).")
+    source.add_argument("--file", metavar="PDF", help="A single PDF.")
+    _default_model = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
+    parser.add_argument(
+        "--model",
+        default=_default_model,
+        help=f"LLM model identifier (default: LLM_MODEL env var, currently {_default_model!r}).",
+    )
+    parser.add_argument("--base-url", metavar="URL", default=DEFAULT_BASE_URL)
+    parser.add_argument(
+        "--output-dir",
+        metavar="DIR",
+        default="output_overview",
+        help="Where records/ and overview.jsonl go (default: output_overview).",
+    )
+    parser.add_argument(
+        "--codebook",
+        metavar="FILE",
+        default=str(DEFAULT_CODEBOOK),
+        help=(
+            "Codebook embedded in the prompt (default: skill_data/overview/codebook.md). An edited "
+            "copy must keep the option values, which the record schema fixes."
+        ),
+    )
+    parser.add_argument(
+        "--critic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Second call per paper in which the model checks its own record (default: off).",
+    )
+    parser.add_argument("--workers", metavar="N", type=_positive_int, default=3)
+    parser.add_argument("--timeout", metavar="S", type=int, default=600)
+    parser.add_argument("--max-cost", metavar="USD", type=float, default=None)
+    parser.add_argument(
+        "--force", action="store_true", help="Re-extract papers that already have a current record."
+    )
+    parser.add_argument(
+        "--zotero",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Take citation keys, titles and years from the local Zotero library (default: on).",
+    )
+    parser.add_argument(
+        "--gold",
+        metavar="FILE",
+        default=None,
+        help=(
+            "Gold JSONL, one {sha256, record} per line; after the run, prints the per-field "
+            "accuracy of every stored record in --output-dir that has a gold entry."
+        ),
+    )
+    parser.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=False)
+    args = parser.parse_args(argv)
+    setup_logging(verbose=args.verbose, log_file=_log_file(None))
+
+    for flag, value in (("--codebook", args.codebook), ("--gold", args.gold)):
+        if value and not Path(value).is_file():
+            logger.error("%s: file not found: %s", flag, value)
+            sys.exit(1)
+    if args.source and not Path(args.source).is_dir():
+        logger.error("Not a directory: %s", args.source)
+        sys.exit(1)
+    pdfs = [Path(args.file)] if args.file else find_pdfs(Path(args.source))
+    missing = [p for p in pdfs if not p.is_file()]
+    if missing or not pdfs:
+        logger.error(
+            "No PDFs to process (missing: %s)", ", ".join(map(str, missing)) or "none found"
+        )
+        sys.exit(1)
+    config = OverviewConfig(
+        base_url=args.base_url,
+        model=args.model,
+        output_dir=Path(args.output_dir),
+        codebook=Path(args.codebook),
+        critic=args.critic,
+        workers=args.workers,
+        timeout_s=args.timeout,
+        max_cost=args.max_cost,
+        force=args.force,
+        zotero=args.zotero,
+    )
+    llm_config = config.llm_config()
+    _check_backend(llm_config.base_url)
+    _check_openrouter_config(llm_config)
+    _log_key_info(llm_config)
+    try:
+        report = run_overview(pdfs, config)
+    except OutputDirLocked as exc:
+        logger.error("%s; wait for it to finish or use another --output-dir.", exc)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        logger.warning("Interrupted: finished records are saved and skipped on the next run.")
+        sys.exit(130)
+    if args.gold:
+        _print_overview_scores(Path(args.gold), Path(args.output_dir))
+    _report_and_exit(report)
+
+
+def _print_overview_scores(gold_path: Path, output_dir: Path) -> None:
+    """Log per-field accuracy of the stored records against a gold file."""
+    gold = {}
+    for line in gold_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            row = json.loads(line)
+            gold[row["sha256"]] = normalize(OverviewRecord.model_validate(row["record"]))[0]
+    hits: dict[str, int] = {}
+    n = 0
+    for result in load_results(output_dir):
+        if result.sha256 not in gold:
+            continue
+        n += 1
+        for field, ok in score_record(result.record, gold[result.sha256]).items():
+            hits[field] = hits.get(field, 0) + ok
+    if not n:
+        logger.warning("No stored record matches the gold file %s", gold_path)
+        return
+    logger.info("Accuracy on %d gold papers:", n)
+    for field, ok in hits.items():
+        logger.info("  %-40s %d/%d", field, ok, n)
+    logger.info("  %-40s %.1f%%", "all fields", 100 * sum(hits.values()) / (n * len(hits)))
+
+
+def _overview_tables_main(argv: list[str]) -> None:
+    """``summarize-papers overview-tables``: review tables from stored records (no LLM)."""
+    parser = argparse.ArgumentParser(
+        prog="summarize-papers overview-tables",
+        description="Write review tables (markdown) and a per-paper CSV from overview records.",
+    )
+    parser.add_argument("--input", metavar="DIR", default="output_overview")
+    parser.add_argument(
+        "--compare",
+        metavar="DIR",
+        default=None,
+        help="Records from a second model; fields where it disagrees are flagged for checking.",
+    )
+    parser.add_argument(
+        "--output",
+        metavar="FILE",
+        default=None,
+        help="Markdown report (default: <input>/overview.md; a CSV is written next to it).",
+    )
+    args = parser.parse_args(argv)
+    setup_logging(verbose=False, log_file=None)
+    input_dir = Path(args.input)
+    results = load_results(input_dir)
+    if not results:
+        logger.error(
+            "No overview records under %s (run `summarize-papers overview` first)", input_dir
+        )
+        sys.exit(1)
+    out = Path(args.output) if args.output else input_dir / "overview.md"
+    if out.suffix.lower() == ".csv":
+        logger.error("--output is the markdown report; the CSV is written next to it")
+        sys.exit(1)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    second = None
+    if args.compare:
+        second = load_results(Path(args.compare))
+        if not second:
+            logger.error("--compare: no overview records under %s", args.compare)
+            sys.exit(1)
+    out.write_text(render_report(results, second), encoding="utf-8")
+    out.with_suffix(".csv").write_text(papers_csv(results), encoding="utf-8")
+    logger.info("Wrote %s and %s (%d records)", out, out.with_suffix(".csv"), len(results))
 
 
 # ---------------------------------------------------------------------------

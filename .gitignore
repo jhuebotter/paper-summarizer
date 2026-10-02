@@ -35,8 +35,12 @@ notes/
 # Data files
 input_papers/
 output_summaries/
+output_overview*/
 output_summaries_v2/
 test_pdfs/
 test_summaries/
 logs/
 eval/
+
+# paper
+paper/
