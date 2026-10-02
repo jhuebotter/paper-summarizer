@@ -58,9 +58,22 @@ def year_of(result: OverviewResult) -> int | None:
     return int(m.group("year")) if m else None
 
 
-def primary(results: Iterable[OverviewResult]) -> list[OverviewResult]:
+_CONTROL_LEVELS = ("closed-loop", "open-loop actuation")
+
+
+def in_scope(result: OverviewResult) -> bool:
+    """The review's core scope: spiking (or event-sensing) systems that actuate a plant."""
+    return bool(result.record.spiking_roles) and result.record.control_level in _CONTROL_LEVELS
+
+
+def primary(results: Iterable[OverviewResult], control_only: bool = False) -> list[OverviewResult]:
+    """Primary-research records by year; with ``control_only``, only those :func:`in_scope`."""
     return sorted(
-        (r for r in results if r.record.paper_kind == "primary research"),
+        (
+            r
+            for r in results
+            if r.record.paper_kind == "primary research" and (in_scope(r) or not control_only)
+        ),
         key=lambda r: (year_of(r) or 0, label(r)),
     )
 
@@ -315,15 +328,25 @@ def review_flags(
     return "\n".join(lines) or "None."
 
 
-def render_report(results: list[OverviewResult], second: list[OverviewResult] | None = None) -> str:
-    """The full markdown report; ``second`` (another model's records) adds disagreement flags."""
-    papers = primary(results)
+def render_report(
+    results: list[OverviewResult],
+    second: list[OverviewResult] | None = None,
+    control_only: bool = False,
+) -> str:
+    """The full markdown report.
+
+    ``second`` (another model's records) adds disagreement flags; ``control_only``
+    counts only spiking systems that actuate a plant (see :func:`in_scope`).
+    """
+    papers = primary(results, control_only)
     disagree = disagreements(results, second) if second else {}
     models = Counter(r.model for r in results)
     header, rows = paper_rows(papers)
     sections = [
         "# Literature overview: spiking neural networks for control",
-        f"{len(papers)} primary papers (of {len(results)} records). Extraction model(s): "
+        f"{len(papers)} primary papers"
+        + (" with a spiking system that actuates a plant" if control_only else "")
+        + f" (of {len(results)} records). Extraction model(s): "
         + ", ".join(f"`{m}` ({n})" for m, n in models.most_common())
         + ". Labels are model-extracted: check the flagged records before citing numbers."
         + (
@@ -354,8 +377,8 @@ def render_report(results: list[OverviewResult], second: list[OverviewResult] | 
     return "\n\n".join(sections) + "\n"
 
 
-def papers_csv(results: list[OverviewResult]) -> str:
-    header, rows = paper_rows(primary(results))
+def papers_csv(results: list[OverviewResult], control_only: bool = False) -> str:
+    header, rows = paper_rows(primary(results, control_only))
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(header)

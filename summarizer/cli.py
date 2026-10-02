@@ -332,6 +332,14 @@ def _overview_tables_main(argv: list[str]) -> None:
         help="Records from a second model; fields where it disagrees are flagged for checking.",
     )
     parser.add_argument(
+        "--control-only",
+        action="store_true",
+        help=(
+            "Count only papers whose spiking (or event-sensing) system actuates a plant, open or "
+            "closed loop (default: every primary research paper)."
+        ),
+    )
+    parser.add_argument(
         "--output",
         metavar="FILE",
         default=None,
@@ -357,8 +365,8 @@ def _overview_tables_main(argv: list[str]) -> None:
         if not second:
             logger.error("--compare: no overview records under %s", args.compare)
             sys.exit(1)
-    out.write_text(render_report(results, second), encoding="utf-8")
-    out.with_suffix(".csv").write_text(papers_csv(results), encoding="utf-8")
+    out.write_text(render_report(results, second, args.control_only), encoding="utf-8")
+    out.with_suffix(".csv").write_text(papers_csv(results, args.control_only), encoding="utf-8")
     logger.info("Wrote %s and %s (%d records)", out, out.with_suffix(".csv"), len(results))
 
 

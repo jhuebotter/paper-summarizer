@@ -1056,3 +1056,19 @@ def test_quotes_match_math_italic_text_and_ellipsis_fragments():
     assert missing_quotes(_record(control_evidence=stitched), text) == []
     reversed_ = "the robot runs on Loihi ... The policy π(a|s) is trained online"
     assert missing_quotes(_record(control_evidence=reversed_), text) == ["control_evidence"]
+
+
+def test_control_only_counts_spiking_systems_that_actuate_a_plant(tmp_path):
+    from summarizer.overview_tables import in_scope
+
+    control = _result("AAAA1111__Doe - 2024 - RL.pdf", _record())
+    perception = _result(
+        "BBBB2222__Roe - 2020 - P.pdf", _record(control_level="perception for control")
+    )
+    theory = _result("CCCC3333__Poe - 2021 - T.pdf", _record(spiking_roles=[]))
+    assert [in_scope(r) for r in (control, perception, theory)] == [True, False, False]
+    _store(tmp_path / "ov", [control, perception, theory])
+    main(["overview-tables", "--input", str(tmp_path / "ov"), "--control-only"])
+    report = (tmp_path / "ov" / "overview.md").read_text()
+    assert report.split("\n\n")[1].startswith("1 primary papers with a spiking system")
+    assert len((tmp_path / "ov" / "overview.csv").read_text().splitlines()) == 2
