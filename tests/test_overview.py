@@ -1034,3 +1034,14 @@ def test_overview_command_checks_its_inputs_before_running(tmp_path):
         with pytest.raises(SystemExit):
             main(["overview", "--source", str(tmp_path / "nope")])
     run.assert_not_called()
+
+
+def test_checked_fields_are_no_longer_flagged():
+    from summarizer.overview_tables import review_flags
+
+    first = [_result("a.pdf", _record(), checked=["interface"])]
+    second = [_result("a.pdf", _record(interface="event-native"))]
+    flags = render_report(first, second).split("## 9.")[1]
+    assert "second run disagrees on: derived.quadrant" in flags
+    assert "interface," not in flags and "checked by hand: 1 field(s)" in flags
+    assert review_flags([_result("b.pdf", _record())]) == "None."

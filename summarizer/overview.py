@@ -420,6 +420,9 @@ class OverviewResult(BaseModel):
     cost_usd: float = 0.0
     calls: int = 0
     created: str = ""
+    #: Fields a person (or a checking agent) confirmed against the paper; the
+    #: tables stop flagging them.
+    checked: list[str] = []
 
 
 def load_results(output_dir: Path) -> list[OverviewResult]:

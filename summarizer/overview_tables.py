@@ -297,8 +297,11 @@ def review_flags(
     lines = []
     for r in sorted(results, key=label):
         flags = []
-        if r.sha256 in disagree:
-            flags.append("second run disagrees on: " + ", ".join(disagree[r.sha256]))
+        unchecked = [f for f in disagree.get(r.sha256, []) if f not in r.checked]
+        if unchecked:
+            flags.append("second run disagrees on: " + ", ".join(unchecked))
+        if r.checked:
+            flags.append(f"checked by hand: {len(r.checked)} field(s)")
         if r.record.paper_kind != "primary research":
             flags.append(f"paper kind: {r.record.paper_kind} (not counted)")
         if r.missing_quotes:
