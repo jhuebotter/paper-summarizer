@@ -339,7 +339,12 @@ def render_report(
     counts only spiking systems that actuate a plant (see :func:`in_scope`).
     """
     papers = primary(results, control_only)
-    disagree = disagreements(results, second) if second else {}
+    checked = {r.sha256: set(r.checked) for r in results}
+    disagree = {
+        sha: [f for f in fields if f not in checked.get(sha, set())]
+        for sha, fields in (disagreements(results, second) if second else {}).items()
+    }
+    disagree = {sha: fields for sha, fields in disagree.items() if fields}
     models = Counter(r.model for r in results)
     header, rows = paper_rows(papers)
     sections = [
@@ -351,7 +356,7 @@ def render_report(
         + ". Labels are model-extracted: check the flagged records before citing numbers."
         + (
             f" A second run (`{second[0].model}`) disagrees on {sum(map(len, disagree.values()))}"
-            f" labels in {len(disagree)} papers; see section 9."
+            f" labels not yet checked by hand, in {len(disagree)} papers; see section 9."
             if second
             else ""
         ),

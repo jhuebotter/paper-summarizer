@@ -591,7 +591,7 @@ def test_a_second_run_flags_the_fields_it_disagrees_on(tmp_path):
     _store(tmp_path / "b", second)
     main(["overview-tables", "--input", str(tmp_path / "a"), "--compare", str(tmp_path / "b")])
     report = (tmp_path / "a" / "overview.md").read_text()
-    assert "disagrees on 2 labels in 1 papers" in report
+    assert "disagrees on 2 labels not yet checked by hand, in 1 papers" in report
     assert "second run disagrees on: interface, derived.quadrant" in report
 
 
